@@ -1119,8 +1119,10 @@ async fn pad_only_side(
         vec![aloo::settings::DirectPunchTarget {
             nickname: peer_name.to_string(),
             device_id: None,
-            host: "127.0.0.1".to_string(),
-            ports: vec![19000],
+            via: aloo::settings::DirectPunchVia::Host {
+                host: "127.0.0.1".to_string(),
+                port: 19000,
+            },
             frequency: aloo::settings::PunchFrequency::parse("every_1m").expect("valid"),
         }],
         0,

@@ -55,62 +55,49 @@ Feature: Punching a direct link with no server involved
 
   # A NAT that rewrites the source port - most of them do - leaves both
   # ends aiming at a port neither router ever mapped, and no single agreed
-  # number can fix that, because the number that survives is the router's
-  # choice, not either peer's. Naming several and probing them all on the
-  # same slot only needs one of them to get through.
+  # number can fix that. Rather than a fixed address, a line may name a
+  # rendezvous realm on a public Hysteria server (realm.hy2.io): both peers
+  # meet there, learn each other's STUN-discovered outer address, and punch
+  # at what they actually turned out to be. See docs/PROTOCOL.md 7.1.5.
   @AC-434
-  Scenario: A peer may be named with several ports at once
-    Then "bob,203.0.113.9:[18000,19000,21000],every_5m" names host "203.0.113.9" on ports "18000,19000,21000"
-    And "bob,bobpublic.com:[18000, 19000],every_5m" names host "bobpublic.com" on ports "18000,19000"
-    And "bob,[2001:db8::1]:[18000,19000],every_5m" names host "2001:db8::1" on ports "18000,19000"
-    And "bob,bobpublic.com:19000,every_5m" names host "bobpublic.com" on ports "19000"
-    And "bob,bobpublic.com:[19000,18000,19000],every_5m" names host "bobpublic.com" on ports "19000,18000"
+  Scenario: A peer may be named through a rendezvous realm instead of an address
+    Then "bob,realm://public@realm.hy2.io/a-long-random-realm-name,every_5m" names a realm at host "realm.hy2.io" with token "public"
+    And "bob,realm+http://tok@rv.example:8443/my-realm,every_5m" names a realm at host "rv.example" with token "tok"
 
-  # The other half of naming several ports. What a peer can reach you on is
-  # the set of ports you send *from*, never the ones you aim at - so being
-  # reachable on three means binding three, and each probes the peer's
-  # matching port so both sides end up reachable on all of them.
+  @AC-434
+  Scenario: A malformed realm URI is refused rather than silently accepted
+    Then "bob,realm://public@realm.hy2.io/,every_5m" is refused as a malformed realm
+    And "bob,realm://realm.hy2.io/name,every_5m" is refused as a malformed realm
+    And "bob,realm://public@realm.hy2.io/name?lport=40000,every_5m" is refused as a malformed realm
+
+  # The one local port a peer can reach this client on is the port it sends
+  # *from*. Only one is bound: a router that rewrites the source port makes
+  # what a peer aims at unknowable in advance, which the realm rendezvous
+  # discovers rather than binding several ports to guess at.
   @AC-438
-  Scenario: Punching listens on every configured local port
+  Scenario: Punching binds one local port
     Given a settings file that says
       """
       direct_punch=on
-      direct_punch_port=18000,19000,21000
-      direct_punch_to=bob,bobpublic.com:[18000,19000,21000],every_1m
+      direct_punch_port=19000
+      direct_punch_to=bob,bobpublic.com:19000,every_1m
       """
     Then direct punching is on
-    And this client punches from ports "18000,19000,21000"
+    And this client punches from port 19000
 
   @AC-438
-  Scenario: One local port is still the ordinary case
+  Scenario: The well-known port is the default
     Given a settings file that says
       """
       direct_punch=on
-      direct_punch_port=18000
       """
-    Then this client punches from ports "18000"
-
-  @AC-434
-  Scenario: Every named port is probed on the same slot
-    Given alice lists bob on three ports, only one of which reaches him
-    When the next slot on their shared grid comes round
-    Then alice and bob have a direct link to each other
+    Then this client punches from port 7879
 
   @AC-435
   Scenario: A port outside the allowed range is refused with a reason
     Then "bob,203.0.113.9:9000,every_5m" is refused, naming the allowed port range
-    And "bob,203.0.113.9:[18000,70000],every_5m" is refused, naming the allowed port range
-    And "bob,203.0.113.9:[],every_5m" is refused for naming no port at all
+    And "bob,203.0.113.9:70000,every_5m" is refused, naming the allowed port range
     And "bob,203.0.113.9,every_5m" names host "203.0.113.9" on the well-known port
-
-  @AC-436
-  Scenario: The port that answered is the only one probed until the link is lost
-    Given alice lists bob on three ports, only one of which reaches him
-    When the next slot on their shared grid comes round
-    Then alice and bob have a direct link to each other
-    And alice probes bob on only the port he answered from
-    When bob disappears and the link goes quiet
-    Then alice probes bob on all three ports again
 
   @AC-213
   Scenario: A line with a typo says so instead of quietly doing nothing

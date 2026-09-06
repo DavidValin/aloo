@@ -164,8 +164,8 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
-    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), alice.raw_taps(), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), bob.raw_taps(), b_raw_tx);
 
     // alice proposes a link to bob - relayed by the server as PeerCandidates.
     alice.ensure_link(&mut a, bob_id).await;
@@ -296,8 +296,8 @@ async fn device_id_announce_travels_encrypted_and_decrypts_on_arrival() {
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
-    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), alice.raw_taps(), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), bob.raw_taps(), b_raw_tx);
 
     alice.ensure_link(&mut a, bob_id).await;
     let ServerMessage::PeerCandidates {
@@ -784,7 +784,7 @@ async fn an_active_link_that_goes_quiet_is_lost_and_re_established() {
         .await;
     let addr: SocketAddr = "203.0.113.8:6666".parse().unwrap();
     let t0 = tokio::time::Instant::now().into_std();
-    alice.on_datagram_at(0, addr, PunchDatagram::Pong { link_nonce }, t0);
+    alice.on_datagram_at(addr, PunchDatagram::Pong { link_nonce }, t0);
     assert!(alice.is_active(bob_id));
 
     // Still within the window: nothing has been heard, but not for long
@@ -820,11 +820,11 @@ async fn a_peers_keepalive_keeps_an_otherwise_idle_link_alive() {
         .await;
     let addr: SocketAddr = "203.0.113.9:7777".parse().unwrap();
     let t0 = tokio::time::Instant::now().into_std();
-    alice.on_datagram_at(0, addr, PunchDatagram::Pong { link_nonce }, t0);
+    alice.on_datagram_at(addr, PunchDatagram::Pong { link_nonce }, t0);
 
     // A beat arrives well into the idle window, resetting it.
     let beat_at = t0 + LINK_IDLE_TIMEOUT - Duration::from_secs(5);
-    alice.on_datagram_at(0, addr, PunchDatagram::Keepalive { link_nonce }, beat_at);
+    alice.on_datagram_at(addr, PunchDatagram::Keepalive { link_nonce }, beat_at);
 
     // A moment that would have been past the deadline without that beat.
     alice.tick_at(t0 + LINK_IDLE_TIMEOUT + Duration::from_secs(1));
@@ -1400,8 +1400,8 @@ impl Pair {
 
         let (a_raw_tx, a_raw) = tokio::sync::mpsc::unbounded_channel();
         let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
-        aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
-        aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+        aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), alice.raw_taps(), a_raw_tx);
+        aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), bob.raw_taps(), b_raw_tx);
 
         Self {
             alice,
@@ -2010,7 +2010,7 @@ async fn a_peer_that_reconnects_under_a_new_id_is_punched_from_scratch() {
             .await
             .unwrap();
     let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), bob.raw_taps(), b_raw_tx);
     pair.bob = bob;
     pair.b_ctl = b_ctl;
     pair.b_events = b_events;
@@ -2211,8 +2211,8 @@ async fn a_delivery_receipt_becomes_a_delivered_event_naming_its_sender() {
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
-    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), alice.raw_taps(), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), bob.raw_taps(), b_raw_tx);
 
     alice.ensure_link(&mut a, bob_id).await;
     let ServerMessage::PeerCandidates {

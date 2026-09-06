@@ -100,6 +100,7 @@ impl SettingsTab {
             SettingsTab::DirectPunch => &[
                 DirectPunchEnabled,
                 Punches,
+                DirectPunchChannels,
                 NoipEnabled,
                 NoipHostname,
                 NoipUsername,
@@ -127,6 +128,8 @@ pub enum SettingsField {
     /// The configured `direct_punch_to` list itself - one focus stop that
     /// then behaves like a list (see `handle_punches_key`), not a value.
     Punches,
+    /// The global `direct_punch_channel` rooms, comma-separated in one box.
+    DirectPunchChannels,
     NoipEnabled,
     NoipHostname,
     NoipUsername,
@@ -164,6 +167,7 @@ impl SettingsField {
             SettingsField::QueueSendMessages => "queue_send_messages",
             SettingsField::DirectPunchEnabled => "direct_punch",
             SettingsField::Punches => "configured punches",
+            SettingsField::DirectPunchChannels => "direct_punch_channel",
             SettingsField::NoipEnabled => "noip_when_no_server_and_direct_punch_is_active",
             SettingsField::NoipHostname => "noip_hostname",
             SettingsField::NoipUsername => "noip_username",
@@ -192,6 +196,9 @@ impl SettingsField {
             }
             SettingsField::DirectPunchEnabled => "punch links from the schedule below, no server",
             SettingsField::Punches => "who to punch at, where, and how often",
+            SettingsField::DirectPunchChannels => {
+                "rooms shared with punched peers, comma-separated (same on both sides)"
+            }
             SettingsField::NoipEnabled => "keep a No-IP hostname pointed here while serverless",
             SettingsField::NoipHostname => "the No-IP hostname to update",
             SettingsField::NoipUsername => "the No-IP account it belongs to",
@@ -213,6 +220,7 @@ impl SettingsField {
             | SettingsField::DirectPunchEnabled
             | SettingsField::NoipEnabled => FieldKind::Toggle,
             SettingsField::GlobalPttShortcut
+            | SettingsField::DirectPunchChannels
             | SettingsField::NoipHostname
             | SettingsField::NoipUsername
             | SettingsField::NoipPassword
@@ -246,6 +254,9 @@ pub struct SettingsDraft {
     pub resume_from_log: bool,
     pub queue_send_messages: bool,
     pub direct_punch: bool,
+    /// The global `direct_punch_channel` rooms, as the comma-separated text
+    /// the box holds; `apply_to` splits it back into names.
+    pub direct_punch_channels: String,
     pub noip_enabled: bool,
     pub noip_hostname: String,
     pub noip_username: String,
@@ -272,6 +283,7 @@ impl SettingsDraft {
             resume_from_log: settings.resume_from_log,
             queue_send_messages: settings.queue_send_messages,
             direct_punch: settings.direct_punch,
+            direct_punch_channels: settings.direct_punch_channels.join(", "),
             noip_enabled: settings.noip_when_no_server_and_direct_punch_is_active,
             noip_hostname: settings.noip_hostname.clone(),
             noip_username: settings.noip_username.clone(),
@@ -300,6 +312,21 @@ impl SettingsDraft {
         settings.resume_from_log = self.resume_from_log;
         settings.queue_send_messages = self.queue_send_messages;
         settings.direct_punch = self.direct_punch;
+        // Comma-separated in the box, split back into valid room names;
+        // an all-blank box clears the list (the file default reapplies on
+        // the next load, since an empty value is never written).
+        settings.direct_punch_channels = self
+            .direct_punch_channels
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && crate::validation::channel_name_is_valid(name))
+            .map(str::to_string)
+            .fold(Vec::new(), |mut acc, name| {
+                if !acc.contains(&name) {
+                    acc.push(name);
+                }
+                acc
+            });
         settings.noip_when_no_server_and_direct_punch_is_active = self.noip_enabled;
         settings.noip_hostname = self.noip_hostname.trim().to_string();
         settings.noip_username = self.noip_username.trim().to_string();
@@ -350,6 +377,7 @@ impl SettingsDraft {
     fn text_mut(&mut self, field: SettingsField) -> Option<&mut String> {
         Some(match field {
             SettingsField::GlobalPttShortcut => &mut self.global_ptt_shortcut,
+            SettingsField::DirectPunchChannels => &mut self.direct_punch_channels,
             SettingsField::NoipHostname => &mut self.noip_hostname,
             SettingsField::NoipUsername => &mut self.noip_username,
             SettingsField::NoipPassword => &mut self.noip_password,
@@ -362,6 +390,7 @@ impl SettingsDraft {
     pub fn text_value(&self, field: SettingsField) -> &str {
         match field {
             SettingsField::GlobalPttShortcut => &self.global_ptt_shortcut,
+            SettingsField::DirectPunchChannels => &self.direct_punch_channels,
             SettingsField::NoipHostname => &self.noip_hostname,
             SettingsField::NoipUsername => &self.noip_username,
             SettingsField::NoipPassword => &self.noip_password,
@@ -527,6 +556,10 @@ impl UiState {
     fn handle_punches_key(&mut self, code: KeyCode) -> Option<UiAction> {
         match code {
             KeyCode::Char('a') | KeyCode::Char('n') => {
+                // The add form opens with a generated public rendezvous
+                // realm already in the "where" (`blank_edit_state`) - the
+                // robust default when no address is reachable, typed over
+                // for a fixed address.
                 self.settings_popup.as_mut()?.punches.edit = Some(super::direct_punch_popup::blank_edit_state());
                 None
             }
@@ -571,7 +604,7 @@ impl UiState {
 /// - `centered_rect` clamps it to the terminal on anything narrower, and
 /// `render_descriptions` still wraps when it has to.
 const POPUP_WIDTH: u16 = 102;
-const POPUP_HEIGHT: u16 = 36;
+const POPUP_HEIGHT: u16 = 40;
 
 /// Hands out rows from the top of an area, refusing anything that no
 /// longer fits.
@@ -785,13 +818,14 @@ fn render_general_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopu
 fn render_direct_punch_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopupState) {
     use SettingsField::*;
     let focused = popup.focused_field();
-    if let Some(mut inner) = group(frame, stack, "direct_punch", 9) {
+    if let Some(mut inner) = group(frame, stack, "direct_punch", 12) {
         render_toggle(frame, &mut inner, popup, DirectPunchEnabled);
         if let Some(mut list) = group(frame, &mut inner, "configured punches", 6)
             && let Some(area) = list.take(list.remaining())
         {
             render_punch_list(frame, area, &popup.punches, focused == Punches);
         }
+        render_text_field(frame, &mut inner, popup, DirectPunchChannels);
     }
     stack.gap();
     if let Some(mut inner) = group(frame, stack, "noip", 12) {

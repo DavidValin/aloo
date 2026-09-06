@@ -24,10 +24,12 @@
 //! serverless direct punch (`docs/PROTOCOL.md` §7.1.5, `DirectPunch` below).
 //! Everything the server would have supplied - who the peer is, where they
 //! are, and when both sides will probe at once - comes instead from
-//! `~/.aloo/settings`' `direct_punch_to` lines and from the wall clock. Once
-//! such a link is open it is an ordinary `PeerLink` carrying ordinary
-//! traffic; the only thing that stays different is who re-establishes it
-//! when it drops.
+//! `~/.aloo/settings`' `direct_punch_to` lines and from the wall clock; a
+//! line that names a rendezvous realm rather than an address learns the
+//! "where" at each slot through `crate::client::hysteria_realm` instead. Once such
+//! a link is open it is an ordinary `PeerLink` carrying ordinary traffic;
+//! the only thing that stays different is who re-establishes it when it
+//! drops.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
@@ -38,10 +40,11 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use crate::client::p2p_reliable::{ArqReceiver, ArqSender};
+use crate::client::hysteria_realm::{self as realm, RawTaps};
+use crate::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use crate::proto::{self, ClientMessage, UserId};
-use crate::settings::PunchFrequency;
+use crate::settings::{DirectPunchVia, PunchFrequency};
 
 /// How long a link may sit waiting for the peer's relayed candidates
 /// before the attempt is abandoned and retried. Generous because it covers
@@ -146,28 +149,33 @@ struct DirectTarget {
     /// (`crate::settings::DirectPunchTarget::device_id`). `None` behaves
     /// exactly as every target did before this field existed.
     device_id: Option<String>,
-    host: String,
-    /// Every port this peer may be reachable on
-    /// (`settings::DirectPunchTarget::ports`), probed together until one
-    /// of them answers.
-    ports: Vec<u16>,
+    /// Where the line says they are: a fixed host and port, or a
+    /// rendezvous realm that says so at each slot
+    /// (`settings::DirectPunchVia`).
+    via: DirectPunchVia,
     frequency: PunchFrequency,
     /// The `UserId` this peer's link is filed under locally. Synthetic
     /// (`direct_peer_id`) until the server tells us their real one, at
     /// which point `set_direct_peer_id` moves the target onto it so a peer
     /// reachable both ways still has just one link.
     peer: UserId,
-    /// The host's address, resolved at the start of an attempt rather than
-    /// once at startup - the whole point of naming a host instead of an
-    /// address is that a home connection's address moves. Only the address:
-    /// which port to pair it with is `ports`, all of them until one answers.
+    /// A fixed host's address, resolved at the start of an attempt rather
+    /// than once at startup - the whole point of naming a host instead of
+    /// an address is that a home connection's address moves. Always `None`
+    /// for a realm target, which has no host to resolve.
     resolved_ip: Option<std::net::IpAddr>,
     /// The one address this peer has actually answered from, once they
-    /// have. `Some` narrows every later probe to it - a port that worked is
-    /// the port that survived both routers' rewriting, and re-probing the
-    /// rest is pure noise. Cleared when the link drops, which is exactly
-    /// when the surviving port may no longer be the surviving port.
+    /// have - or, for a realm target, the address the rendezvous punch
+    /// opened. `Some` narrows every later probe to it: the address that
+    /// worked is the one that survived both routers' rewriting, and the
+    /// configured one is at best a guess. Cleared when the link drops,
+    /// which is exactly when the surviving address may no longer be the
+    /// surviving address.
     addr: Option<SocketAddr>,
+    /// The rendezvous task in flight for a realm target's current attempt
+    /// (`realm::run_attempt`), aborted with the attempt so a window that
+    /// closes never leaves a registration behind.
+    realm_attempt: Option<RealmAttempt>,
     state: DirectState,
     /// Which slot of the hour was last acted on, so one slot fires once.
     /// Seeded with the slot in progress when the target is configured, so a
@@ -178,23 +186,42 @@ struct DirectTarget {
     reconnects: u32,
 }
 
+/// A spawned `realm::run_attempt`, aborted on drop.
+struct RealmAttempt(tokio::task::JoinHandle<()>);
+
+impl Drop for RealmAttempt {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl DirectTarget {
     /// Where this slot's probes go: the single address the peer has
-    /// answered from once there is one, and otherwise every configured
-    /// port on the resolved host - the whole point of naming several, since
-    /// a NAT that rewrites the source port makes it unknowable in advance
-    /// which of them a router will let through (`docs/PROTOCOL.md` §7.1.5).
-    /// Empty while the host is still unresolved, which is what asks the
-    /// caller for a `DirectResolve` instead.
+    /// answered from (or the rendezvous punched open) once there is one,
+    /// and otherwise the configured port on the resolved host. Empty
+    /// while a host is still unresolved - which is what asks the caller
+    /// for a `DirectResolve` - and while a realm target's rendezvous has
+    /// not yet said where the peer is.
     fn probe_addrs(&self) -> Vec<SocketAddr> {
         if let Some(addr) = self.addr {
             return vec![addr];
         }
-        let Some(ip) = self.resolved_ip else {
-            return Vec::new();
-        };
-        self.ports.iter().map(|port| SocketAddr::new(ip, *port)).collect()
+        match (&self.via, self.resolved_ip) {
+            (DirectPunchVia::Host { port, .. }, Some(ip)) => vec![SocketAddr::new(ip, *port)],
+            _ => Vec::new(),
+        }
     }
+
+    /// Whether the line names a host that has to be looked up in DNS.
+    fn needs_resolving(&self) -> bool {
+        matches!(&self.via, DirectPunchVia::Host { host, .. } if host.parse::<std::net::IpAddr>().is_err())
+    }
+}
+
+/// What one `realm::run_attempt` reports back to the scheduler.
+struct RealmOutcome {
+    target_key: String,
+    result: Result<SocketAddr, String>,
 }
 
 /// The serverless direct-punch scheduler's whole state, present only when
@@ -214,6 +241,12 @@ struct DirectPunch {
     /// so a session that never turns `direct_punch` on never touches
     /// `~/.aloo/banned_ips.log` at all.
     ip_bans: crate::client::ip_ban::IpBanList,
+    /// Where the rendezvous tasks report (`RealmOutcome`), drained by
+    /// `direct_tick` - a channel the scheduler polls on its own tick
+    /// rather than an event the session has to route back, so a realm
+    /// target needs nothing of the caller that a fixed one does not.
+    realm_results_tx: UnboundedSender<RealmOutcome>,
+    realm_results_rx: tokio::sync::mpsc::UnboundedReceiver<RealmOutcome>,
 }
 
 /// The local `UserId` a peer known only by nickname is filed under.
@@ -723,11 +756,6 @@ struct PeerLink {
     reported: LinkStatus,
     arq_tx: ArqSender,
     arq_rx: ArqReceiver,
-    /// Index into `PeerLinkManager::sockets` of the socket this peer's
-    /// traffic actually arrives on, and therefore the only one their NAT
-    /// holds a mapping for. Everything sent to them has to leave from it;
-    /// `0` (the primary) until one of their datagrams says otherwise.
-    socket_idx: usize,
 }
 
 impl PeerLink {
@@ -739,7 +767,6 @@ impl PeerLink {
             pending: VecDeque::new(),
             attempts: 0,
             reported: LinkStatus::Connecting,
-            socket_idx: 0,
             arq_tx: ArqSender::new(),
             arq_rx: ArqReceiver::new(),
         }
@@ -770,17 +797,15 @@ impl PeerLink {
 /// forwarding raw datagrams in over a channel, exactly like the existing
 /// TCP-reader task pattern.
 pub struct PeerLinkManager {
-    /// Every bound UDP socket, `sockets[0]` being the primary: the one the
-    /// server rendezvous talks to and the default for any link that has
-    /// not pinned another. The rest exist only for direct punching, where
-    /// what a peer can reach you on is exactly the set of ports you send
-    /// *from* - so being reachable on several means binding several
-    /// (`docs/PROTOCOL.md` §7.1.5).
-    sockets: Vec<Arc<UdpSocket>>,
-    /// `sockets[i]`'s local port, cached at bind time - the pairing that
-    /// decides which socket probes which of a peer's ports runs on every
-    /// tick, and asking the OS each time would be a syscall per probe.
-    socket_ports: Vec<u16>,
+    /// The session's one UDP socket: everything peer-to-peer leaves from
+    /// it and arrives on it, the server rendezvous and a realm's STUN and
+    /// punch traffic included - a NAT mapping belongs to a socket, so the
+    /// socket that discovered the mapping has to be the one that uses it.
+    socket: Arc<UdpSocket>,
+    /// The rendezvous attempts listening on `socket` right now, consulted
+    /// by the receive loop before any of aloo's own decoding
+    /// (`realm::RawTaps`).
+    raw_taps: RawTaps,
     /// The server's UDP rendezvous socket: the only address this manager
     /// ever talks to that isn't a peer, and the discriminator that tells
     /// rendezvous replies from punch traffic. `None` with no server at all
@@ -862,52 +887,7 @@ impl PeerLinkManager {
         server_udp_addr: Option<SocketAddr>,
         events_tx: UnboundedSender<P2pEvent>,
     ) -> std::io::Result<(Self, Arc<UdpSocket>)> {
-        let (manager, sockets) = Self::bind_all(&[bind_addr], server_udp_addr, events_tx).await?;
-        let socket = sockets.into_iter().next().expect("bind_all returns at least one socket");
-        Ok((manager, socket))
-    }
-
-    /// `bind`, for the several ports serverless direct punching wants
-    /// (`settings::Settings::direct_punch_ports`). The first address that
-    /// binds becomes the primary; a later one that is already in use is
-    /// reported and skipped rather than being fatal, since the ports that
-    /// did bind are still ports a peer can reach this client on. Fails
-    /// only when *none* of them bind, leaving the caller its usual
-    /// fall-back-to-ephemeral path.
-    pub async fn bind_all(
-        bind_addrs: &[SocketAddr],
-        server_udp_addr: Option<SocketAddr>,
-        events_tx: UnboundedSender<P2pEvent>,
-    ) -> std::io::Result<(Self, Vec<Arc<UdpSocket>>)> {
-        let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
-        let mut first_error = None;
-        for addr in bind_addrs {
-            match UdpSocket::bind(addr).await {
-                Ok(socket) => sockets.push(Arc::new(socket)),
-                Err(e) => {
-                    if !sockets.is_empty() {
-                        crate::log_warn!(
-                            "could not bind the direct-punch port {} ({e}) - punching \
-                             continues on the other ports, but no peer can reach this \
-                             client on that one",
-                            addr.port()
-                        );
-                    }
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-        if sockets.is_empty() {
-            return Err(first_error
-                .unwrap_or_else(|| std::io::Error::other("no address to bind")));
-        }
-        let socket = sockets[0].clone();
-        let socket_ports = sockets
-            .iter()
-            .map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0))
-            .collect();
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
         let local_addr = socket.local_addr()?;
         let local_is_ipv6 = local_addr.is_ipv6();
         let reflexive = match server_udp_addr {
@@ -917,8 +897,8 @@ impl PeerLinkManager {
 
         Ok((
             Self {
-                sockets: sockets.clone(),
-                socket_ports,
+                socket: socket.clone(),
+                raw_taps: RawTaps::new(),
                 server_udp_addr,
                 host_candidates: host_candidates(local_addr.port(), local_is_ipv6),
                 local_is_ipv6,
@@ -933,22 +913,16 @@ impl PeerLinkManager {
                 queue_held: HashSet::new(),
                 events_tx,
             },
-            sockets,
+            socket,
         ))
     }
 
-    /// The primary socket: the server rendezvous, and anything not aimed
-    /// at one particular peer.
-    fn primary(&self) -> &Arc<UdpSocket> {
-        &self.sockets[0]
-    }
-
-    /// The socket `peer`'s link is pinned to - the one their datagrams
-    /// arrive on, and so the only one their NAT will accept a reply
-    /// through. Falls back to the primary for a peer with no link yet.
-    fn socket_for(&self, peer: UserId) -> &Arc<UdpSocket> {
-        let idx = self.links.get(&peer).map_or(0, |l| l.socket_idx);
-        self.sockets.get(idx).unwrap_or_else(|| self.primary())
+    /// The demultiplexer the receive loop on this manager's socket must
+    /// consult (`spawn_receive_loop`): it is what lets a realm attempt's
+    /// STUN replies and punch packets share the socket with everything
+    /// else.
+    pub fn raw_taps(&self) -> RawTaps {
+        self.raw_taps.clone()
     }
 
     /// Every address this client can currently be reached at, in the order
@@ -1201,7 +1175,7 @@ impl PeerLinkManager {
             link_nonce: link.link_nonce,
         });
         for addr in &link.candidates {
-            send_dgram(self.socket_for(peer), &dgram, *addr);
+            send_dgram(&self.socket, &dgram, *addr);
         }
     }
 
@@ -1243,7 +1217,7 @@ impl PeerLinkManager {
             self.test_drop_delivery_acks -= 1;
             return;
         }
-        let socket = self.socket_for(peer).clone();
+        let socket = self.socket.clone();
         // The durable queue is asked *before* "is there a link record",
         // not after: a peer who disconnected has had theirs forgotten
         // (`session::drop_peer_state`), and content for them would
@@ -1334,7 +1308,7 @@ impl PeerLinkManager {
             });
             return;
         }
-        let socket = self.socket_for(peer).clone();
+        let socket = self.socket.clone();
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
@@ -1383,31 +1357,19 @@ impl PeerLinkManager {
     /// Feeds one datagram straight off `spawn_receive_loop` to whichever
     /// of the two protocols it belongs to.
     pub fn on_inbound(&mut self, addr: SocketAddr, dgram: InboundDatagram) {
-        self.on_inbound_on(0, addr, dgram)
-    }
-
-    /// `on_inbound`, naming which of `sockets` the datagram arrived on -
-    /// the socket a reply has to leave from, since it is the only one the
-    /// sender's NAT holds a mapping for.
-    pub fn on_inbound_on(&mut self, socket_idx: usize, addr: SocketAddr, dgram: InboundDatagram) {
         match dgram {
-            InboundDatagram::Punch(dgram) => self.on_datagram_on(socket_idx, addr, dgram),
+            InboundDatagram::Punch(dgram) => self.on_datagram(addr, dgram),
             InboundDatagram::Rendezvous(msg) => self.on_rendezvous(addr, msg),
         }
     }
 
-    /// `on_datagram_at`, at the current time, on the primary socket.
-    pub fn on_datagram(&mut self, addr: SocketAddr, dgram: PunchDatagram) {
-        self.on_datagram_at(0, addr, dgram, Instant::now());
-    }
-
-    /// `on_datagram`, naming the receiving socket.
-    pub fn on_datagram_on(&mut self, socket_idx: usize, addr: SocketAddr, dgram: PunchDatagram) {
-        self.on_datagram_at(socket_idx, addr, dgram, Instant::now());
-    }
-
     /// Feeds one received punch datagram, already demuxed to `addr` by the
     /// caller's receive loop, into the relevant link.
+    pub fn on_datagram(&mut self, addr: SocketAddr, dgram: PunchDatagram) {
+        self.on_datagram_at(addr, dgram, Instant::now());
+    }
+
+    /// `on_datagram` at an injected instant.
     ///
     /// Attribution is by source address where one is known, and otherwise
     /// by `link_nonce` against a link currently being established - which
@@ -1425,13 +1387,7 @@ impl PeerLinkManager {
     /// `now` is injected (rather than read here) so a test can exercise
     /// `LINK_IDLE_TIMEOUT`'s liveness window without sleeping through it,
     /// the same seam `tick`/`tick_at` already provides.
-    pub fn on_datagram_at(
-        &mut self,
-        socket_idx: usize,
-        addr: SocketAddr,
-        dgram: PunchDatagram,
-        now: Instant,
-    ) {
+    pub fn on_datagram_at(&mut self, addr: SocketAddr, dgram: PunchDatagram, now: Instant) {
         match dgram {
             PunchDatagram::Ping { link_nonce } => {
                 let peer = self.attribute(addr, link_nonce);
@@ -1443,9 +1399,9 @@ impl PeerLinkManager {
                     return;
                 };
                 self.adopt_candidate(peer, addr);
-                self.note_received(peer, socket_idx, now);
+                self.note_received(peer, now);
                 send_dgram(
-                    self.socket_for(peer),
+                    &self.socket,
                     &encode_dgram(&PunchDatagram::Pong { link_nonce }),
                     addr,
                 );
@@ -1467,15 +1423,15 @@ impl PeerLinkManager {
                 // nothing, it just proves the peer is still there for
                 // `LINK_IDLE_TIMEOUT`'s benefit.
                 if let Some(peer) = self.attribute(addr, link_nonce) {
-                    self.note_received(peer, socket_idx, now);
+                    self.note_received(peer, now);
                 }
             }
             PunchDatagram::Ack { seq } => {
                 let Some(&peer) = self.addr_index.get(&addr) else {
                     return;
                 };
-                self.note_received(peer, socket_idx, now);
-                let socket = self.socket_for(peer).clone();
+                self.note_received(peer, now);
+                let socket = self.socket.clone();
                 let mut delivered = Vec::new();
                 if let Some(link) = self.links.get_mut(&peer) {
                     // Retiring this frame may release the next one waiting
@@ -1499,7 +1455,7 @@ impl PeerLinkManager {
                 let Some(&peer) = self.addr_index.get(&addr) else {
                     return;
                 };
-                self.note_received(peer, socket_idx, now);
+                self.note_received(peer, now);
                 self.on_reliable(peer, addr, seq, payload);
             }
             PunchDatagram::Unreliable {
@@ -1510,7 +1466,7 @@ impl PeerLinkManager {
                 let Some(&peer) = self.addr_index.get(&addr) else {
                     return;
                 };
-                self.note_received(peer, socket_idx, now);
+                self.note_received(peer, now);
                 let _ = self.events_tx.send(P2pEvent::StreamChunk {
                     from: peer,
                     stream_id,
@@ -1522,13 +1478,13 @@ impl PeerLinkManager {
                 if from.len() > crate::p2p_proto::MAX_DIRECT_PUNCH_NICK_LEN {
                     return;
                 }
-                self.on_direct_ping(socket_idx, addr, link_nonce, &from, now);
+                self.on_direct_ping(addr, link_nonce, &from, now);
             }
             PunchDatagram::DirectPong { link_nonce, from } => {
                 if from.len() > crate::p2p_proto::MAX_DIRECT_PUNCH_NICK_LEN {
                     return;
                 }
-                self.on_direct_pong(socket_idx, addr, link_nonce, &from, now);
+                self.on_direct_pong(addr, link_nonce, &from, now);
             }
         }
         self.sync_statuses();
@@ -1613,25 +1569,19 @@ impl PeerLinkManager {
         self.addr_index.insert(addr, peer);
     }
 
-    /// One attributed datagram arrived from `peer`, on `socket_idx`.
-    ///
-    /// Pinning here rather than at each establishment site is deliberate:
-    /// *any* datagram of theirs proves which socket their NAT holds a
-    /// mapping for, and a peer whose path moves mid-link (a re-punch that
-    /// lands on a different port) has to be followed, not answered on a
-    /// socket they can no longer receive from.
-    fn note_received(&mut self, peer: UserId, socket_idx: usize, now: Instant) {
+    /// One attributed datagram arrived from `peer`: the input to
+    /// `LINK_IDLE_TIMEOUT`'s liveness check.
+    fn note_received(&mut self, peer: UserId, now: Instant) {
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
-        link.socket_idx = socket_idx;
         if let PeerLinkState::Active { last_received, .. } = &mut link.state {
             *last_received = now;
         }
     }
 
     fn on_pong(&mut self, peer: UserId, addr: SocketAddr, link_nonce: u64, now: Instant) {
-        let socket = self.socket_for(peer).clone();
+        let socket = self.socket.clone();
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
@@ -1675,7 +1625,7 @@ impl PeerLinkManager {
         // whose ack was lost can recover.
         if let Some(ack) = link.arq_rx.ack_seq() {
             send_dgram(
-                self.socket_for(peer),
+                &self.socket,
                 &encode_dgram(&PunchDatagram::Ack { seq: ack }),
                 addr,
             );
@@ -1918,11 +1868,9 @@ impl PeerLinkManager {
         self.refresh_reflexive(now);
 
         let mut lost: Vec<(UserId, String)> = Vec::new();
-        // Arc handles, cloned before the loop takes `self.links` mutably -
-        // each link sends on the socket it is pinned to, not the primary.
-        let sockets = self.sockets.clone();
+        // An Arc handle, cloned before the loop takes `self.links` mutably.
+        let socket = self.socket.clone();
         for (&peer, link) in self.links.iter_mut() {
-            let socket = sockets.get(link.socket_idx).unwrap_or(&sockets[0]).clone();
             match &mut link.state {
                 PeerLinkState::Requested { started } => {
                     if now.duration_since(*started) >= SIGNAL_TIMEOUT {
@@ -2017,7 +1965,7 @@ impl PeerLinkManager {
         let request = encode_dgram_rendezvous(&RendezvousMessage::BindingRequest {
             token: self.reflexive_token,
         });
-        send_dgram(self.primary(), &request, server_udp_addr);
+        send_dgram(&self.socket, &request, server_udp_addr);
     }
 
     /// Moves a link out of service and schedules its next attempt. Never
@@ -2248,15 +2196,13 @@ impl PeerLinkManager {
                 let target = DirectTarget {
                     peer: direct_peer_id(&t.nickname, t.device_id.as_deref()),
                     // An address literal needs no resolver at all, so it
-                    // is usable from the very first slot; nothing is
-                    // *locked* yet, though, so the first slot still probes
-                    // every configured port.
-                    resolved_ip: t.host.parse::<std::net::IpAddr>().ok(),
+                    // is usable from the very first slot.
+                    resolved_ip: t.host().and_then(|h| h.parse::<std::net::IpAddr>().ok()),
                     addr: None,
+                    realm_attempt: None,
                     nickname: t.nickname,
                     device_id: t.device_id,
-                    host: t.host,
-                    ports: t.ports,
+                    via: t.via,
                     last_slot: Some(t.frequency.slot_of_hour(second_of_hour)),
                     frequency: t.frequency,
                     state: DirectState::Idle,
@@ -2273,10 +2219,15 @@ impl PeerLinkManager {
             );
             crate::client::ip_ban::IpBanList::new_empty(ip_ban_path)
         });
+        let (realm_results_tx, realm_results_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Replacing the scheduler drops every target with it, and a
+        // dropped target aborts the rendezvous it had in flight.
         self.direct = Some(DirectPunch {
             own_nick,
             targets,
             ip_bans,
+            realm_results_tx,
+            realm_results_rx,
         });
     }
 
@@ -2432,6 +2383,15 @@ impl PeerLinkManager {
     /// of the hour, which is the only clock the slot grid is defined
     /// against.
     fn direct_tick(&mut self, now: Instant, second_of_hour: u64) {
+        let mut outcomes = Vec::new();
+        if let Some(direct) = self.direct.as_mut() {
+            while let Ok(outcome) = direct.realm_results_rx.try_recv() {
+                outcomes.push(outcome);
+            }
+        }
+        for outcome in outcomes {
+            self.on_realm_outcome(&outcome.target_key, outcome.result, now);
+        }
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
@@ -2500,25 +2460,12 @@ impl PeerLinkManager {
 
     /// Starts one attempt at `target_key`: puts the peer's link into a
     /// fresh punch (the same `restart_attempt` every other establishment
-    /// path uses, so the reliable layer restarts with it) and either probes
-    /// straight away or asks the caller to resolve the host first.
+    /// path uses, so the reliable layer restarts with it) and then either
+    /// probes straight away, asks the caller to resolve the host first, or
+    /// - for a realm target - starts the rendezvous that will say where
+    /// the peer is (`realm::run_attempt`, reporting back through
+    /// `on_realm_outcome`).
     fn begin_direct_attempt(&mut self, target_key: &str, now: Instant) {
-        self.begin_direct_attempt_on(target_key, now, None)
-    }
-
-    /// `begin_direct_attempt`, pinning the link to `socket_idx` first.
-    ///
-    /// An attempt opened by a peer's own probe already knows the one socket
-    /// that peer can be answered on, and the attempt's first probes go out
-    /// before anything else could pin it - so without this they would leave
-    /// from the primary, which is exactly the socket their NAT has no
-    /// mapping for.
-    fn begin_direct_attempt_on(
-        &mut self,
-        target_key: &str,
-        now: Instant,
-        pin: Option<usize>,
-    ) {
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
@@ -2526,16 +2473,25 @@ impl PeerLinkManager {
             return;
         };
         let peer = target.peer;
-        let host = target.host.clone();
-        // Only ever used to satisfy `lookup_host`'s signature - the answer
-        // is taken apart for its address and re-paired with every port in
-        // `ports`, so which one is asked with makes no difference.
-        let resolve_port = target
-            .ports
-            .first()
-            .copied()
-            .unwrap_or(crate::settings::DEFAULT_DIRECT_PUNCH_PORT);
         let probe_addrs = target.probe_addrs();
+        let resolve = match &target.via {
+            DirectPunchVia::Host { host, port } if probe_addrs.is_empty() => {
+                Some((host.clone(), *port))
+            }
+            _ => None,
+        };
+        let rendezvous = match &target.via {
+            DirectPunchVia::Realm(realm) if target.addr.is_none() => Some(realm::AttemptConfig {
+                realm: realm.clone(),
+                role: realm::role_for(&direct.own_nick, &target.nickname),
+                socket: self.socket.clone(),
+                local_addrs: self.host_candidates.clone(),
+                local_is_ipv6: self.local_is_ipv6,
+                window: DIRECT_PUNCH_WINDOW,
+                peer_label: target_key.to_string(),
+            }),
+            _ => None,
+        };
         // Step 4/6: a link that is already up - however it got there - is
         // never punched again.
         if matches!(
@@ -2548,18 +2504,14 @@ impl PeerLinkManager {
             target.state = DirectState::Punching { started: now };
         }
         self.restart_attempt(peer, now);
-        // After `restart_attempt`, which rebuilds the link's state.
-        if let Some(idx) = pin
-            && let Some(link) = self.links.get_mut(&peer)
-        {
-            link.socket_idx = idx;
-        }
-        if probe_addrs.is_empty() {
+        if let Some((host, port)) = resolve {
             let _ = self.events_tx.send(P2pEvent::DirectResolve {
                 target_key: target_key.to_string(),
                 host,
-                port: resolve_port,
+                port,
             });
+        } else if let Some(cfg) = rendezvous {
+            self.spawn_realm_attempt(target_key, cfg);
         } else {
             for addr in probe_addrs {
                 self.adopt_candidate(peer, addr);
@@ -2567,6 +2519,53 @@ impl PeerLinkManager {
             self.send_direct_ping(target_key);
         }
         self.sync_statuses();
+    }
+
+    /// Runs one realm rendezvous for `target_key` in the background,
+    /// replacing (and so aborting) any earlier one still in flight.
+    fn spawn_realm_attempt(&mut self, target_key: &str, cfg: realm::AttemptConfig) {
+        let Some(direct) = self.direct.as_mut() else {
+            return;
+        };
+        let results = direct.realm_results_tx.clone();
+        let taps = self.raw_taps.clone();
+        let key = target_key.to_string();
+        let handle = tokio::spawn(async move {
+            let result = realm::run_attempt(cfg, taps).await;
+            let _ = results.send(RealmOutcome { target_key: key, result });
+        });
+        if let Some(target) = direct.targets.get_mut(target_key) {
+            target.realm_attempt = Some(RealmAttempt(handle));
+        }
+    }
+
+    /// What a realm rendezvous came back with. Success names the address
+    /// the punch opened on the peer's side, which from here on is treated
+    /// exactly as a resolved host would be: adopted as the link's
+    /// candidate and probed with `DirectPing`, so the link activates
+    /// through the same `DirectPong` path every other direct link does.
+    /// Failure is logged and leaves the attempt to run out its window,
+    /// exactly like a host that does not resolve.
+    fn on_realm_outcome(&mut self, target_key: &str, result: Result<SocketAddr, String>, now: Instant) {
+        let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(target_key)) else {
+            return;
+        };
+        target.realm_attempt = None;
+        if !matches!(target.state, DirectState::Punching { .. }) {
+            return;
+        }
+        let peer = target.peer;
+        match result {
+            Ok(addr) => {
+                target.addr = Some(addr);
+                self.rearm_direct_link(target_key, now);
+                self.adopt_candidate(peer, addr);
+                self.send_direct_ping(target_key);
+            }
+            Err(reason) => {
+                crate::log_warn!("direct punch to {target_key} through its realm did not open: {reason}");
+            }
+        }
     }
 
     /// Feeds back the address the caller resolved for a `DirectResolve`.
@@ -2589,7 +2588,7 @@ impl PeerLinkManager {
         }
         target.resolved_ip = Some(addr.ip());
         let peer = target.peer;
-        // Every configured port on the address that just resolved - the
+        // The configured port on the address that just resolved - the
         // resolver was only ever asked for the host half.
         for addr in target.probe_addrs() {
             self.adopt_candidate(peer, addr);
@@ -2599,7 +2598,8 @@ impl PeerLinkManager {
 
     /// Where the next probe for `target_key` would be sent. Test-only
     /// window onto `DirectTarget::probe_addrs`, so a scenario can show the
-    /// sweep narrowing to one port and widening again.
+    /// probe following the address a peer answered from and returning to
+    /// the configured one when the link drops.
     pub fn direct_probe_addrs_for_test(&self, target_key: &str) -> Vec<SocketAddr> {
         self.direct
             .as_ref()
@@ -2656,44 +2656,9 @@ impl PeerLinkManager {
             link_nonce: link.link_nonce,
             from: direct.own_nick.clone(),
         });
-        for (socket, addr) in self.direct_probe_pairs(target) {
-            send_dgram(socket, &dgram, addr);
+        for addr in target.probe_addrs() {
+            send_dgram(&self.socket, &dgram, addr);
         }
-    }
-
-    /// Which socket each of this slot's probes leaves from, paired by
-    /// port: the socket bound to 18000 probes the peer's 18000.
-    ///
-    /// Pairing is what makes a shared port list symmetric. What a peer can
-    /// reach us on is the set of ports we send *from*, so probing their
-    /// 19000 from our 18000 would leave our 19000 unmapped and useless.
-    /// Paired, both sides end up reachable on every port in the list, and
-    /// a router that leaves any one of them alone is enough to connect.
-    ///
-    /// A peer port this side has no socket for still gets probed, from the
-    /// primary: two settings files that disagree should punch with fewer
-    /// chances rather than none.
-    fn direct_probe_pairs(&self, target: &DirectTarget) -> Vec<(&Arc<UdpSocket>, SocketAddr)> {
-        // Locked: one address, from the socket their reply arrived on.
-        if let Some(addr) = target.addr {
-            return vec![(self.socket_for(target.peer), addr)];
-        }
-        let Some(ip) = target.resolved_ip else {
-            return Vec::new();
-        };
-        target
-            .ports
-            .iter()
-            .map(|port| {
-                let socket = self
-                    .socket_ports
-                    .iter()
-                    .position(|p| p == port)
-                    .and_then(|i| self.sockets.get(i))
-                    .unwrap_or_else(|| self.primary());
-                (socket, SocketAddr::new(ip, *port))
-            })
-            .collect()
     }
 
     /// An attempt that used up its whole `DIRECT_PUNCH_WINDOW` without the
@@ -2707,6 +2672,8 @@ impl PeerLinkManager {
             return;
         };
         let peer = target.peer;
+        // A rendezvous still running has nothing left to run for.
+        target.realm_attempt = None;
         let retry = target.reconnects > 0 && target.reconnects < DIRECT_MAX_RECONNECTS;
         if retry {
             target.reconnects += 1;
@@ -2748,13 +2715,14 @@ impl PeerLinkManager {
         }
         target.reconnects = 1;
         target.state = DirectState::Idle;
-        // The port that was working is no longer known to work, and on a
-        // NAT that reassigns its mappings it very likely is not: unlock,
-        // so the reconnect sweeps every configured port again. A named host
-        // is re-resolved with it, since an address that moved is the other
+        // The address that was working is no longer known to work, and on
+        // a NAT that reassigns its mappings it very likely is not: unlock,
+        // so the reconnect starts from the configured address (or, for a
+        // realm target, from a fresh rendezvous) again. A named host is
+        // re-resolved with it, since an address that moved is the other
         // reason a link drops for good.
         target.addr = None;
-        if target.host.parse::<std::net::IpAddr>().is_err() {
+        if target.needs_resolving() {
             target.resolved_ip = None;
         }
         self.begin_direct_attempt(nickname, now);
@@ -2796,10 +2764,10 @@ impl PeerLinkManager {
                 if let Some((key, _)) = many.iter().find(|(_, t)| t.addr == Some(addr)) {
                     return Some((*key).clone());
                 }
-                // Then a target that actually names this address among
-                // the ones it probes: two devices behind one host are told
-                // apart by the port their line configured, which is what
-                // a first-ever ping from either of them carries.
+                // Then a target that actually names this address: two
+                // devices behind one host are told apart by the port
+                // their line configured, which is what a first-ever ping
+                // from either of them carries.
                 if let Some((key, _)) = many.iter().find(|(_, t)| t.probe_addrs().contains(&addr)) {
                     return Some((*key).clone());
                 }
@@ -2825,14 +2793,7 @@ impl PeerLinkManager {
     /// `direct_punch_to` - anyone else gets nothing back, so the port is no
     /// more discoverable by probing it than the session socket is (§7.1's
     /// same rule for an unattributable `Ping`).
-    fn on_direct_ping(
-        &mut self,
-        socket_idx: usize,
-        addr: SocketAddr,
-        link_nonce: u64,
-        from: &str,
-        now: Instant,
-    ) {
+    fn on_direct_ping(&mut self, addr: SocketAddr, link_nonce: u64, from: &str, now: Instant) {
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
@@ -2880,11 +2841,11 @@ impl PeerLinkManager {
             target.addr = Some(addr);
         }
         if idle {
-            self.begin_direct_attempt_on(&target_key, now, Some(socket_idx));
+            self.begin_direct_attempt(&target_key, now);
         }
-        self.note_received(peer, socket_idx, now);
+        self.note_received(peer, now);
         send_dgram(
-            self.socket_for(peer),
+            &self.socket,
             &encode_dgram(&PunchDatagram::DirectPong {
                 link_nonce,
                 from: own_nick,
@@ -2900,14 +2861,7 @@ impl PeerLinkManager {
     /// Handles a `DirectPong`: our own attempt answered. Activation is the
     /// ordinary `on_pong` - from here the link is indistinguishable from
     /// one the server helped arrange.
-    fn on_direct_pong(
-        &mut self,
-        socket_idx: usize,
-        addr: SocketAddr,
-        link_nonce: u64,
-        from: &str,
-        now: Instant,
-    ) {
+    fn on_direct_pong(&mut self, addr: SocketAddr, link_nonce: u64, from: &str, now: Instant) {
         let Some(target_key) = self.resolve_incoming_direct_target(addr, from) else {
             return;
         };
@@ -2922,9 +2876,7 @@ impl PeerLinkManager {
         }
         let peer = target.peer;
         self.adopt_candidate(peer, addr);
-        // Pinned before activating: `on_pong` builds the Active state and
-        // sends on it, so the socket has to be known first.
-        self.note_received(peer, socket_idx, now);
+        self.note_received(peer, now);
         self.on_pong(peer, addr, link_nonce, now);
         if !self.is_active(peer) {
             return;
@@ -2932,6 +2884,7 @@ impl PeerLinkManager {
         if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(&target_key)) {
             target.state = DirectState::Established;
             target.addr = Some(addr);
+            target.realm_attempt = None;
             // The budget bounds one outage, not the session: a link that
             // came back has nothing left to answer for.
             target.reconnects = 0;
@@ -3440,31 +3393,18 @@ fn warn_unusable_reflexive(observed: SocketAddr) {
 
 /// Spawned once per session (mirrors `session.rs`'s TCP-reader task):
 /// forwards every subsequent datagram on `socket` to `PeerLinkManager` via
-/// `raw_tx`, for the main select loop to process with `on_datagram`/
-/// `on_rendezvous`. Kept as a thin decode-and-forward task rather than
-/// driving `PeerLinkManager` itself, so all link-state mutation stays on
-/// the single-threaded session loop. Which decoder to use is decided by
-/// source address (see `InboundDatagram`).
+/// `raw_tx`, for the main select loop to process with `on_inbound`. Kept as
+/// a thin decode-and-forward task rather than driving `PeerLinkManager`
+/// itself, so all link-state mutation stays on the single-threaded session
+/// loop. Which decoder to use is decided by source address (see
+/// `InboundDatagram`) - after `taps` (`PeerLinkManager::raw_taps`) has had
+/// first refusal, since a realm attempt's STUN replies and punch packets
+/// arrive on this same socket and are noise to every decoder here.
 pub fn spawn_receive_loop(
     socket: Arc<UdpSocket>,
     server_udp_addr: Option<SocketAddr>,
+    taps: RawTaps,
     raw_tx: UnboundedSender<(SocketAddr, InboundDatagram)>,
-) {
-    spawn_receive_loop_on(socket, 0, server_udp_addr, move |_, addr, dgram| {
-        raw_tx.send((addr, dgram)).is_ok()
-    });
-}
-
-/// `spawn_receive_loop`, tagging everything it reads with `socket_idx` -
-/// which of `PeerLinkManager`'s sockets it came in on. With several bound
-/// for direct punching (`settings::Settings::direct_punch_ports`) there is
-/// one of these per socket, all feeding the same channel, because a reply
-/// has to leave from the socket its prompt arrived on.
-pub fn spawn_receive_loop_on(
-    socket: Arc<UdpSocket>,
-    socket_idx: usize,
-    server_udp_addr: Option<SocketAddr>,
-    deliver: impl Fn(usize, SocketAddr, InboundDatagram) -> bool + Send + 'static,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -3490,6 +3430,9 @@ pub fn spawn_receive_loop_on(
                     continue;
                 }
             };
+            if taps.demux(addr, &buf[..n]) {
+                continue;
+            }
             let decoded = if server_udp_addr == Some(addr) {
                 proto::decode::<RendezvousMessage>(&buf[..n])
                     .ok()
@@ -3502,7 +3445,7 @@ pub fn spawn_receive_loop_on(
             let Some(decoded) = decoded else {
                 continue;
             };
-            if !deliver(socket_idx, addr, decoded) {
+            if raw_tx.send((addr, decoded)).is_err() {
                 // The receiving end (`session.rs`'s `p2p_raw_rx`) is gone,
                 // meaning the whole session has already ended - nothing
                 // left for this loop to deliver to.

@@ -503,20 +503,38 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                previous one's acknowledgement; with queueing off a message to someone \
                unreachable is refused instead, so no pad is spent. OTP: \
                the low-key warning threshold \
-               and which otp binary to run. Direct Punch: reach someone with no server \
-               involved - 'a' adds a target with their nickname, and where their client is \
-               (an IPv4/IPv6 address or hostname, optionally :port), and how often to try \
-               - every_1m, every_5m, ... every_55m or every_1h. Every schedule restarts at \
+               and which otp binary to run. Direct Punch: reach someone with no aloo \
+               server involved - 'a' adds a target with their nickname, and where their \
+               client is, and how often to try - every_1m, every_5m, ... every_55m or \
+               every_1h. The 'where' is either a fixed address (an IPv4/IPv6 address or \
+               hostname, optionally :port) or a rendezvous realm - realm://token@host/name, \
+               typed straight into the host box with the port left empty. Use a realm when \
+               a fixed address never connects, which is most home routers: they rewrite the \
+               port you send from, so a fixed number arrives nowhere. A realm is a meeting \
+               point on a public Hysteria server (realm.hy2.io by default, not an aloo \
+               server) where the two of you learn each other's real outer address by STUN \
+               and punch straight at it. Adding a target ('a') starts with a ready-made \
+               public realm already filled in - a random, unguessable name - so keep it and \
+               just add the nickname, then share that exact line with the other person, \
+               since you only meet if both carry the same one; to punch a fixed address \
+               instead, type it straight over the realm in the host box. The two of you are \
+               introduced through realm.hy2.io and public STUN servers (stun.nextcloud.com, \
+               stun.sip.us, global.stun.twilio.com) - these only introduce you to each \
+               other, no messages ever pass through them, though the rendezvous and STUN do \
+               see your outer IP, which is why a realm is opt-in per peer and both are \
+               swappable (realm+http://... self-hosted, ?stun=... your own). \
+               Every schedule restarts at \
                the top of the hour, so every_1m tries at :00, :01, :02... and every_1h at \
                :00 only - both sides trying at the same clock moments, with nothing \
                coordinating it but that. It only works if they've added you back the same \
-               way - your nickname, your public host/IP, and the *same* frequency - \
-               otherwise your two attempts never land at the same moment. If your own \
-               address moves (an ordinary home connection), turn on \
+               way - your nickname, your address or the same realm, and the *same* \
+               frequency - otherwise your two attempts never land at the same moment. If \
+               your own (fixed) address moves (an ordinary home connection), turn on \
                noip_when_no_server_and_direct_punch_is_active on that same tab and fill in \
                the No-IP hostname/username/password - aloo keeps that hostname pointed at \
                wherever you currently are, so you can give the other person a fixed \
-               hostname to punch at instead of a raw address that might change. Once at \
+               hostname to punch at instead of a raw address that might change (a realm \
+               solves the same problem a different way, and needs no No-IP). Once at \
                least one target is configured the header shows <active>/<total> (next: \
                <time>) - how many of them have a link right now, out of how many you \
                configured, and how long until the next attempt - green once every one is \

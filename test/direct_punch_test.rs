@@ -53,8 +53,7 @@ fn target(nickname: &str, port: u16, frequency: &str) -> DirectPunchTarget {
     DirectPunchTarget {
         nickname: nickname.to_string(),
         device_id: None,
-        host: "127.0.0.1".to_string(),
-        ports: vec![port],
+        via: aloo::settings::DirectPunchVia::Host { host: "127.0.0.1".to_string(), port },
         frequency: PunchFrequency::parse(frequency).unwrap(),
     }
 }
@@ -65,8 +64,7 @@ fn target_for_device(nickname: &str, device_id: &str, port: u16, frequency: &str
     DirectPunchTarget {
         nickname: nickname.to_string(),
         device_id: Some(device_id.to_string()),
-        host: "127.0.0.1".to_string(),
-        ports: vec![port],
+        via: aloo::settings::DirectPunchVia::Host { host: "127.0.0.1".to_string(), port },
         frequency: PunchFrequency::parse(frequency).unwrap(),
     }
 }
@@ -87,7 +85,7 @@ async fn spawn_client(rendezvous: SocketAddr) -> Client {
         .unwrap();
     let port = socket.local_addr().unwrap().port();
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(socket, Some(rendezvous), raw_tx);
+    aloo::client::p2p::spawn_receive_loop(socket, Some(rendezvous), link.raw_taps(), raw_tx);
     Client {
         link,
         port,
@@ -240,241 +238,48 @@ async fn dead_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port()
 }
 
-/// The point of binding several ports: a peer reaching this client on
-/// *any* of them is answered, and answered **from that same port** - the
-/// only one their NAT has a mapping for. One socket means one reachable
-/// port; three means three independent chances that a router leaves one
-/// alone.
-/// @requirement AC-438
-#[tokio::test]
-async fn a_peer_can_reach_this_client_on_any_bound_punch_port() {
-    let rendezvous = spawn_fake_rendezvous().await;
-    // Three fixed ports above the OS ephemeral range so nothing else has
-    // them, and inside the range a punch line accepts.
-    let ports = [61101u16, 61102, 61103];
-    let binds: Vec<SocketAddr> = ports
-        .iter()
-        .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
-        .collect();
-    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut alice, sockets) = PeerLinkManager::bind_all(&binds, Some(rendezvous), events_tx)
-        .await
-        .expect("all three ports are free");
-    assert_eq!(sockets.len(), 3, "every configured port is bound, not just the first");
-
-    // One receive loop per socket, all tagging what they read - exactly
-    // what a real session wires up.
-    let (raw_tx, mut raw_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, SocketAddr, InboundDatagram)>();
-    for (idx, socket) in sockets.into_iter().enumerate() {
-        let tx = raw_tx.clone();
-        aloo::client::p2p::spawn_receive_loop_on(socket, idx, Some(rendezvous), move |i, a, d| {
-            tx.send((i, a, d)).is_ok()
-        });
-    }
-    drop(raw_tx);
-
-    let bob = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let bob_addr = bob.local_addr().unwrap();
-    alice.configure_direct_punch(
-        "alice".into(),
-        vec![target("bob", bob_addr.port(), "every_1h")],
-        30,
-    );
-
-    // Bob reaches her on the LAST of the three - the one a router happened
-    // to leave alone. Nothing is due on an hourly grid, so only his probe
-    // can start anything.
-    let ping = aloo::proto::encode(&PunchDatagram::DirectPing {
-        link_nonce: 77,
-        from: "bob".to_string(),
-    })
-    .unwrap();
-    bob.send_to(&ping, format!("127.0.0.1:{}", ports[2]))
-        .await
-        .unwrap();
-
-    let (idx, from, dgram) = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
-        .await
-        .expect("the probe arrives on a bound port")
-        .unwrap();
-    assert_eq!(idx, 2, "tagged with the socket it actually arrived on");
-    alice.on_inbound_on(idx, from, dgram);
-
-    // She must answer FROM that same port: it is the only one bob's NAT
-    // would have a mapping for.
-    let mut buf = [0u8; 512];
-    let (n, src) = tokio::time::timeout(Duration::from_secs(2), bob.recv_from(&mut buf))
-        .await
-        .expect("alice answers a peer that reached her on any bound port")
-        .unwrap();
-    assert_eq!(
-        src.port(),
-        ports[2],
-        "the reply must leave from the socket the probe arrived on, not the primary"
-    );
-    match aloo::proto::decode::<PunchDatagram>(&buf[..n]).unwrap() {
-        PunchDatagram::DirectPong { from, .. } | PunchDatagram::DirectPing { from, .. } => {
-            assert_eq!(from, "alice")
-        }
-        other => panic!("unexpected answer: {other:?}"),
-    }
-}
-
-/// Not just that the right addresses are named, but that one slot really
-/// puts a probe on every one of them - "at once" is the whole property,
-/// since both peers are only aiming at the same moment for as long as the
-/// slot lasts.
-/// @requirement AC-434
-#[tokio::test]
-async fn one_slot_puts_a_probe_on_every_named_port() {
-    let rendezvous = spawn_fake_rendezvous().await;
-    let mut alice = spawn_client(rendezvous).await;
-    // Three real sockets, so what is asserted is delivery, not intent.
-    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let (pa, pb, pc) = (
-        a.local_addr().unwrap().port(),
-        b.local_addr().unwrap().port(),
-        c.local_addr().unwrap().port(),
-    );
-    let line = format!("bob,127.0.0.1:[{pa},{pb},{pc}],every_1m");
-    alice.link.configure_direct_punch(
-        "alice".into(),
-        vec![DirectPunchTarget::parse(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))],
-        30,
-    );
-
-    // Exactly one slot boundary, and nothing else.
-    let fired = Instant::now();
-    alice.link.tick_with_clock_at(fired, 60);
-
-    for (socket, port) in [(&a, pa), (&b, pb), (&c, pc)] {
-        let mut buf = [0u8; 512];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("port {port} was named but never probed"))
-            .unwrap();
-        match aloo::proto::decode::<PunchDatagram>(&buf[..n]).unwrap() {
-            PunchDatagram::DirectPing { from, .. } => assert_eq!(from, "alice"),
-            other => panic!("port {port} got {other:?} instead of a DirectPing"),
-        }
-    }
-    // All three left inside one tick, not spread over later ones.
-    assert!(
-        fired.elapsed() < DIRECT_PUNCH_WINDOW,
-        "every named port must be probed within the slot that opened it"
-    );
-}
-
-/// Two named ports can both get through - nothing stops a router mapping
-/// more than one. The first answer has to win outright, or the link would
-/// flap between two addresses that are both, briefly, working.
+/// The address a peer actually answers from - under NAT, rarely the one
+/// the settings line named - is locked in and becomes the only one
+/// probed, since it is the address that survived both routers' rewriting.
+/// Losing the link clears the lock and the next attempt goes back to the
+/// configured address, a NAT that reassigns its mappings being exactly
+/// why the address that worked may no longer work.
 /// @requirement AC-436
 #[tokio::test]
-async fn a_second_port_answering_does_not_move_a_link_that_is_already_up() {
-    let rendezvous = spawn_fake_rendezvous().await;
-    let mut alice = spawn_client(rendezvous).await;
-    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let (p1, p2) = (
-        first.local_addr().unwrap().port(),
-        second.local_addr().unwrap().port(),
-    );
-    let line = format!("bob,127.0.0.1:[{p1},{p2}],every_1m");
-    alice.link.configure_direct_punch(
-        "alice".into(),
-        vec![DirectPunchTarget::parse(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))],
-        30,
-    );
-    alice.link.tick_with_clock_at(Instant::now(), 60);
-
-    // Both ports really were probed, and both learn the same link nonce -
-    // one link, not one per port.
-    let nonce = {
-        let mut buf = [0u8; 512];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), first.recv_from(&mut buf))
-            .await
-            .expect("the first port was probed")
-            .unwrap();
-        match aloo::proto::decode::<PunchDatagram>(&buf[..n]).unwrap() {
-            PunchDatagram::DirectPing { link_nonce, .. } => link_nonce,
-            other => panic!("expected a DirectPing, got {other:?}"),
-        }
-    };
-    let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(2), second.recv_from(&mut buf))
-        .await
-        .expect("the second port was probed too")
-        .unwrap();
-    match aloo::proto::decode::<PunchDatagram>(&buf[..n]).unwrap() {
-        PunchDatagram::DirectPing { link_nonce, .. } => {
-            assert_eq!(link_nonce, nonce, "one link and one nonce, not one per port")
-        }
-        other => panic!("expected a DirectPing, got {other:?}"),
-    }
-
-    // The first port answers and takes the link.
-    let addr1: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
-    let addr2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
-    alice.link.on_datagram(
-        addr1,
-        PunchDatagram::DirectPong { link_nonce: nonce, from: "bob".into() },
-    );
-    let locked: Vec<SocketAddr> = alice.link.direct_probe_addrs_for_test("bob");
-    assert_eq!(locked, vec![addr1], "the first answer takes the link");
-
-    // The second answers a moment later and must change nothing.
-    alice.link.on_datagram(
-        addr2,
-        PunchDatagram::DirectPong { link_nonce: nonce, from: "bob".into() },
-    );
-    assert_eq!(
-        alice.link.direct_probe_addrs_for_test("bob"),
-        vec![addr1],
-        "a later answer on another port must not move a link that is already up"
-    );
-}
-
-/// The sweep narrows to what worked, and widens again when it stops
-/// working. Bob lists alice at a dead port on purpose: his own probes then
-/// reach nobody, so the only thing that can open this link is alice's
-/// sweep finding the one live port among the three.
-/// @requirement AC-434
-/// @requirement AC-436
-#[tokio::test]
-async fn the_answering_port_is_the_only_one_probed_until_the_link_drops() {
+async fn the_address_a_peer_answers_from_is_the_only_one_probed_until_the_link_drops() {
     let rendezvous = spawn_fake_rendezvous().await;
     let mut alice = spawn_client(rendezvous).await;
     let mut bob = spawn_client(rendezvous).await;
-    let (dead_a, dead_b) = (dead_port().await, dead_port().await);
-    let line = format!("bob,127.0.0.1:[{dead_a},{dead_b},{}],every_1m", bob.port);
+    // Alice's line names bob on a port he is not actually reachable on -
+    // the shape a source-port-rewriting NAT produces. Bob still reaches
+    // her, and his probe arrives from his real address, which is what her
+    // side must lock onto rather than the configured one.
+    let wrong_port = dead_port().await;
     alice.link.configure_direct_punch(
         "alice".into(),
-        vec![DirectPunchTarget::parse(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))],
+        vec![target("bob", wrong_port, "every_1m")],
         30,
     );
-    let alice_dead = dead_port().await;
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("alice", alice_dead, "every_1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
     let bob_id = direct_peer_id("bob", None);
 
-    // Before anything answers, every named port is in play.
+    // Before anything answers, the configured (wrong) address is what is
+    // probed.
     alice.link.tick_with_clock_at(Instant::now(), 60);
-    let swept: Vec<u16> = alice
+    let configured: Vec<u16> = alice
         .link
         .direct_probe_addrs_for_test("bob")
         .iter()
         .map(|a| a.port())
         .collect();
-    assert_eq!(swept, vec![dead_a, dead_b, bob.port], "all three are probed together");
+    assert_eq!(configured, vec![wrong_port], "the configured address is probed first");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !alice.link.is_active(bob_id) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the sweep never found the one live port"
+            "bob's own probe never opened the link"
         );
         tokio::select! {
             Some((addr, dgram)) = alice.raw_rx.recv() => alice.link.on_inbound(addr, dgram),
@@ -486,35 +291,28 @@ async fn the_answering_port_is_the_only_one_probed_until_the_link_drops() {
         }
     }
 
-    let narrowed: Vec<u16> = alice
+    // Locked to the address bob actually answered from - his real port,
+    // not the wrong one the line named.
+    let locked: Vec<u16> = alice
         .link
         .direct_probe_addrs_for_test("bob")
         .iter()
         .map(|a| a.port())
         .collect();
-    assert_eq!(
-        narrowed,
-        vec![bob.port],
-        "the port that answered is the one that survived - re-probing the rest is noise"
-    );
+    assert_eq!(locked, vec![bob.port], "the address that answered is the one probed");
 
-    // Losing the link reopens the question of which port works.
+    // Losing the link reopens the question, back to the configured address.
     let mut now = Instant::now() + LINK_IDLE_TIMEOUT + Duration::from_secs(1);
     alice.link.tick_with_clock_at(now, 60);
     now += Duration::from_millis(1);
     alice.link.tick_with_clock_at(now, 60);
-
     let widened: Vec<u16> = alice
         .link
         .direct_probe_addrs_for_test("bob")
         .iter()
         .map(|a| a.port())
         .collect();
-    assert_eq!(
-        widened,
-        vec![dead_a, dead_b, bob.port],
-        "a NAT that reassigns its mappings makes the port that worked no longer the one that works"
-    );
+    assert_eq!(widened, vec![wrong_port], "a dropped link goes back to the configured address");
 }
 
 /// @requirement AC-208

@@ -10,7 +10,7 @@ use ui_common::*;
 use aloo::client::tui::direct_punch_popup::DirectPunchField;
 use aloo::client::tui::settings_popup::SettingsField;
 use aloo::client::tui::ui::{Mode, UiAction, UiState, render};
-use aloo::settings::{DEFAULT_DIRECT_PUNCH_PORT, DirectPunchTarget, PunchFrequency};
+use aloo::settings::{DEFAULT_DIRECT_PUNCH_PORT, DirectPunchTarget, DirectPunchVia, PunchFrequency};
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -19,8 +19,7 @@ fn target(nickname: &str, host: &str, port: u16, frequency_minutes: u32) -> Dire
     DirectPunchTarget {
         nickname: nickname.to_string(),
         device_id: None,
-        host: host.to_string(),
-        ports: vec![port],
+        via: DirectPunchVia::Host { host: host.to_string(), port },
         frequency: PunchFrequency::parse(&format!("every_{frequency_minutes}m")).unwrap(),
     }
 }
@@ -125,16 +124,25 @@ fn esc_on_the_list_closes_the_whole_modal() {
 // The add/edit form
 // ---------------------------------------------------------------------
 
-/// @requirement AC-291
+/// Adding opens the form with a freshly generated public rendezvous realm
+/// already in the "where" - the robust default when no address is
+/// reachable - and only the nickname left to type.
+/// @requirement AC-437
 #[test]
-fn a_opens_a_blank_add_form() {
+fn a_opens_the_add_form_with_a_generated_realm() {
     let mut state = joined_general_with(vec![]);
     open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
     assert_eq!(edit.editing_index, None);
     assert_eq!(edit.nickname, "");
-    assert_eq!(edit.focus, DirectPunchField::Nickname);
+    assert_eq!(edit.focus, DirectPunchField::Nickname, "the nickname is what is left to type");
+    assert!(
+        edit.host.starts_with("realm://public@realm.hy2.io/"),
+        "the where is a generated public realm, got {:?}",
+        edit.host
+    );
+    assert!(edit.port.is_empty(), "a realm names no port");
 }
 
 /// The add form opens with the blinking terminal cursor visibly in the
@@ -379,12 +387,12 @@ fn enter_on_a_non_save_field_does_nothing() {
 // Saving and deleting
 // ---------------------------------------------------------------------
 
-/// The file spells a port list in brackets only because there its commas
-/// would collide with the commas between the line's own fields; a field of
-/// its own has no such collision, so it reads the way a list reads.
+/// One fixed port, typed as a plain number: the file spells the same line
+/// (`bobhost.example:19000`) and this is the whole of it, since there is
+/// no longer any list to spell.
 /// @requirement AC-437
 #[test]
-fn the_port_field_takes_a_comma_separated_list() {
+fn the_port_field_takes_a_single_port() {
     let mut state = joined_general_with(vec![]);
     open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
@@ -392,15 +400,131 @@ fn the_port_field_takes_a_comma_separated_list() {
     press(&mut state, KeyCode::Tab);
     type_str(&mut state, "bobhost.example");
     press(&mut state, KeyCode::Tab);
-    type_str(&mut state, "18000, 19000");
+    type_str(&mut state, "19000");
     press(&mut state, KeyCode::Tab);
     press(&mut state, KeyCode::Tab); // -> Save
 
     match press(&mut state, KeyCode::Enter) {
         Some(UiAction::SaveDirectPunchTargets(targets)) => {
             assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].host, "bobhost.example");
-            assert_eq!(targets[0].ports, [18000, 19000]);
+            assert_eq!(targets[0].host(), Some("bobhost.example"));
+            assert_eq!(targets[0].port(), Some(19000));
+        }
+        other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
+    }
+}
+
+/// A realm URI is typed straight into the host box, with the port left
+/// empty - it names a rendezvous, not an address, so there is no port to
+/// give. It saves as a realm target (`docs/PROTOCOL.md` §7.1.5).
+/// @requirement AC-437
+#[test]
+fn a_realm_uri_is_saved_as_a_realm_target_with_no_port() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "realm://public@realm.hy2.io/my-long-realm-name");
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab); // -> Frequency (no port typed)
+    press(&mut state, KeyCode::Tab); // -> Save
+
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::SaveDirectPunchTargets(targets)) => {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].host(), None, "a realm target names no host");
+            assert_eq!(targets[0].port(), None, "a realm target names no port");
+            assert_eq!(
+                targets[0].realm().map(|r| r.uri()),
+                Some("realm://public@realm.hy2.io/my-long-realm-name")
+            );
+        }
+        other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
+    }
+}
+
+/// A port typed next to a realm URI has nowhere to go in the saved line,
+/// so it is refused inline rather than silently dropped.
+/// @requirement AC-437
+#[test]
+fn a_realm_uri_with_a_port_is_refused_inline() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "realm://public@realm.hy2.io/my-long-realm-name");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "19000");
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab); // -> Save
+
+    assert_eq!(press(&mut state, KeyCode::Enter), None, "nothing is saved");
+    let punches = &state.settings_popup.as_ref().unwrap().punches;
+    assert!(punches.rows.is_empty(), "the bad row must not be added");
+    assert!(
+        punches.edit.as_ref().and_then(|e| e.error.as_ref()).is_some(),
+        "the reason is shown inline"
+    );
+}
+
+/// The generated realm is freshly random every add (it is the whole of the
+/// rendezvous's privacy, not a fixed placeholder), and keeping it - filling
+/// only the nickname - saves the realm target both peers then share.
+/// @requirement AC-437
+#[test]
+fn a_kept_generated_realm_is_random_and_saves_as_a_realm() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    let first = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().host.clone();
+    DirectPunchTarget::parse(&format!("x,{first},every_1m")).expect("the offered realm is valid");
+
+    press(&mut state, KeyCode::Esc);
+    press(&mut state, KeyCode::Char('a'));
+    let second = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().host.clone();
+    assert_ne!(first, second, "each realm offered is freshly random");
+
+    // Keep it: type only the nickname, tab past the untouched realm to Save.
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab); // nickname -> host
+    press(&mut state, KeyCode::Tab); // -> port
+    press(&mut state, KeyCode::Tab); // -> frequency
+    press(&mut state, KeyCode::Tab); // -> save
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::SaveDirectPunchTargets(targets)) => {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].nickname, "bob");
+            let realm = targets[0].realm().expect("a realm target");
+            assert_eq!(realm.host, "realm.hy2.io");
+            assert_eq!(realm.token, "public");
+            assert_eq!(targets[0].port(), None, "a realm names no port");
+        }
+        other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
+    }
+}
+
+/// Typing in the host box replaces the generated realm rather than
+/// appending to it, so a fixed address is entered by just typing it over -
+/// the first keystroke clears the suggestion.
+/// @requirement AC-437
+#[test]
+fn typing_a_host_replaces_the_generated_realm() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab); // -> host, holding the suggested realm
+    type_str(&mut state, "bobhost.example");
+    press(&mut state, KeyCode::Tab); // -> port
+    press(&mut state, KeyCode::Tab); // -> frequency
+    press(&mut state, KeyCode::Tab); // -> save
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::SaveDirectPunchTargets(targets)) => {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].host(), Some("bobhost.example"), "the typed address replaced the realm");
+            assert!(targets[0].realm().is_none(), "it is a fixed-address target, not a realm");
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }
@@ -419,7 +543,7 @@ fn a_port_outside_the_range_is_refused_inline_and_nothing_is_saved() {
     press(&mut state, KeyCode::Tab);
     type_str(&mut state, "bobhost.example");
     press(&mut state, KeyCode::Tab);
-    type_str(&mut state, "18000, 9000");
+    type_str(&mut state, "9000");
     press(&mut state, KeyCode::Tab);
     press(&mut state, KeyCode::Tab); // -> Save
 
@@ -434,17 +558,30 @@ fn a_port_outside_the_range_is_refused_inline_and_nothing_is_saved() {
     );
 }
 
+/// An existing fixed-port row comes back with its host and port in their
+/// boxes; a realm row comes back with its URI in the host box and no port.
 /// @requirement AC-437
 #[test]
-fn an_existing_rows_ports_come_back_comma_separated() {
+fn an_existing_row_comes_back_prefilled_for_editing() {
     let mut state = joined_general_with(vec![]);
     open_punches(&mut state);
     state.set_direct_punch_rows(vec![
-        DirectPunchTarget::parse("bob,bobhost.example:[18000,19000,21000],every_1m").unwrap(),
+        DirectPunchTarget::parse("bob,bobhost.example:19000,every_1m").unwrap(),
     ]);
     press(&mut state, KeyCode::Char('e'));
     let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
-    assert_eq!(edit.port, "18000, 19000, 21000");
+    assert_eq!(edit.host, "bobhost.example");
+    assert_eq!(edit.port, "19000");
+    // Close the form before editing a different row.
+    press(&mut state, KeyCode::Esc);
+
+    state.set_direct_punch_rows(vec![
+        DirectPunchTarget::parse("carol,realm://public@realm.hy2.io/my-long-realm-name,every_1m").unwrap(),
+    ]);
+    press(&mut state, KeyCode::Char('e'));
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
+    assert_eq!(edit.host, "realm://public@realm.hy2.io/my-long-realm-name", "the URI fills the host box");
+    assert_eq!(edit.port, "", "a realm names no port");
 }
 
 /// Offering the default back as a number would put a port outside the
@@ -468,7 +605,7 @@ fn a_row_on_the_default_port_comes_back_with_an_empty_port_field() {
     press(&mut state, KeyCode::Tab); // -> Save
     match press(&mut state, KeyCode::Enter) {
         Some(UiAction::SaveDirectPunchTargets(targets)) => {
-            assert_eq!(targets[0].ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+            assert_eq!(targets[0].port(), Some(DEFAULT_DIRECT_PUNCH_PORT));
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }
@@ -492,8 +629,8 @@ fn saving_a_valid_new_target_appends_it_and_requests_a_save() {
         Some(UiAction::SaveDirectPunchTargets(targets)) => {
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].nickname, "bob");
-            assert_eq!(targets[0].host, "bobhost.example");
-            assert_eq!(targets[0].ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+            assert_eq!(targets[0].host(), Some("bobhost.example"));
+            assert_eq!(targets[0].port(), Some(DEFAULT_DIRECT_PUNCH_PORT));
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }
@@ -526,7 +663,7 @@ fn saving_edits_an_existing_target_in_place_rather_than_appending() {
         Some(UiAction::SaveDirectPunchTargets(targets)) => {
             assert_eq!(targets.len(), 2, "editing must not add a new row");
             assert_eq!(targets[0].nickname, "bob");
-            assert_eq!(targets[0].host, "newhost");
+            assert_eq!(targets[0].host(), Some("newhost"));
             assert_eq!(targets[1].nickname, "carol", "the other row is untouched");
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),

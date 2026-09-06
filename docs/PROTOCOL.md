@@ -1730,9 +1730,9 @@ direct_punch_to=bob,bobpublic.com,every_1m
 direct_punch_to=marco,marcohost.com,every_1h
 ```
 
-The host may be an IPv4 address, an IPv6 address or a hostname, and may
-carry its own port (`bobpublic.com:19000`, `[2001:db8::1]:19000`) or a
-bracketed list of them (`bobpublic.com:[18000,19000,21000]`); with no port
+The "where" is either a fixed address or a **rendezvous realm**. A fixed
+address is an IPv4 address, an IPv6 address or a hostname, and may carry
+its own port (`bobpublic.com:19000`, `[2001:db8::1]:19000`); with no port
 at all, both sides assume one well-known default. A written port must fall
 between `DIRECT_PUNCH_PORT_MIN` and `DIRECT_PUNCH_PORT_MAX`, and one that
 does not is refused with the range in the reason. The frequency is one of
@@ -1741,42 +1741,36 @@ does not is refused with the range in the reason. The frequency is one of
 `every_1h`.
 
 Unlike §7.1's UDP socket, whose port is ephemeral because the server
-relays whatever it happened to be given, this one is fixed: with nothing
-relaying it, a port both sides agreed on in advance is the only thing a
+relays whatever it happened to be given, this one is fixed at
+`direct_punch_port` - one socket, bound once. With nothing relaying it, a
+port both sides agreed on in advance is the only thing a fixed-address
 peer can aim at.
 
-**Why a line may name several ports.** Agreeing on a port is not the same
-as arriving on it. Many NATs rewrite the source port of an outgoing
-datagram whether or not the one asked for is free, so a peer aiming at the
-agreed number reaches a port their router never mapped, and nothing
-connects however well the two clocks agree. Which port survives is the
-router's choice, not either peer's, so no single agreed number fixes it.
+**Why a fixed address often is not enough, and what a realm does instead.**
+Agreeing on a port is not the same as arriving on it. Many NATs rewrite
+the source port of an outgoing datagram whether or not the one asked for
+is free, so a peer aiming at the agreed number reaches a port their router
+never mapped, and nothing connects however well the two clocks agree.
+Which port survives is the router's choice, not either peer's, so no
+single agreed number fixes it - and binding several local ports does not
+either, since the router rewrites each of them to a number of its own
+choosing. What is needed is to *discover* the router's rewritten outer
+address rather than guess it, which is what a realm target does: instead
+of naming an address, the line names a Hysteria Realms rendezvous both
+peers meet at, learn each other's STUN-discovered outer address through,
+and punch at what they actually turned out to be. The rest of this section
+covers the fixed-address case; "Meeting through a rendezvous realm" below
+covers the realm case, which replaces steps 1-2 with STUN and the
+rendezvous and then rejoins the fixed-address path at its handshake.
 
-Being reachable on several ports is the other half of it, and it is not
-the same thing as aiming at several: what a peer can reach this client on
-is exactly the set of ports it sends **from**, never the ones it sends
-**to**. So `direct_punch_port` takes a list too, one UDP socket is bound
-per port, and probes are **paired** - the socket bound to 18000 probes the
-peer's 18000. Two clients running the same list are then reachable on all
-of it, and a router leaving any single port unrewritten is enough. A peer
-port with no matching local socket is still probed, from the primary, so
-two settings files that disagree punch with fewer chances rather than
-none; a local port already in use is reported and skipped, and only all of
-them failing falls back to an ephemeral socket.
-
-Every datagram to a peer leaves from the socket that peer's own traffic
-arrived on - the only one their NAT holds a mapping for - including the
-probes of an attempt their own probe opened.
-
-Naming several and probing them all on the same slot only needs *one* to
-get through. Every named port is probed with the same `DirectPing`, and
-the first reply settles it: the address a peer actually answers from is
-locked in and becomes the only one probed thereafter, because the port
-that answered is the port that survived both routers' rewriting. Losing
-the link clears that lock and the next attempt sweeps the whole list
-again - a NAT that reassigns its mappings makes the port that worked no
-longer the port that works - re-resolving a named host with it, an address
-having moved being the other reason a link drops for good.
+Whichever way the address was arrived at, the first reply settles it: the
+address a peer actually answers from is locked in and becomes the only one
+probed thereafter, because it is the address that survived both routers'
+rewriting. Losing the link clears that lock and the next attempt goes back
+to the configured address (or a fresh rendezvous) - a NAT that reassigns
+its mappings makes the address that worked no longer the one that works -
+re-resolving a named host with it, an address having moved being the other
+reason a link drops for good.
 
 **1. The slot grid, in place of signaling.** Hole punching only works if
 both sides send at roughly the same moment - that is what the candidate
@@ -1923,6 +1917,78 @@ envelope is checked against, so a peer whose key is unknown, or whose key
 has changed, is not quietly admitted. No key exchange happens here - two
 peers who have never established each other's key material through a
 server have a working transport and nothing to encrypt over it.
+
+**Meeting through a rendezvous realm.** A `direct_punch_to` line whose
+"where" is a `realm://` URI names no address at all. It names a realm - a
+long, unguessable name - on a rendezvous host both peers can reach: the
+public one the Hysteria project runs (`realm://public@realm.hy2.io/<name>`),
+or a self-hosted `hysteria-realm-server` (`realm+http://…` speaks plain
+HTTP, for a private network or a test). This is the Hysteria Realms
+protocol, spoken against that server as it expects rather than reinvented:
+the HTTP routes (`POST /v1/{realm}`, `.../connect`, `.../connects/{nonce}`,
+`GET .../events`, `DELETE /v1/{realm}`), the `Authorization: Bearer` auth
+(the realm token to register and connect, the server's returned session id
+for the rest), the `addresses`/`nonce`/`obfs` fields and `punch` SSE event,
+and the 16-byte nonce / 32-byte obfs it validates are all matched against
+`apernet/hysteria-realm-server`. So two aloo peers meet through the public
+`realm.hy2.io` with no aloo server anywhere - which is the whole point of
+this path.
+
+At each slot, instead of aiming at a configured address, a realm target
+runs this procedure (`client::hysteria_realm`):
+
+1. **STUN.** The client asks a public STUN server what its NAT shows the
+   world for the punch socket - the router-rewritten outer address that
+   made a fixed port unreachable to begin with. The servers tried, in
+   order, are a small built-in list of public ones (`DEFAULT_STUN_SERVERS`:
+   `stun.nextcloud.com`, `stun.sip.us`, `global.stun.twilio.com`, all on
+   3478) unless the URI overrides them with one or more `?stun=` entries.
+2. **Rendezvous.** The two peers take opposite roles, settled with no
+   message between them: the one whose nickname sorts lower **registers**
+   the realm with its outer addresses and waits on the server's event
+   stream; the other **looks it up**, posting its own outer addresses plus
+   a freshly minted punch nonce and obfuscation key. The server pushes
+   those to the registrant, who runs STUN once more (its earlier mapping
+   may have aged out) and answers with fresh addresses, which the server
+   returns to the looking-up side.
+3. **Punch.** Both now hold the other's outer address and the shared
+   nonce/obfs key. They send small obfuscated `HYRLMv1` packets at each
+   other until one is answered; the address it came from is the one both
+   NATs have opened. This packet is aloo's *own* obfuscation (salted and
+   SHA-256-masked under the shared obfs key), not Hysteria's own punch-byte
+   format - it only ever travels aloo-to-aloo, so both ends agreeing is all
+   it needs, and an aloo peer correspondingly will not punch a genuine
+   Hysteria endpoint, which is not the goal. STUN replies and these packets
+   share the one punch socket with aloo's own traffic and are told apart
+   from it before any of aloo's decoding runs, the way a QUIC transport
+   demultiplexes such packets off its own socket.
+4. **The ordinary handshake.** That address is adopted as the peer's
+   candidate exactly as a resolved host would be, and the link opens
+   through the same `DirectPing`/`DirectPong` exchange and activates
+   exactly as every other direct link does - nothing downstream knows or
+   cares that a realm arranged it.
+
+The rendezvous only ever introduces the two peers; no application traffic
+passes through it, and the registration is torn down as soon as the
+attempt ends (success, failure, or the window closing) so it does not
+linger. The nonce and obfuscation key make a punch packet recognisable to
+exactly the two peers this introduction is for and noise to anyone else on
+the path. This works for many NAT combinations but not all: two symmetric
+NATs that allocate unpredictable outer ports for each destination may
+never open a direct path, and nothing here helps behind carrier-grade NAT
+- a case a relay, which aloo deliberately does not provide, would be the
+only answer to.
+
+Using the public `realm.hy2.io` reveals this client's outer IP to a
+third-party server the Hysteria project runs, and each STUN query reveals
+it to whichever public STUN server answers - two separate third parties,
+which is why a realm is opt-in per peer rather than the default, and why
+both are swappable: `realm+http://…` (or `realm://…@your-host/…`) points
+the rendezvous at your own `hysteria-realm-server`, and `?stun=` points
+the STUN step at servers you choose. Neither is trusted to carry or to
+vouch for anything - the rendezvous only introduces - so who a peer is is
+still decided entirely by §7.1.5's own authentication above, against the
+key already pinned for that nickname.
 
 **No-IP updates.** Everything above assumes a peer's `direct_punch_to` host
 stays put. For one whose address changes - an ordinary home connection -

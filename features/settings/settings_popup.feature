@@ -18,18 +18,29 @@ Feature: Changing settings without leaving the app
     And the settings popup asked the session to load the file
     And the focused setting is "global_ptt_enabled"
 
-  # The settings line spells a port list in brackets, because there its
-  # commas would collide with the commas between the line's own fields.
-  # In the editor there is no such collision, so the field reads the way a
-  # list of anything reads.
+  # One fixed port, typed as a plain number - there is no longer a list to
+  # spell, since a peer whose router rewrites the source port is met
+  # through a rendezvous realm instead (docs/PROTOCOL.md 7.1.5).
+  # The realm name is the whole of a rendezvous's privacy, so aloo offers a
+  # random one rather than have someone invent a guessable name; both peers
+  # then share that exact line to meet (docs/PROTOCOL.md 7.1.5).
   @AC-437
-  Scenario: The punch editor takes several ports separated by commas
+  Scenario: Adding a realm offers a ready-made public one to share
     Given I am connected and viewing a channel
     And I press Ctrl+S
     And I press Tab
     And I press Down
-    When I add a punch for "bob" at "bobhost.example" with ports "18000, 19000"
-    Then the saved punch names host "bobhost.example" on ports "18000,19000"
+    When I add a realm punch for "bob"
+    Then the saved punch is a public rendezvous realm
+
+  @AC-437
+  Scenario: The punch editor takes a single port
+    Given I am connected and viewing a channel
+    And I press Ctrl+S
+    And I press Tab
+    And I press Down
+    When I add a punch for "bob" at "bobhost.example" with port "19000"
+    Then the saved punch names host "bobhost.example" on port 19000
 
   @AC-397
   Scenario: Tab walks the three tabs and comes back round
@@ -131,6 +142,8 @@ Feature: Changing settings without leaving the app
     Then the selected punch row is 0
     When I press Down
     Then the selected punch row is 1
+    When I press Down
+    Then the focused setting is "direct_punch_channel"
     When I press Down
     Then the focused setting is "noip_when_no_server_and_direct_punch_is_active"
 

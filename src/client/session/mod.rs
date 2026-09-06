@@ -663,19 +663,10 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     } else {
         std::net::Ipv4Addr::UNSPECIFIED.into()
     };
-    // One socket per configured punch port, because what a peer can reach
-    // this client on is exactly the set of ports it sends *from*: a router
-    // that leaves any one of them unrewritten is then a port that works
-    // (§7.1.5). With punching off it is the single ephemeral socket it has
-    // always been.
-    let bind_addrs: Vec<SocketAddr> = if settings.direct_punch {
-        settings
-            .direct_punch_ports
-            .iter()
-            .map(|port| SocketAddr::new(unspecified, *port))
-            .collect()
+    let bind_addr = if settings.direct_punch {
+        SocketAddr::new(unspecified, settings.direct_punch_port)
     } else {
-        vec![SocketAddr::new(unspecified, 0)]
+        SocketAddr::new(unspecified, 0)
     };
     // `~/.aloo/d_id` - generated once per nickname, the first session that
     // connects as `display_name` on this machine, and reused for that
@@ -694,30 +685,27 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         String::new()
     });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut peer_link, p2p_sockets) = match PeerLinkManager::bind_all(
-        &bind_addrs,
+    let (mut peer_link, p2p_socket) = match PeerLinkManager::bind(
+        bind_addr,
         server_addr,
         p2p_events_tx.clone(),
     )
     .await
     {
         Ok(ok) => ok,
-        // Not one of them bound. Ephemeral keeps everything except direct
-        // punching working, and says so - a scheduler running with no
-        // reachable port looks identical to a peer who never answers.
-        Err(e) if bind_addrs.iter().any(|a| a.port() != 0) => {
+        // The punch port is taken. Ephemeral keeps everything except
+        // direct punching working, and says so - a scheduler running with
+        // no reachable port looks identical to a peer who never answers.
+        Err(e) if bind_addr.port() != 0 => {
             crate::log_warn!(
-                "could not bind any direct-punch port ({e}); falling back to an \
+                "could not bind the direct-punch port {} ({e}); falling back to an \
                  ephemeral port - direct_punch_to peers will not be able to reach \
-                 this client"
+                 this client",
+                bind_addr.port()
             );
-            PeerLinkManager::bind_all(
-                &[SocketAddr::new(unspecified, 0)],
-                server_addr,
-                p2p_events_tx,
-            )
-            .await
-            .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?
+            PeerLinkManager::bind(SocketAddr::new(unspecified, 0), server_addr, p2p_events_tx)
+                .await
+                .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?
         }
         Err(e) => return Err(format!("failed to open the direct-link UDP socket: {e}").into()),
     };
@@ -729,17 +717,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         );
     }
     let (p2p_raw_tx, mut p2p_raw_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, SocketAddr, p2p::InboundDatagram)>();
-    // One loop per bound socket, all feeding the one channel, each tagging
-    // what it reads with its own index so a reply leaves from the socket
-    // its prompt arrived on.
-    for (idx, socket) in p2p_sockets.into_iter().enumerate() {
-        let tx = p2p_raw_tx.clone();
-        p2p::spawn_receive_loop_on(socket, idx, server_addr, move |idx, addr, dgram| {
-            tx.send((idx, addr, dgram)).is_ok()
-        });
-    }
-    drop(p2p_raw_tx);
+        tokio::sync::mpsc::unbounded_channel::<(SocketAddr, p2p::InboundDatagram)>();
+    p2p::spawn_receive_loop(p2p_socket, server_addr, peer_link.raw_taps(), p2p_raw_tx);
 
     // The identity's own bundle never rotates; only the per-peer
     // encryption keys derived from it do (`docs/PROTOCOL.md` §13.10). Its
@@ -1158,8 +1137,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 session.peer_link.dispatch_outbound(msg);
             }
             dgram = p2p_raw_rx.recv() => {
-                let Some((socket_idx, addr, dgram)) = dgram else { break };
-                session.peer_link.on_inbound_on(socket_idx, addr, dgram);
+                let Some((addr, dgram)) = dgram else { break };
+                session.peer_link.on_inbound(addr, dgram);
             }
             event = p2p_events_rx.recv() => {
                 let Some(event) = event else { break };

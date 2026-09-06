@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::settings::{DirectPunchTarget, PUNCH_FREQUENCIES, PunchFrequency};
 
@@ -58,6 +58,11 @@ pub struct DirectPunchEditState {
     pub frequency_index: usize,
     pub focus: DirectPunchField,
     pub error: Option<String>,
+    /// True while `host` still holds the realm the add form filled in for
+    /// the person rather than anything they typed: the first edit of the
+    /// host field clears it whole, so typing a fixed address over the
+    /// suggestion just works instead of appending to a 40-character realm.
+    pub host_is_suggested: bool,
 }
 
 pub struct DirectPunchPopupState {
@@ -149,7 +154,14 @@ impl UiState {
                             edit.nickname.pop();
                         }
                         DirectPunchField::Host => {
-                            edit.host.pop();
+                            // Backspace on the untouched suggestion drops it
+                            // whole - nobody edits a random realm by character.
+                            if edit.host_is_suggested {
+                                edit.host.clear();
+                                edit.host_is_suggested = false;
+                            } else {
+                                edit.host.pop();
+                            }
                         }
                         DirectPunchField::Port => {
                             edit.port.pop();
@@ -163,12 +175,16 @@ impl UiState {
                 if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut()) {
                     match edit.focus {
                         DirectPunchField::Nickname => edit.nickname.push(c),
-                        DirectPunchField::Host => edit.host.push(c),
-                        // Commas and the space people naturally type after
-                        // one, so a list can be entered as it reads.
-                        DirectPunchField::Port if c.is_ascii_digit() || c == ',' || c == ' ' => {
-                            edit.port.push(c)
+                        DirectPunchField::Host => {
+                            // The first keystroke replaces the generated realm
+                            // rather than appending to it.
+                            if edit.host_is_suggested {
+                                edit.host.clear();
+                                edit.host_is_suggested = false;
+                            }
+                            edit.host.push(c);
                         }
+                        DirectPunchField::Port if c.is_ascii_digit() => edit.port.push(c),
                         DirectPunchField::Port | DirectPunchField::Frequency | DirectPunchField::Save => {}
                     }
                 }
@@ -189,22 +205,23 @@ impl UiState {
             return None;
         }
         let frequency = PUNCH_FREQUENCIES[edit.frequency_index];
-        // The field is comma-separated because that is how a list of
-        // anything reads; the settings line spells the same list in
-        // brackets, because there its commas would collide with the
-        // commas separating the line's own fields.
-        let typed: Vec<&str> = edit
-            .port
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .collect();
-        let host = match typed.as_slice() {
-            [] => edit.host.clone(),
-            [only] => format!("{}:{}", edit.host, only),
-            many => format!("{}:[{}]", edit.host, many.join(",")),
+        let host = edit.host.trim();
+        let port = edit.port.trim();
+        // A realm URI names no address, so a port typed next to one is a
+        // mistake to point out rather than a number to append: the
+        // settings line has nowhere to put it.
+        if crate::settings::DirectPunchVia::is_realm_uri(host) && !port.is_empty() {
+            self.set_direct_punch_error(
+                "a realm URI has no port to name - leave the port empty".to_string(),
+            );
+            return None;
+        }
+        let place = if port.is_empty() {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
         };
-        let line = format!("{},{},every_{}m", edit.nickname.trim(), host, frequency);
+        let line = format!("{},{place},every_{frequency}m", edit.nickname.trim());
         let target = match DirectPunchTarget::parse(&line) {
             Ok(target) => target,
             Err(message) => {
@@ -238,15 +255,24 @@ fn next_field(focus: DirectPunchField, backwards: bool) -> DirectPunchField {
     order[next]
 }
 
+/// The add form. Its "where" starts as a freshly generated public
+/// rendezvous realm (`hysteria_realm::suggested_realm_uri`), the robust
+/// default when no address is reachable: someone who wants a realm keeps it
+/// and just types the nickname (focus starts there), someone who wants a
+/// fixed address types it straight over the suggestion, which the first
+/// keystroke in the host box clears. The realm name is generated rather
+/// than left to a person because it is the whole of the rendezvous's
+/// privacy and an invented one would likely be guessable.
 pub(crate) fn blank_edit_state() -> DirectPunchEditState {
     DirectPunchEditState {
         editing_index: None,
         nickname: String::new(),
-        host: String::new(),
+        host: crate::client::hysteria_realm::suggested_realm_uri(),
         port: String::new(),
         frequency_index: 0,
         focus: DirectPunchField::Nickname,
         error: None,
+        host_is_suggested: true,
     }
 }
 
@@ -261,23 +287,24 @@ pub(crate) fn edit_state_for(index: usize, target: &DirectPunchTarget) -> Direct
         // suffixed row (§5a) round-trips its `+<device_id>` suffix rather
         // than silently dropping it.
         nickname: target.target_key(),
-        host: target.host.clone(),
+        // A realm line comes back as its URI in the host box, with no
+        // port - exactly the shape it is typed in.
+        host: match &target.via {
+            crate::settings::DirectPunchVia::Host { host, .. } => host.clone(),
+            crate::settings::DirectPunchVia::Realm(realm) => realm.uri().to_string(),
+        },
         // The implicit default is shown as an empty field, the way it was
         // entered - offering it back as a number would put a port outside
         // the accepted range into a field that then refuses to save.
-        port: if target.ports == [crate::settings::DEFAULT_DIRECT_PUNCH_PORT] {
-            String::new()
-        } else {
-            target
-                .ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+        port: match target.port() {
+            Some(port) if port != crate::settings::DEFAULT_DIRECT_PUNCH_PORT => port.to_string(),
+            _ => String::new(),
         },
         frequency_index,
         focus: DirectPunchField::Nickname,
         error: None,
+        // An existing row's host is real, not a suggestion to type over.
+        host_is_suggested: false,
     }
 }
 
@@ -338,17 +365,33 @@ pub(crate) fn render_punch_list(
     frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
-/// One row's host and ports, spelled the way the settings line spells
-/// them so the list reads the same in both places.
+/// One row's "where", spelled the way the settings line spells it so the
+/// list reads the same in both places - the host with its port, or the
+/// realm URI.
 fn host_display(t: &DirectPunchTarget) -> String {
-    match t.ports.as_slice() {
-        [only] => format!("{}:{only}", t.host),
-        many => format!(
-            "{}:[{}]",
-            t.host,
-            many.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
-        ),
+    match &t.via {
+        crate::settings::DirectPunchVia::Host { host, port } => format!("{host}:{port}"),
+        crate::settings::DirectPunchVia::Realm(realm) => realm.uri().to_string(),
     }
+}
+
+/// The line under the form when the "where" is a realm: it names the two
+/// third parties a punch actually touches - the rendezvous host and the
+/// STUN servers this very realm would use - and says plainly that both
+/// only introduce the peers, so a reader can see exactly who learns their
+/// address before committing to it. Falls back to the public defaults
+/// while a realm is still being typed and does not yet parse.
+fn realm_instruction(host: &str) -> String {
+    use crate::client::hysteria_realm::{DEFAULT_STUN_SERVERS, PUBLIC_RENDEZVOUS_HOST, RealmAddr};
+    let (rendezvous, stun) = match RealmAddr::parse(host) {
+        Ok(realm) => (realm.host.clone(), realm.stun_servers().join(", ")),
+        Err(_) => (PUBLIC_RENDEZVOUS_HOST.to_string(), DEFAULT_STUN_SERVERS.join(", ")),
+    };
+    format!(
+        "Share this exact realm with the peer - you meet only if both carry the same one. \
+         You are introduced through {rendezvous} and STUN ({stun}); these only introduce \
+         you to each other - no messages ever pass through them."
+    )
 }
 
 /// A bordered field, styled exactly like `ui_connect_popup`'s own
@@ -356,6 +399,10 @@ fn host_display(t: &DirectPunchTarget) -> String {
 /// value drawn inside - so every popup's text fields read the same way.
 /// Returns the inner `Rect`, for placing the blinking cursor in it.
 pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) {
+    // A realm is a shared secret both peers must carry identically, so the
+    // form says so the moment the "where" reads as one - the value is no
+    // use to a person who does not also give it to the other side.
+    let is_realm = crate::settings::DirectPunchVia::is_realm_uri(edit.host.trim());
     let mut constraints = vec![
         Constraint::Length(3), // nickname
         Constraint::Length(3), // host
@@ -363,6 +410,9 @@ pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunch
         Constraint::Length(3), // frequency
         Constraint::Length(3), // save button
     ];
+    if is_realm {
+        constraints.push(Constraint::Length(4)); // realm-sharing instruction
+    }
     if edit.error.is_some() {
         constraints.push(Constraint::Min(1));
     }
@@ -375,8 +425,13 @@ pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunch
         &edit.nickname,
         edit.focus == DirectPunchField::Nickname,
     );
-    let host_inner =
-        render_bordered_field(frame, rows[1], "host", &edit.host, edit.focus == DirectPunchField::Host);
+    let host_inner = render_bordered_field(
+        frame,
+        rows[1],
+        "host, or realm://token@host/name",
+        &edit.host,
+        edit.focus == DirectPunchField::Host,
+    );
     let port_display = if edit.port.is_empty() {
         format!("<default {}>", crate::settings::DEFAULT_DIRECT_PUNCH_PORT)
     } else {
@@ -385,7 +440,7 @@ pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunch
     let port_inner = render_bordered_field(
         frame,
         rows[2],
-        "ports (comma-separated)",
+        "port (none for a realm)",
         &port_display,
         edit.focus == DirectPunchField::Port,
     );
@@ -410,7 +465,20 @@ pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunch
 
     render_popup_button(frame, rows[4], 16, "Save", edit.focus == DirectPunchField::Save);
 
+    // The realm-sharing instruction sits between Save and any error, so its
+    // row index shifts the error down by one when it is shown.
+    let mut next_row = 5;
+    if is_realm {
+        frame.render_widget(
+            Paragraph::new(realm_instruction(edit.host.trim()))
+                .style(Style::default().fg(Color::Cyan))
+                .wrap(Wrap { trim: true }),
+            rows[next_row],
+        );
+        next_row += 1;
+    }
+
     if let Some(err) = &edit.error {
-        frame.render_widget(Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)), rows[5]);
+        frame.render_widget(Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)), rows[next_row]);
     }
 }

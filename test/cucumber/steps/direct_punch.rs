@@ -65,7 +65,7 @@ async fn bind_client(w: &mut AlooWorld, name: &str) -> u16 {
             .unwrap();
     let port = socket.local_addr().unwrap().port();
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(socket, Some(rendezvous), raw_tx);
+    aloo::client::p2p::spawn_receive_loop(socket, Some(rendezvous), link.raw_taps(), raw_tx);
     let client = w.clients.entry(name.to_string()).or_default();
     client.peer_link = Some(link);
     client.p2p_raw_rx = Some(raw_rx);
@@ -159,7 +159,7 @@ async fn punched_every(w: &mut AlooWorld, name: String, host: String, minutes: u
         .iter()
         .find(|t| t.nickname == name)
         .unwrap_or_else(|| panic!("no direct_punch_to line for {name}"));
-    assert_eq!(found.host, host);
+    assert_eq!(found.host(), Some(host.as_str()));
     assert_eq!(found.frequency.minutes(), minutes);
 }
 
@@ -168,8 +168,8 @@ async fn default_port(w: &mut AlooWorld) {
     let settings = w.direct_settings.as_ref().unwrap();
     for t in &settings.direct_punch_to {
         assert_eq!(
-            t.ports,
-            [DEFAULT_DIRECT_PUNCH_PORT],
+            t.port(),
+            Some(DEFAULT_DIRECT_PUNCH_PORT),
             "{} named no port, so both sides must assume the well-known one",
             t.nickname
         );
@@ -179,15 +179,15 @@ async fn default_port(w: &mut AlooWorld) {
 #[then(expr = "{string} names host {string} on the well-known port")]
 async fn names_host_default_port(_w: &mut AlooWorld, value: String, host: String) {
     let target = DirectPunchTarget::parse(&value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-    assert_eq!(target.host, host);
-    assert_eq!(target.ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+    assert_eq!(target.host(), Some(host.as_str()));
+    assert_eq!(target.port(), Some(DEFAULT_DIRECT_PUNCH_PORT));
 }
 
 #[then(expr = "{string} names host {string} on port {int}")]
 async fn names_host_port(_w: &mut AlooWorld, value: String, host: String, port: u16) {
     let target = DirectPunchTarget::parse(&value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-    assert_eq!(target.host, host);
-    assert_eq!(target.ports, [port]);
+    assert_eq!(target.host(), Some(host.as_str()));
+    assert_eq!(target.port(), Some(port));
 }
 
 /// Device-pinning plan §5a: a `+<device_id>` suffix on the nickname field
@@ -206,22 +206,22 @@ async fn names_nickname_no_device(_w: &mut AlooWorld, value: String, nickname: S
     assert_eq!(target.device_id, None);
 }
 
-#[then(expr = "this client punches from ports {string}")]
-async fn punches_from_ports(w: &mut AlooWorld, ports: String) {
-    let expected: Vec<u16> = ports.split(',').map(|p| p.trim().parse().unwrap()).collect();
+#[then(expr = "this client punches from port {int}")]
+async fn punches_from_port(w: &mut AlooWorld, port: u16) {
     let settings = w.direct_settings.as_ref().unwrap();
     assert_eq!(
-        settings.direct_punch_ports, expected,
-        "what a peer can reach this client on is the set of ports it sends from"
+        settings.direct_punch_port, port,
+        "the one local port a peer can reach this client on"
     );
 }
 
-#[then(expr = "{string} names host {string} on ports {string}")]
-async fn names_host_ports(_w: &mut AlooWorld, value: String, host: String, ports: String) {
+#[then(expr = "{string} names a realm at host {string} with token {string}")]
+async fn names_realm(_w: &mut AlooWorld, value: String, host: String, token: String) {
     let target = DirectPunchTarget::parse(&value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-    let expected: Vec<u16> = ports.split(',').map(|p| p.trim().parse().unwrap()).collect();
-    assert_eq!(target.host, host);
-    assert_eq!(target.ports, expected, "{value:?}");
+    let realm = target.realm().unwrap_or_else(|| panic!("{value:?} is not a realm target"));
+    assert_eq!(realm.host, host);
+    assert_eq!(realm.token, token);
+    assert_eq!(target.port(), None, "a realm names no port");
 }
 
 #[then(expr = "{string} is refused, naming the allowed port range")]
@@ -235,11 +235,12 @@ async fn refused_out_of_range(_w: &mut AlooWorld, value: String) {
     );
 }
 
-#[then(expr = "{string} is refused for naming no port at all")]
-async fn refused_empty_list(_w: &mut AlooWorld, value: String) {
-    let message =
-        DirectPunchTarget::parse(&value).expect_err(&format!("{value:?} names an empty list"));
-    assert!(message.contains("no port"), "unhelpful reason: {message:?}");
+#[then(expr = "{string} is refused as a malformed realm")]
+async fn refused_bad_realm(_w: &mut AlooWorld, value: String) {
+    assert!(
+        DirectPunchTarget::parse(&value).is_err(),
+        "{value:?} should be refused as a malformed realm URI"
+    );
 }
 
 #[then(expr = "{int} direct punch lines are reported as unusable, each with a reason")]
@@ -343,69 +344,6 @@ async fn both_list_each_other(w: &mut AlooWorld) {
         "bob".into(),
         vec![target("alice", alice_port, 1)],
         CONFIGURED_AT,
-    );
-}
-
-/// A port nothing is listening on: bound only long enough to be handed a
-/// free one, then dropped, so probing it is silence rather than a refusal.
-async fn dead_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// The shape a port-rewriting NAT produces: alice names three ports for
-/// bob and only one of them is the one he can actually be reached on.
-///
-/// Bob lists alice at a dead port on purpose. His own probes then reach
-/// nobody, so the only thing that can open this link is alice's sweep
-/// finding the one live port among the three - which is the whole claim.
-#[given(expr = "alice lists bob on three ports, only one of which reaches him")]
-async fn alice_lists_three_ports(w: &mut AlooWorld) {
-    bind_client(w, "alice").await;
-    let bob_port = bind_client(w, "bob").await;
-    let (dead_a, dead_b) = (dead_port().await, dead_port().await);
-    let line = format!("bob,127.0.0.1:[{dead_a},{dead_b},{bob_port}],every_1m");
-    link_of(w, "alice").configure_direct_punch(
-        "alice".into(),
-        vec![DirectPunchTarget::parse(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))],
-        CONFIGURED_AT,
-    );
-    let alice_dead = dead_port().await;
-    link_of(w, "bob").configure_direct_punch(
-        "bob".into(),
-        vec![target("alice", alice_dead, 1)],
-        CONFIGURED_AT,
-    );
-    w.direct_swept_ports = Some(vec![dead_a, dead_b, bob_port]);
-    w.direct_answered_port = Some(bob_port);
-}
-
-#[then(expr = "alice probes bob on only the port he answered from")]
-async fn probes_only_the_answering_port(w: &mut AlooWorld) {
-    let answered = w.direct_answered_port.expect("a scenario that set the ports up");
-    let addrs = link_of(w, "alice").direct_probe_addrs_for_test("bob");
-    let ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
-    assert_eq!(
-        ports,
-        vec![answered],
-        "a port that answered is the port that survived both routers' rewriting - \
-         re-probing the rest is pure noise"
-    );
-}
-
-#[then(expr = "alice probes bob on all three ports again")]
-async fn probes_all_ports_again(w: &mut AlooWorld) {
-    let expected = w.direct_swept_ports.clone().expect("a scenario that set the ports up");
-    let addrs = link_of(w, "alice").direct_probe_addrs_for_test("bob");
-    let ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
-    assert_eq!(
-        ports, expected,
-        "losing the link reopens the question of which port works, so every \
-         configured port is in play again"
     );
 }
 

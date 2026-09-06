@@ -29,6 +29,7 @@ pub mod otp_store;
 pub mod p2p;
 pub mod p2p_reliable;
 pub mod pq_rekey;
+pub mod hysteria_realm;
 pub mod presence;
 pub mod reconnect;
 pub mod rekey;

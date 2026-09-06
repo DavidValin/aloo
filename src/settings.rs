@@ -221,6 +221,13 @@ pub const DEFAULT_DIRECT_PUNCH_PORT: u16 = 7879;
 pub const DIRECT_PUNCH_PORT_MIN: u16 = 10_000;
 pub const DIRECT_PUNCH_PORT_MAX: u16 = 65_000;
 
+/// The room every serverless client is in unless `direct_punch_channel`
+/// says otherwise: with no server to define channels, two peers who punch
+/// each other still need a name to share to land in the same room, so one
+/// is agreed by convention. Named identically on both sides, exactly like
+/// the punch port, so a shared default just works out of the box.
+pub const DEFAULT_DIRECT_PUNCH_CHANNEL: &str = "direct-punches";
+
 /// How often a `direct_punch_to` target is attempted, in minutes past the
 /// hour. Only the values `docs/SPEC.md` "Direct punch settings" lists are
 /// representable - the slot grid restarts at every o'clock, and both peers
@@ -344,8 +351,32 @@ impl std::fmt::Display for ChannelDeletionPeriod {
     }
 }
 
-/// One `direct_punch_to=<nickname>[+<device_id>],<host>[:<port>],<frequency>`
-/// line.
+/// Where a `direct_punch_to` line says its peer is: a fixed address, or a
+/// rendezvous realm both peers meet through (`docs/PROTOCOL.md` §7.1.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectPunchVia {
+    /// A literal IPv4/IPv6 address or a hostname, resolved fresh at every
+    /// slot rather than once at startup (a home connection's address
+    /// moves), and the one UDP port to aim at - `DEFAULT_DIRECT_PUNCH_PORT`
+    /// when the line names none.
+    Host { host: String, port: u16 },
+    /// A Hysteria Realms rendezvous (`client::hysteria_realm`): nothing about the
+    /// peer's address is known in advance. Both sides learn their own
+    /// NAT-rewritten outer address by STUN, meet at the realm, and punch
+    /// at what the other side actually turned out to be.
+    Realm(crate::client::hysteria_realm::RealmAddr),
+}
+
+impl DirectPunchVia {
+    /// Whether a "where" is meant as a realm URI - the same test `parse`
+    /// applies, for an editor that has to know before it builds the line.
+    pub fn is_realm_uri(value: &str) -> bool {
+        crate::client::hysteria_realm::RealmAddr::is_realm_uri(value)
+    }
+}
+
+/// One `direct_punch_to=<nickname>[+<device_id>],<where>,<frequency>`
+/// line, `<where>` being `<host>[:<port>]` or a `realm://` URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPunchTarget {
     /// The peer's nickname - the only name a serverless link has, since
@@ -359,25 +390,16 @@ pub struct DirectPunchTarget {
     /// its own `UserId` (`direct_peer_id`), its own link, and (since a raw
     /// pairing key already differs per device) its own pad.
     pub device_id: Option<String>,
-    /// A literal IPv4/IPv6 address or a hostname, resolved fresh at every
-    /// slot rather than once at startup (a home connection's address moves).
-    pub host: String,
-    /// Every port to probe this peer on, in the order the line wrote them,
-    /// deduplicated. Never empty: a line with no port of its own gets
-    /// `[DEFAULT_DIRECT_PUNCH_PORT]`.
-    ///
-    /// More than one because a NAT that rewrites the source port leaves
-    /// both ends aiming at a port neither router ever mapped - naming
-    /// several and probing them together only needs *one* to survive the
-    /// rewrite (`docs/PROTOCOL.md` §7.1.5).
-    pub ports: Vec<u16>,
+    pub via: DirectPunchVia,
     pub frequency: PunchFrequency,
 }
 
 impl DirectPunchTarget {
-    /// Parses one settings value. The host may carry an explicit port
-    /// (`bobpublic.com:9000`, `[2001:db8::1]:9000`); a bare IPv6 literal
-    /// needs no brackets precisely because it cannot then also carry one.
+    /// Parses one settings value. The "where" field is either a host that
+    /// may carry an explicit port (`bobpublic.com:19000`,
+    /// `[2001:db8::1]:19000`; a bare IPv6 literal needs no brackets
+    /// precisely because it cannot then also carry one) or a realm URI
+    /// (`realm://public@realm.hy2.io/<name>`), told apart by the scheme.
     ///
     /// The nickname component may carry a `+<device_id>` suffix, split at
     /// the *first* `+` in the field. `+` is therefore reserved once this
@@ -387,10 +409,10 @@ impl DirectPunchTarget {
     /// name - the same trade-off the tab/newline field delimiters already
     /// make for `is_storable` itself.
     pub fn parse(value: &str) -> Result<Self, String> {
-        let parts = split_fields(value);
-        let [nick_field, host, frequency] = parts.as_slice() else {
+        let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+        let [nick_field, place, frequency] = parts.as_slice() else {
             return Err(format!(
-                "expected <nickname>,<host>,<frequency>, got {value:?}"
+                "expected <nickname>,<host or realm://...>,<frequency>, got {value:?}"
             ));
         };
         let (nickname, device_id) = match nick_field.split_once('+') {
@@ -405,42 +427,47 @@ impl DirectPunchTarget {
         if !crate::validation::nickname_is_registrable(nickname) {
             return Err(format!("not a valid nickname: {nickname:?}"));
         }
-        let (host, ports) = split_host_ports(host)?;
+        let via = if crate::client::hysteria_realm::RealmAddr::is_realm_uri(place) {
+            DirectPunchVia::Realm(crate::client::hysteria_realm::RealmAddr::parse(place)?)
+        } else {
+            let (host, port) = split_host_port(place)?;
+            DirectPunchVia::Host { host, port }
+        };
         Ok(Self {
             nickname: nickname.to_string(),
             device_id,
-            host,
-            ports,
+            via,
             frequency: PunchFrequency::parse(frequency)?,
         })
     }
 
-    /// `<nickname>[+<device_id>],<host>[:<port>|:[<port>,...]],<frequency>` -
-    /// the exact spelling `parse` accepts, so a load/save round trip is
-    /// lossless in all three port shapes.
+    /// `<nickname>[+<device_id>],<where>,<frequency>` - the exact spelling
+    /// `parse` accepts, so a load/save round trip is lossless.
     pub fn to_setting_value(&self) -> String {
-        let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let host = match self.ports.as_slice() {
-            // Written back as no port at all, exactly as it was read: the
-            // default is outside the range `parse_port` accepts, so
-            // rendering it explicitly would produce a line that no longer
-            // parses.
-            [DEFAULT_DIRECT_PUNCH_PORT] => host,
-            [only] => format!("{host}:{only}"),
-            many => format!(
-                "{host}:[{}]",
-                many.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
-            ),
+        let place = match &self.via {
+            DirectPunchVia::Host { host, port } => {
+                let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{host}]")
+                } else {
+                    host.clone()
+                };
+                // Written back as no port at all, exactly as it was read:
+                // the default is outside the range `parse_port` accepts,
+                // so rendering it explicitly would produce a line that no
+                // longer parses.
+                if *port == DEFAULT_DIRECT_PUNCH_PORT {
+                    host
+                } else {
+                    format!("{host}:{port}")
+                }
+            }
+            DirectPunchVia::Realm(realm) => realm.uri().to_string(),
         };
         match &self.device_id {
             Some(device_id) => {
-                format!("{}+{device_id},{host},{}", self.nickname, self.frequency)
+                format!("{}+{device_id},{place},{}", self.nickname, self.frequency)
             }
-            None => format!("{},{host},{}", self.nickname, self.frequency),
+            None => format!("{},{place},{}", self.nickname, self.frequency),
         }
     }
 
@@ -455,93 +482,68 @@ impl DirectPunchTarget {
             None => self.nickname.clone(),
         }
     }
-}
 
-/// Splits one `direct_punch_to` value into its three fields on top-level
-/// commas only, so the commas inside a bracketed port list
-/// (`host:[18000,19000]`) stay with the host field they belong to. A
-/// bracketed IPv6 literal contains no commas, so the same rule leaves the
-/// pre-existing `[2001:db8::1]` spelling untouched.
-fn split_fields(value: &str) -> Vec<&str> {
-    let mut fields = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (i, c) in value.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                fields.push(value[start..i].trim());
-                start = i + c.len_utf8();
-            }
-            _ => {}
+    /// The host a fixed-address line names; `None` for a realm line.
+    pub fn host(&self) -> Option<&str> {
+        match &self.via {
+            DirectPunchVia::Host { host, .. } => Some(host),
+            DirectPunchVia::Realm(_) => None,
         }
     }
-    fields.push(value[start..].trim());
-    fields
+
+    /// The port a fixed-address line aims at; `None` for a realm line.
+    pub fn port(&self) -> Option<u16> {
+        match &self.via {
+            DirectPunchVia::Host { port, .. } => Some(*port),
+            DirectPunchVia::Realm(_) => None,
+        }
+    }
+
+    /// The realm a rendezvous line names; `None` for a fixed-address line.
+    pub fn realm(&self) -> Option<&crate::client::hysteria_realm::RealmAddr> {
+        match &self.via {
+            DirectPunchVia::Host { .. } => None,
+            DirectPunchVia::Realm(realm) => Some(realm),
+        }
+    }
 }
 
-/// Splits `host`, `host:port`, `host:[port,...]`, `[v6]`, `[v6]:port` or
-/// `[v6]:[port,...]` into its two pieces, defaulting to
-/// `DEFAULT_DIRECT_PUNCH_PORT` when no port is named, and rejects a host
-/// that is neither an IP literal nor a syntactically valid hostname.
-fn split_host_ports(value: &str) -> Result<(String, Vec<u16>), String> {
-    let (host, ports) = if let Some(rest) = value.strip_prefix('[') {
+/// Splits `host`, `host:port`, `[v6]` or `[v6]:port` into its two
+/// pieces, defaulting to `DEFAULT_DIRECT_PUNCH_PORT` when no port is
+/// named, and rejects a host that is neither an IP literal nor a
+/// syntactically valid hostname.
+fn split_host_port(value: &str) -> Result<(String, u16), String> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         // Bracketed IPv6, the one form that can carry a port without the
         // port's colon being ambiguous with the address's own.
         let Some((inside, after)) = rest.split_once(']') else {
             return Err(format!("unterminated '[' in host: {value:?}"));
         };
-        let ports = match after {
-            "" => vec![DEFAULT_DIRECT_PUNCH_PORT],
-            p => parse_port_list(p.strip_prefix(':').unwrap_or(p))?,
+        let port = match after {
+            "" => DEFAULT_DIRECT_PUNCH_PORT,
+            p => parse_port(p.strip_prefix(':').unwrap_or(p))?,
         };
-        (inside.to_string(), ports)
+        (inside.to_string(), port)
     } else if value.parse::<std::net::Ipv6Addr>().is_ok() {
-        (value.to_string(), vec![DEFAULT_DIRECT_PUNCH_PORT])
+        (value.to_string(), DEFAULT_DIRECT_PUNCH_PORT)
     } else if let Some((h, p)) = value.rsplit_once(':') {
-        (h.to_string(), parse_port_list(p)?)
+        (h.to_string(), parse_port(p)?)
     } else {
-        (value.to_string(), vec![DEFAULT_DIRECT_PUNCH_PORT])
+        (value.to_string(), DEFAULT_DIRECT_PUNCH_PORT)
     };
     if !host_is_valid(&host) {
         return Err(format!(
             "not a valid IPv4 address, IPv6 address or hostname: {host:?}"
         ));
     }
-    Ok((host, ports))
-}
-
-/// A single port, or a bracketed list of them (`[18000, 19000, 21000]`).
-/// Repeats collapse rather than being refused - naming the same port twice
-/// asks for the same probe twice, and sending it twice is pure waste - but
-/// an empty list is an error, since a line that names no port at all is
-/// spelled by omitting the `:` entirely.
-fn parse_port_list(s: &str) -> Result<Vec<u16>, String> {
-    let Some(rest) = s.strip_prefix('[') else {
-        return Ok(vec![parse_port(s)?]);
-    };
-    let inner = rest
-        .strip_suffix(']')
-        .ok_or_else(|| format!("unterminated '[' in port list: {s:?}"))?;
-    if inner.trim().is_empty() {
-        return Err(format!("a port list names no port at all: {s:?}"));
-    }
-    let mut ports = Vec::new();
-    for piece in inner.split(',') {
-        let port = parse_port(piece.trim())?;
-        if !ports.contains(&port) {
-            ports.push(port);
-        }
-    }
-    Ok(ports)
+    Ok((host, port))
 }
 
 fn parse_port(s: &str) -> Result<u16, String> {
     // Parsed wider than a port so that a number past `u16::MAX` is still
     // reported as out of range rather than as "not a port at all" - 70000
     // is a port someone meant, spelled wrongly, not a typo like "http".
-    match s.parse::<u32>() {
+    match s.trim().parse::<u32>() {
         Ok(p) if (u32::from(DIRECT_PUNCH_PORT_MIN)..=u32::from(DIRECT_PUNCH_PORT_MAX))
             .contains(&p) =>
         {
@@ -756,19 +758,14 @@ pub struct Settings {
     /// binds a fixed, well-known UDP port and sends unsolicited probes to
     /// hosts named here - neither of which anyone should get by default.
     pub direct_punch: bool,
-    /// The local UDP ports that scheduler listens on, in file order,
-    /// deduplicated and never empty. Only meaningful with `direct_punch`
-    /// on; see `DEFAULT_DIRECT_PUNCH_PORT` for why they have to be fixed
-    /// at all.
-    ///
-    /// A list rather than one port because what a peer can reach you on is
-    /// exactly the set of local ports you send *from*: a router that does
-    /// not rewrite maps each socket to its own port, so binding several is
-    /// several independent chances that one of them survives untouched
-    /// (`docs/PROTOCOL.md` §7.1.5). Written `direct_punch_port=18000,19000`
-    /// - the key keeps its singular name so every existing settings file
-    /// still reads.
-    pub direct_punch_ports: Vec<u16>,
+    /// The one local UDP port that scheduler listens on and punches from.
+    /// Only meaningful with `direct_punch` on; see
+    /// `DEFAULT_DIRECT_PUNCH_PORT` for why it has to be fixed at all. One
+    /// port, not several: a router that rewrites the source port maps
+    /// every local port to a number of its own choosing, so what a peer
+    /// must aim at is discovered (`client::hysteria_realm`, `docs/PROTOCOL.md`
+    /// §7.1.5), not multiplied.
+    pub direct_punch_port: u16,
     /// Every `direct_punch_to` line, in file order. One accumulating key
     /// per peer rather than a single comma-joined value - the same shape
     /// `muted_voice` above uses, and here the value has its own commas in
@@ -885,9 +882,9 @@ impl Default for Settings {
             daemon_otp: false,
             daemon_no_server: false,
             direct_punch: false,
-            direct_punch_ports: vec![DEFAULT_DIRECT_PUNCH_PORT],
+            direct_punch_port: DEFAULT_DIRECT_PUNCH_PORT,
             direct_punch_to: Vec::new(),
-            direct_punch_channels: Vec::new(),
+            direct_punch_channels: vec![DEFAULT_DIRECT_PUNCH_CHANNEL.to_string()],
             noip_when_no_server_and_direct_punch_is_active: false,
             noip_hostname: String::new(),
             noip_username: String::new(),
@@ -957,8 +954,9 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         Key("direct_punch"),
         Key("direct_punch_port"),
         Literal("# direct_punch_to=alice,alicehost.com,every_1m"),
-        Literal("# direct_punch_to=bob,bobhost.com:[18000,19000,21000],every_1m"),
-        Literal("# direct_punch_channel=the-hall"),
+        Literal("# direct_punch_to=bob,bobhost.com:19000,every_1m"),
+        Literal("# direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m"),
+        Literal("# direct_punch_channel=direct-punches,the-hall"),
         Key("noip_when_no_server_and_direct_punch_is_active"),
         Key("noip_hostname"),
         Key("noip_username"),
@@ -1061,6 +1059,10 @@ impl Settings {
 
     fn parse(contents: &str) -> Self {
         let mut settings = Self::default();
+        // The first `direct_punch_channel` the file names replaces the
+        // built-in default rather than adding to it, so a file that names
+        // its own rooms is not silently also joined to `direct-punches`.
+        let mut punch_channels_from_file = false;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1187,30 +1189,31 @@ impl Settings {
                 // both are accepted so neither spelling is a silent no-op.
                 "daemon_no_server" => settings.daemon_no_server = parse_switch(value),
                 "direct_punch" => settings.direct_punch = parse_switch(value),
-                // Comma-separated, and as forgiving as it has always
-                // been: an unusable entry is skipped rather than failing
-                // the line, and a value with nothing usable in it at all
-                // leaves the default alone.
+                // As forgiving as every other numeric key: a value that
+                // is not a port leaves the default alone.
                 "direct_punch_port" => {
-                    let mut ports = Vec::new();
-                    for piece in value.split(',') {
-                        if let Ok(p) = piece.trim().parse::<u16>()
-                            && p != 0
-                            && !ports.contains(&p)
-                        {
-                            ports.push(p);
-                        }
-                    }
-                    if !ports.is_empty() {
-                        settings.direct_punch_ports = ports;
+                    if let Ok(p) = value.trim().parse::<u16>()
+                        && p != 0
+                    {
+                        settings.direct_punch_port = p;
                     }
                 }
-                "direct_punch_channel"
-                    if !value.is_empty()
-                        && crate::validation::channel_name_is_valid(value)
-                        && !settings.direct_punch_channels.iter().any(|c| c == value) =>
-                {
-                    settings.direct_punch_channels.push(value.to_string());
+                // Comma-separated, one or more rooms per line (and still
+                // accumulating across lines). The first occurrence clears
+                // the default so the file's list is authoritative.
+                "direct_punch_channel" if !value.is_empty() => {
+                    if !punch_channels_from_file {
+                        settings.direct_punch_channels.clear();
+                        punch_channels_from_file = true;
+                    }
+                    for name in value.split(',') {
+                        let name = name.trim();
+                        if crate::validation::channel_name_is_valid(name)
+                            && !settings.direct_punch_channels.iter().any(|c| c == name)
+                        {
+                            settings.direct_punch_channels.push(name.to_string());
+                        }
+                    }
                 }
                 "connect_host" if !value.is_empty() => {
                     settings.connect_host = Some(value.to_string())
@@ -1315,14 +1318,7 @@ impl Settings {
             always_switch("resume_from_log", self.resume_from_log),
             always_switch("queue_send_messages", self.queue_send_messages),
             always_switch("direct_punch", self.direct_punch),
-            always(
-                "direct_punch_port",
-                self.direct_punch_ports
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
+            always("direct_punch_port", self.direct_punch_port),
             always_switch(
                 "noip_when_no_server_and_direct_punch_is_active",
                 self.noip_when_no_server_and_direct_punch_is_active,
@@ -1400,7 +1396,21 @@ impl Settings {
                 "direct_punch_to",
                 self.direct_punch_to.iter().map(DirectPunchTarget::to_setting_value).collect(),
             ),
-            ("direct_punch_channel", self.direct_punch_channels.clone()),
+            // One comma-separated line, not one per room - the popup edits
+            // it as a single field. The built-in default (and an empty
+            // list) write nothing, so a scaffold that only comments the key
+            // stays byte-identical through a save and the file is not
+            // cluttered with a value the loader already assumes.
+            (
+                "direct_punch_channel",
+                if self.direct_punch_channels.is_empty()
+                    || self.direct_punch_channels == [DEFAULT_DIRECT_PUNCH_CHANNEL]
+                {
+                    Vec::new()
+                } else {
+                    vec![self.direct_punch_channels.join(",")]
+                },
+            ),
         ]
     }
 

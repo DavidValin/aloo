@@ -104,8 +104,8 @@ async fn two_targets(w: &mut AlooWorld) {
 }
 
 /// Drives the Direct Punch tab's add form the way a person does: 'a' to
-/// open it, then Tab between nickname, host and ports, then on to Save.
-#[when(expr = "I add a punch for {string} at {string} with ports {string}")]
+/// open it, then Tab between nickname, host and port, then on to Save.
+#[when(expr = "I add a punch for {string} at {string} with port {string}")]
 async fn add_punch_with_ports(w: &mut AlooWorld, nickname: String, host: String, ports: String) {
     use crossterm::event::{KeyCode, KeyModifiers};
     use crate::steps::ui_common::press_key;
@@ -123,13 +123,39 @@ async fn add_punch_with_ports(w: &mut AlooWorld, nickname: String, host: String,
     press_key(w, KeyCode::Enter, KeyModifiers::NONE);
 }
 
-#[then(expr = "the saved punch names host {string} on ports {string}")]
-async fn saved_punch_ports(w: &mut AlooWorld, host: String, ports: String) {
-    let expected: Vec<u16> = ports.split(',').map(|p| p.trim().parse().unwrap()).collect();
+#[then(expr = "the saved punch names host {string} on port {int}")]
+async fn saved_punch_ports(w: &mut AlooWorld, host: String, port: u16) {
     let popup = w.ui_mut().settings_popup.as_ref().expect("the settings popup is open");
     let row = popup.punches.rows.last().expect("a punch was saved");
-    assert_eq!(row.host, host);
-    assert_eq!(row.ports, expected);
+    assert_eq!(row.host(), Some(host.as_str()));
+    assert_eq!(row.port(), Some(port));
+}
+
+/// Adding pre-fills the "where" with a generated public realm, so keeping
+/// it means typing only the nickname and tabbing past the untouched host.
+#[when(expr = "I add a realm punch for {string}")]
+async fn add_realm_punch(w: &mut AlooWorld, nickname: String) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use crate::steps::ui_common::press_key;
+    press_key(w, KeyCode::Char('a'), KeyModifiers::NONE);
+    for c in nickname.chars() {
+        press_key(w, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    // nickname -> host -> port -> frequency -> Save
+    for _ in 0..4 {
+        press_key(w, KeyCode::Tab, KeyModifiers::NONE);
+    }
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+}
+
+#[then(expr = "the saved punch is a public rendezvous realm")]
+async fn saved_punch_is_realm(w: &mut AlooWorld) {
+    let popup = w.ui_mut().settings_popup.as_ref().expect("the settings popup is open");
+    let row = popup.punches.rows.last().expect("a punch was saved");
+    let realm = row.realm().expect("the saved row is a realm target");
+    assert_eq!(realm.host, "realm.hy2.io");
+    assert_eq!(realm.token, "public");
+    assert_eq!(row.port(), None, "a realm names no port");
 }
 
 #[when("arriving voice is turned off")]

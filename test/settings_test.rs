@@ -551,8 +551,9 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
         "# muted_voice=somenickname",
         "# daemon_channel=otherchannel",
         "# direct_punch_to=alice,alicehost.com,every_1m",
-        "# direct_punch_to=bob,bobhost.com:[18000,19000,21000],every_1m",
-        "# direct_punch_channel=the-hall",
+        "# direct_punch_to=bob,bobhost.com:19000,every_1m",
+        "# direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m",
+        "# direct_punch_channel=direct-punches,the-hall",
         "# server_superadmin=somenickname",
     ] {
         assert!(
@@ -563,7 +564,9 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
     assert!(settings.muted_voice.is_empty());
     assert!(settings.daemon_channels.is_empty());
     assert!(settings.direct_punch_to.is_empty());
-    assert!(settings.direct_punch_channels.is_empty());
+    // The commented example does not load: the value stays the built-in
+    // default rather than picking up "the-hall".
+    assert_eq!(settings.direct_punch_channels, vec!["direct-punches".to_string()]);
     assert!(settings.server_superadmin.is_empty());
     std::fs::remove_file(&path).ok();
 }
@@ -631,8 +634,9 @@ daemon_no_server=off\n\
 direct_punch=off\n\
 direct_punch_port=7879\n\
 # direct_punch_to=alice,alicehost.com,every_1m\n\
-# direct_punch_to=bob,bobhost.com:[18000,19000,21000],every_1m\n\
-# direct_punch_channel=the-hall\n\
+# direct_punch_to=bob,bobhost.com:19000,every_1m\n\
+# direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m\n\
+# direct_punch_channel=direct-punches,the-hall\n\
 noip_when_no_server_and_direct_punch_is_active=off\n\
 noip_hostname=\n\
 noip_username=\n\
@@ -938,7 +942,7 @@ fn direct_punch_is_off_and_targetless_unless_the_file_turns_it_on() {
     let settings = Settings::load_or_create(&temp_settings_path()).unwrap();
     assert!(!settings.direct_punch);
     assert!(settings.direct_punch_to.is_empty());
-    assert_eq!(settings.direct_punch_ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+    assert_eq!(settings.direct_punch_port, DEFAULT_DIRECT_PUNCH_PORT);
 }
 
 /// @requirement AC-212
@@ -961,11 +965,11 @@ fn direct_punch_on_reads_one_target_per_line() {
         .map(|t| t.nickname.as_str())
         .collect();
     assert_eq!(names, vec!["bob", "marco"]);
-    assert_eq!(settings.direct_punch_to[0].host, "bobpublic.com");
+    assert_eq!(settings.direct_punch_to[0].host(), Some("bobpublic.com"));
     assert_eq!(settings.direct_punch_to[0].frequency.minutes(), 1);
     assert_eq!(settings.direct_punch_to[1].frequency.minutes(), 60);
     // No port in the line means the well-known one both sides assume.
-    assert_eq!(settings.direct_punch_to[0].ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+    assert_eq!(settings.direct_punch_to[0].port(), Some(DEFAULT_DIRECT_PUNCH_PORT));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1012,39 +1016,52 @@ fn has_direct_punch_configured_is_true_with_the_switch_on_and_a_target() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A NAT that rewrites the source port makes one agreed number
-/// insufficient - which port arrives is the router's choice - so a line may
-/// name several and have all of them probed together.
+/// A `direct_punch_to` "where" may be a realm URI naming a rendezvous
+/// instead of an address, told apart from a host by its scheme
+/// (`docs/PROTOCOL.md` §7.1.5). It carries no port - a realm names no
+/// address at all - and its `?stun=` overrides are parsed and kept.
 /// @requirement AC-434
 #[test]
-fn a_target_host_may_name_several_ports_probed_together() {
-    for (value, host, ports) in [
-        (
-            "bob,203.0.113.9:[18000,19000,21000],every_5m",
-            "203.0.113.9",
-            vec![18000u16, 19000, 21000],
-        ),
-        // The space people naturally type after a comma.
-        ("bob,bobpublic.com:[18000, 19000],every_5m", "bobpublic.com", vec![18000, 19000]),
-        // A bracketed IPv6 host and a bracketed port list together: the
-        // field split must not confuse one bracket for the other.
-        ("bob,[2001:db8::1]:[18000,19000],every_5m", "2001:db8::1", vec![18000, 19000]),
-        // A one-element list is just the single-port form.
-        ("bob,bobpublic.com:[19000],every_5m", "bobpublic.com", vec![19000]),
-    ] {
-        let target = DirectPunchTarget::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-        assert_eq!(target.host, host, "{value:?}");
-        assert_eq!(target.ports, ports, "{value:?}");
-    }
+fn a_target_where_may_be_a_realm_uri() {
+    let target =
+        DirectPunchTarget::parse("bob,realm://public@realm.hy2.io/my-long-realm-name,every_5m")
+            .unwrap();
+    assert_eq!(target.host(), None, "a realm names no host");
+    assert_eq!(target.port(), None, "a realm names no port");
+    let realm = target.realm().expect("a realm target");
+    assert_eq!(realm.host, "realm.hy2.io");
+    assert_eq!(realm.token, "public");
+    assert_eq!(realm.realm_id, "my-long-realm-name");
+    assert!(realm.tls, "realm:// is HTTPS");
+
+    // realm+http:// for a self-hosted rendezvous under test, and a ?stun=
+    // override list.
+    let target = DirectPunchTarget::parse(
+        "bob,realm+http://tok@rv.example:8443/my-realm?stun=stun.l.example:3478,every_5m",
+    )
+    .unwrap();
+    let realm = target.realm().expect("a realm target");
+    assert!(!realm.tls, "realm+http:// is plain HTTP");
+    assert_eq!(realm.port, 8443);
+    assert_eq!(realm.stun_servers, vec!["stun.l.example:3478".to_string()]);
 }
 
-/// Asking for the same probe twice only costs a datagram.
+/// A realm URI that names no realm, no token, or asks for its own local
+/// port (which would punch from a port the peer never learns of) is
+/// refused with a reason rather than silently accepted.
 /// @requirement AC-434
 #[test]
-fn a_repeated_port_is_probed_only_once() {
-    let target =
-        DirectPunchTarget::parse("bob,bobpublic.com:[19000,18000,19000],every_5m").unwrap();
-    assert_eq!(target.ports, [19000, 18000], "order is the line's, repeats collapse");
+fn a_malformed_realm_uri_is_refused() {
+    for value in [
+        "bob,realm://public@realm.hy2.io/,every_5m",
+        "bob,realm://realm.hy2.io/name,every_5m",
+        "bob,realm://public@realm.hy2.io/name?lport=40000,every_5m",
+    ] {
+        assert!(
+            DirectPunchTarget::parse(value).is_err(),
+            "{value:?} should be refused"
+        );
+    }
 }
 
 /// @requirement AC-435
@@ -1053,7 +1070,6 @@ fn a_port_outside_the_allowed_range_is_refused_with_the_range_in_the_reason() {
     for value in [
         "bob,203.0.113.9:9000,every_5m",
         "bob,203.0.113.9:65535,every_5m",
-        "bob,203.0.113.9:[18000,70000],every_5m",
         "bob,203.0.113.9:0,every_5m",
     ] {
         let message = DirectPunchTarget::parse(value)
@@ -1066,40 +1082,31 @@ fn a_port_outside_the_allowed_range_is_refused_with_the_range_in_the_reason() {
     }
 }
 
-/// A line that names no port is spelled by leaving the port off, not by
-/// naming an empty list of them.
-/// @requirement AC-435
-#[test]
-fn an_empty_port_list_is_refused() {
-    let message = DirectPunchTarget::parse("bob,203.0.113.9:[],every_5m")
-        .expect_err("an empty list names no port");
-    assert!(message.contains("no port"), "unhelpful reason: {message:?}");
-    let message = DirectPunchTarget::parse("bob,203.0.113.9:[ ],every_5m")
-        .expect_err("whitespace is still no port");
-    assert!(message.contains("no port"), "unhelpful reason: {message:?}");
-}
-
-/// The default sits outside the accepted range on purpose, so writing it
-/// back explicitly would produce a line that no longer parses.
-/// Being reachable on several ports means binding several, since what a
-/// peer can reach you on is the set of ports you send *from*.
+/// One local punch port, read from `direct_punch_port`. A router that
+/// rewrites the source port makes what a peer aims at unknowable in
+/// advance, so binding several would not help - the realm rendezvous
+/// discovers the outer address instead (`docs/PROTOCOL.md` §7.1.5).
 /// @requirement AC-438
 #[test]
-fn direct_punch_port_takes_a_list_of_local_ports() {
+fn direct_punch_port_reads_one_local_port() {
     let path = temp_settings_path();
-    std::fs::write(&path, "direct_punch=on\ndirect_punch_port=18000, 19000,21000\n").unwrap();
+    std::fs::write(&path, "direct_punch=on
+direct_punch_port=19000
+").unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
-    assert_eq!(settings.direct_punch_ports, [18000, 19000, 21000]);
+    assert_eq!(settings.direct_punch_port, 19000);
 
-    // As forgiving as the single-value form always was: an unusable entry
-    // is skipped, and nothing usable at all leaves the default alone.
-    std::fs::write(&path, "direct_punch_port=18000,nonsense,0,18000,19000\n").unwrap();
+    // As forgiving as every other numeric key: an unusable value leaves
+    // the default alone.
+    std::fs::write(&path, "direct_punch_port=nonsense
+").unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
-    assert_eq!(settings.direct_punch_ports, [18000, 19000], "repeats collapse too");
+    assert_eq!(settings.direct_punch_port, DEFAULT_DIRECT_PUNCH_PORT);
 
-    std::fs::write(&path, "direct_punch_port=nonsense\n").unwrap();
+    std::fs::write(&path, "direct_punch_port=0
+").unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
-    assert_eq!(settings.direct_punch_ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+    assert_eq!(settings.direct_punch_port, DEFAULT_DIRECT_PUNCH_PORT, "port 0 is not a port");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1107,16 +1114,17 @@ fn direct_punch_port_takes_a_list_of_local_ports() {
 #[test]
 fn the_implicit_default_port_round_trips_as_no_port_at_all() {
     let target = DirectPunchTarget::parse("bob,bobpublic.com,every_5m").unwrap();
-    assert_eq!(target.ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+    assert_eq!(target.port(), Some(DEFAULT_DIRECT_PUNCH_PORT));
     let written = target.to_setting_value();
     assert_eq!(written, "bob,bobpublic.com,every_5m");
     assert_eq!(DirectPunchTarget::parse(&written).unwrap(), target);
 
-    // And the two written shapes round-trip too.
+    // And every written shape round-trips exactly.
     for value in [
         "bob,bobpublic.com:19000,every_5m",
-        "bob,bobpublic.com:[18000,19000,21000],every_5m",
-        "bob+laptop,[2001:db8::1]:[18000,19000],every_1h",
+        "bob,203.0.113.9:19000,every_1h",
+        "bob+laptop,[2001:db8::1]:19000,every_1h",
+        "bob,realm://public@realm.hy2.io/my-long-realm-name,every_5m",
     ] {
         let target = DirectPunchTarget::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
         assert_eq!(target.to_setting_value(), value, "round trip must be exact");
@@ -1126,21 +1134,21 @@ fn the_implicit_default_port_round_trips_as_no_port_at_all() {
 /// @requirement AC-212
 #[test]
 fn a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port() {
-    for (value, host, ports) in [
-        ("bob,203.0.113.9,every_5m", "203.0.113.9", vec![DEFAULT_DIRECT_PUNCH_PORT]),
-        ("bob,203.0.113.9:19000,every_5m", "203.0.113.9", vec![19000]),
-        ("bob,2001:db8::1,every_5m", "2001:db8::1", vec![DEFAULT_DIRECT_PUNCH_PORT]),
-        ("bob,[2001:db8::1]:19000,every_5m", "2001:db8::1", vec![19000]),
+    for (value, host, port) in [
+        ("bob,203.0.113.9,every_5m", "203.0.113.9", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,203.0.113.9:19000,every_5m", "203.0.113.9", 19000),
+        ("bob,2001:db8::1,every_5m", "2001:db8::1", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,[2001:db8::1]:19000,every_5m", "2001:db8::1", 19000),
         (
             "bob,bob-public.example.com,every_5m",
             "bob-public.example.com",
-            vec![DEFAULT_DIRECT_PUNCH_PORT],
+            DEFAULT_DIRECT_PUNCH_PORT,
         ),
-        ("bob,bobpublic.com:19000,every_5m", "bobpublic.com", vec![19000]),
+        ("bob,bobpublic.com:19000,every_5m", "bobpublic.com", 19000),
     ] {
         let target = DirectPunchTarget::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-        assert_eq!(target.host, host, "{value:?}");
-        assert_eq!(target.ports, ports, "{value:?}");
+        assert_eq!(target.host(), Some(host), "{value:?}");
+        assert_eq!(target.port(), Some(port), "{value:?}");
     }
 }
 
@@ -1304,11 +1312,12 @@ fn direct_punch_settings_survive_a_save_and_load_round_trip() {
     let path = temp_settings_path();
     let settings = Settings {
         direct_punch: true,
-        direct_punch_ports: vec![9100, 19000],
+        direct_punch_port: 19000,
         direct_punch_to: vec![
             DirectPunchTarget::parse("bob,bobpublic.com,every_1m").unwrap(),
             DirectPunchTarget::parse("marco,[2001:db8::1]:19000,every_1h").unwrap(),
-            DirectPunchTarget::parse("nina,ninahost.com:[18000,19000,21000],every_5m").unwrap(),
+            DirectPunchTarget::parse("nina,ninahost.com:21000,every_5m").unwrap(),
+            DirectPunchTarget::parse("carol,realm://public@realm.hy2.io/a-long-realm-name,every_1m").unwrap(),
         ],
         ..Settings::default()
     };
@@ -1316,7 +1325,7 @@ fn direct_punch_settings_survive_a_save_and_load_round_trip() {
 
     let reloaded = Settings::load_or_create(&path).unwrap();
     assert!(reloaded.direct_punch);
-    assert_eq!(reloaded.direct_punch_ports, [9100, 19000]);
+    assert_eq!(reloaded.direct_punch_port, 19000);
     assert_eq!(reloaded.direct_punch_to, settings.direct_punch_to);
     assert!(reloaded.direct_punch_invalid.is_empty());
     let _ = std::fs::remove_file(&path);
@@ -1351,6 +1360,36 @@ fn direct_punch_channels_are_read_one_per_line_and_validated() {
         Settings::load_or_create(&path).unwrap()
     };
     assert_eq!(reloaded.direct_punch_channels, settings.direct_punch_channels);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-217
+#[test]
+fn direct_punch_channels_default_to_direct_punches_and_take_a_comma_list() {
+    // Unset: the built-in default room, so two fresh clients land in the
+    // same one without configuring anything.
+    let path = temp_settings_path();
+    std::fs::write(&path, "direct_punch=on\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.direct_punch_channels, vec!["direct-punches".to_string()]);
+
+    // A comma-separated line names several at once, deduped, and replaces
+    // the default rather than being added to it.
+    std::fs::write(&path, "direct_punch_channel=general, dev,general\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(
+        settings.direct_punch_channels,
+        vec!["general".to_string(), "dev".to_string()],
+        "comma-separated, deduped, and the default is gone"
+    );
+
+    // And it round-trips as one comma-separated line, not one per room.
+    settings.save(&path).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("direct_punch_channel=general,dev"),
+        "one comma-separated line expected: {written}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
