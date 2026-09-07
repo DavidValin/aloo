@@ -580,6 +580,10 @@ fn host_is_valid(host: &str) -> bool {
 pub struct Settings {
     pub global_ptt_enabled: bool,
     pub global_ptt_shortcut: String,
+    /// Hold-to-talk anywhere on the screen with a finger or a mouse
+    /// button (`client::tui::ui::TOUCH_HOLD_THRESHOLD`) - the way to
+    /// talk from a tablet with no keyboard. On by default.
+    pub touch_ptt_enabled: bool,
     /// Attenuate the microphone while the other side's audio is coming out
     /// of the speakers, so it is not captured and sent straight back to
     /// them as an echo (`client::voice::EchoDucker`).
@@ -846,6 +850,7 @@ impl Default for Settings {
         Self {
             global_ptt_enabled: true,
             global_ptt_shortcut: DEFAULT_GLOBAL_PTT_SHORTCUT.to_string(),
+            touch_ptt_enabled: true,
             voice_echo_ducking: EchoDucking::default(),
             voice_autoplay: true,
             roger_beep: true,
@@ -926,6 +931,7 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         Literal("# -----------------------------------------"),
         Key("global_ptt_enabled"),
         Key("global_ptt_shortcut"),
+        Key("touch_ptt_enabled"),
         // The only tri-state switch in the file, and `auto` on its own
         // gives no hint that the other two exist - so the scaffold names
         // them.
@@ -1082,6 +1088,7 @@ impl Settings {
                 "global_ptt_shortcut" if !value.is_empty() => {
                     settings.global_ptt_shortcut = value.to_string();
                 }
+                "touch_ptt_enabled" => settings.touch_ptt_enabled = parse_switch(value),
                 "voice_echo_ducking" => {
                     settings.voice_echo_ducking = EchoDucking::parse(value);
                 }
@@ -1289,6 +1296,7 @@ impl Settings {
         vec![
             always_switch("global_ptt_enabled", self.global_ptt_enabled),
             always("global_ptt_shortcut", &self.global_ptt_shortcut),
+            always_switch("touch_ptt_enabled", self.touch_ptt_enabled),
             always("voice_echo_ducking", self.voice_echo_ducking),
             always_switch("voice_autoplay", self.voice_autoplay),
             always_switch("roger_beep", self.roger_beep),

@@ -197,6 +197,13 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                or in ~/.aloo/settings.",
     },
     HelpLine::Item {
+        keys: "hold a finger / mouse button",
+        text: "same, anywhere on the screen - for a tablet with no keyboard. Held a quarter \
+               of a second it records, lifting stops; a tap still just clicks. If a \
+               recording ever sticks (a terminal that keeps long presses for itself), \
+               tap once to end it. Turn it off under Ctrl+S (General): touch_ptt_enabled.",
+    },
+    HelpLine::Item {
         keys: "Enter",
         text: "replay a voice message (messages focused)",
     },

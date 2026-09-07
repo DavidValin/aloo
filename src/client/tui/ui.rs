@@ -81,6 +81,16 @@ pub(crate) use super::render::{
 /// continuous recording.
 pub const RECORD_HOLD_TIMEOUT: Duration = Duration::from_millis(900);
 
+/// How long a left button (a finger on a touch screen, or a mouse button)
+/// has to stay down anywhere on the screen before it counts as
+/// hold-to-talk rather than a click (`UiState::handle_mouse_at`,
+/// `UiState::tick_touch_hold`). A tap - down and up inside this window -
+/// is the ordinary click it always was; only a press still held at the
+/// end of it starts recording. Comfortably longer than a deliberate tap
+/// and comfortably shorter than the moment it takes to raise a tablet and
+/// speak, so neither is mistaken for the other.
+pub const TOUCH_HOLD_THRESHOLD: Duration = Duration::from_millis(250);
+
 /// How many entries `PageUp`/`PageDown` move the message-log selection by
 /// in one press, while focus is on the message log.
 pub const MESSAGE_PAGE_JUMP: usize = 10;
@@ -805,18 +815,25 @@ pub enum VoiceTarget {
 
 
 /// Which trigger started the current recording - `handle_key`'s Space
-/// branch and `global_record_start`/`global_record_stop` (the global
-/// Ctrl+Alt+P shortcut, see `crate::client::global_ptt`) both drive the same
-/// `recording`/`VoiceRecordStart`/`VoiceRecordStop` machinery, but need to
-/// stay distinguishable: `tick_recording_timeout`'s idle-silence guess
-/// must never apply to a `Global` recording (there's no repeat-keypress
-/// heartbeat for a held OS hotkey to go quiet - it only ever ends on a
-/// real `Released` event), and each trigger should only ever be able to
-/// stop a recording it itself started.
+/// branch, `global_record_start`/`global_record_stop` (the global
+/// Ctrl+Alt+P shortcut, see `crate::client::global_ptt`) and the held
+/// touch/mouse press (`tick_touch_hold`/`handle_mouse_at`) all drive the
+/// same `recording`/`VoiceRecordStart`/`VoiceRecordStop` machinery, but
+/// need to stay distinguishable: `tick_recording_timeout`'s idle-silence
+/// guess must never apply to a `Global` or `Touch` recording (there's no
+/// repeat-keypress heartbeat for a held OS hotkey or a held finger to go
+/// quiet - those only ever end on a real release), and each trigger
+/// should only ever be able to stop a recording it itself started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordSource {
     Space,
     Global,
+    /// A left button held anywhere on the screen past
+    /// `TOUCH_HOLD_THRESHOLD` - a finger on a tablet with no keyboard, or
+    /// a mouse button. Ends on the button's release, or, should the
+    /// terminal never forward that release (some touch terminals keep a
+    /// long press for their own text selection), on the next press.
+    Touch,
 }
 
 /// Where a session is pointed right now (`UiState::current_focus`) - the
@@ -1193,6 +1210,19 @@ pub struct UiState {
     /// because the mail compose view's own Space branch
     /// (`crate::client::tui::otp_mail`) drives the same machinery.
     pub(crate) recording_last_seen: Option<Instant>,
+    /// When the left button (a finger, or a mouse button) last went down
+    /// somewhere and has not come back up yet - `handle_mouse_at` arms it
+    /// on every press, a release inside `TOUCH_HOLD_THRESHOLD` disarms it
+    /// (that was a tap), and `tick_touch_hold` turns one still armed past
+    /// the threshold into a `RecordSource::Touch` recording. `None` while
+    /// nothing is pressed, and while `touch_ptt_enabled` is off.
+    pub(crate) touch_press: Option<Instant>,
+    /// `touch_ptt_enabled` from `~/.aloo/settings`: whether holding a
+    /// finger or a mouse button anywhere on the screen records at all.
+    /// On by default - it is the only way to talk from a tablet with no
+    /// keyboard - and off for anyone whose habit of resting a finger on
+    /// the screen would otherwise send voice.
+    pub touch_ptt_enabled: bool,
     /// The OTP mail surface (compose view + mailbox popup + reader),
     /// `Some` while the `/mail`//`/mailbox` full-screen view is open - see
     /// `crate::client::tui::otp_mail`. Every key routes there while open
@@ -1454,6 +1484,8 @@ impl UiState {
             recording: false,
             recording_source: None,
             recording_last_seen: None,
+            touch_press: None,
+            touch_ptt_enabled: true,
             otp_mail: None,
             keyboard_release_reporting: false,
             audio_error: None,

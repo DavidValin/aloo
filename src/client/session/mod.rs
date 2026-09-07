@@ -966,6 +966,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     ui_state.resume_from_log = settings.resume_from_log;
     ui_state.voice_autoplay = settings.voice_autoplay;
     ui_state.queue_send_messages = settings.queue_send_messages;
+    ui_state.touch_ptt_enabled = settings.touch_ptt_enabled;
     crate::client::global_ptt::set_enabled(settings.global_ptt_enabled);
     // Fixed for the whole session: a `--no-server` start has no supervisor
     // and nothing it could ever reconnect to, so this is the one header
@@ -1421,6 +1422,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     last_otp_key_status_sample = now;
                 }
                 if let Some(action) = ui_state.tick_recording_timeout(Instant::now()) {
+                    handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                }
+                // A finger or mouse button held past `TOUCH_HOLD_THRESHOLD`
+                // becomes a recording here, on the same cadence.
+                if let Some(action) = ui_state.tick_touch_hold(Instant::now()) {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
                 ui_state.tick_status_notice(Instant::now());

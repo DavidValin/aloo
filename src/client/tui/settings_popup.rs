@@ -90,6 +90,7 @@ impl SettingsTab {
             SettingsTab::General => &[
                 GlobalPttEnabled,
                 GlobalPttShortcut,
+                TouchPttEnabled,
                 VoiceAutoplay,
                 RogerBeep,
                 SoundNotifications,
@@ -118,6 +119,7 @@ impl SettingsTab {
 pub enum SettingsField {
     GlobalPttEnabled,
     GlobalPttShortcut,
+    TouchPttEnabled,
     VoiceAutoplay,
     RogerBeep,
     SoundNotifications,
@@ -159,6 +161,7 @@ impl SettingsField {
         match self {
             SettingsField::GlobalPttEnabled => "global_ptt_enabled",
             SettingsField::GlobalPttShortcut => "global_ptt_shortcut",
+            SettingsField::TouchPttEnabled => "touch_ptt_enabled",
             SettingsField::VoiceAutoplay => "voice_autoplay",
             SettingsField::RogerBeep => "roger_beep",
             SettingsField::SoundNotifications => "sound_notifications",
@@ -186,6 +189,9 @@ impl SettingsField {
                 "push to talk from any app (on, from off at startup: next run)"
             }
             SettingsField::GlobalPttShortcut => "which OS-wide combo does it",
+            SettingsField::TouchPttEnabled => {
+                "hold a finger or the mouse button anywhere on screen to talk"
+            }
             SettingsField::VoiceAutoplay => "play arriving voice messages as they land",
             SettingsField::RogerBeep => "the end-of-message tone, sent and received",
             SettingsField::SoundNotifications => "event sounds: file offers, joins, @mentions",
@@ -211,6 +217,7 @@ impl SettingsField {
     pub fn kind(self) -> FieldKind {
         match self {
             SettingsField::GlobalPttEnabled
+            | SettingsField::TouchPttEnabled
             | SettingsField::VoiceAutoplay
             | SettingsField::RogerBeep
             | SettingsField::SoundNotifications
@@ -247,6 +254,7 @@ impl SettingsField {
 pub struct SettingsDraft {
     pub global_ptt_enabled: bool,
     pub global_ptt_shortcut: String,
+    pub touch_ptt_enabled: bool,
     pub voice_autoplay: bool,
     pub roger_beep: bool,
     pub sound_notifications: bool,
@@ -276,6 +284,7 @@ impl SettingsDraft {
         Self {
             global_ptt_enabled: settings.global_ptt_enabled,
             global_ptt_shortcut: settings.global_ptt_shortcut.clone(),
+            touch_ptt_enabled: settings.touch_ptt_enabled,
             voice_autoplay: settings.voice_autoplay,
             roger_beep: settings.roger_beep,
             sound_notifications: settings.sound_notifications,
@@ -305,6 +314,7 @@ impl SettingsDraft {
         if !self.global_ptt_shortcut.trim().is_empty() {
             settings.global_ptt_shortcut = self.global_ptt_shortcut.trim().to_string();
         }
+        settings.touch_ptt_enabled = self.touch_ptt_enabled;
         settings.voice_autoplay = self.voice_autoplay;
         settings.roger_beep = self.roger_beep;
         settings.sound_notifications = self.sound_notifications;
@@ -347,6 +357,7 @@ impl SettingsDraft {
     fn toggle_mut(&mut self, field: SettingsField) -> Option<&mut bool> {
         Some(match field {
             SettingsField::GlobalPttEnabled => &mut self.global_ptt_enabled,
+            SettingsField::TouchPttEnabled => &mut self.touch_ptt_enabled,
             SettingsField::VoiceAutoplay => &mut self.voice_autoplay,
             SettingsField::RogerBeep => &mut self.roger_beep,
             SettingsField::SoundNotifications => &mut self.sound_notifications,
@@ -362,6 +373,7 @@ impl SettingsDraft {
     pub fn toggle_value(&self, field: SettingsField) -> bool {
         match field {
             SettingsField::GlobalPttEnabled => self.global_ptt_enabled,
+            SettingsField::TouchPttEnabled => self.touch_ptt_enabled,
             SettingsField::VoiceAutoplay => self.voice_autoplay,
             SettingsField::RogerBeep => self.roger_beep,
             SettingsField::SoundNotifications => self.sound_notifications,
@@ -787,12 +799,13 @@ fn render_text_field(
 
 fn render_general_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopupState) {
     use SettingsField::*;
-    // 9, not 8: a blank row under the shortcut box, so the two switches
+    // 10, not 9: a blank row under the shortcut box, so the three switches
     // below it do not read as belonging to it.
-    if let Some(mut inner) = group(frame, stack, "voice / ptt", 9) {
+    if let Some(mut inner) = group(frame, stack, "voice / ptt", 10) {
         render_toggle(frame, &mut inner, popup, GlobalPttEnabled);
         render_text_field(frame, &mut inner, popup, GlobalPttShortcut);
         inner.gap();
+        render_toggle(frame, &mut inner, popup, TouchPttEnabled);
         render_toggle(frame, &mut inner, popup, VoiceAutoplay);
         render_toggle(frame, &mut inner, popup, RogerBeep);
     }

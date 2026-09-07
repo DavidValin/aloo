@@ -495,12 +495,13 @@ fn a_blank_row_separates_each_area_and_follows_the_shortcut_box() {
         inner.trim().is_empty()
     };
 
-    // The shortcut box's bottom rule, then a gap, then voice_autoplay.
-    let autoplay = row_of("voice_autoplay");
+    // The shortcut box's bottom rule, then a gap, then the first switch
+    // under it (touch_ptt_enabled).
+    let first_switch_below = row_of("touch_ptt_enabled");
     assert!(
-        is_blank_inside_popup(autoplay - 1),
+        is_blank_inside_popup(first_switch_below - 1),
         "expected a blank row under the shortcut box: {:?}",
-        rows[autoplay - 1]
+        rows[first_switch_below - 1]
     );
     // Every area's own top rule has a gap above it.
     for title in ["notifications", "logs", "delivery"] {
@@ -647,3 +648,23 @@ fn the_noip_password_is_hidden_unless_it_is_the_focused_box() {
 
 
 
+
+/// Hold-to-talk by touch has its switch next to the global shortcut it
+/// sits beside in meaning - on by default, and a flip is saved at once
+/// (docs/SPEC.md Functionality #4, #23).
+/// @requirement AC-447
+#[test]
+fn touch_ptt_enabled_is_a_switch_on_the_general_tab() {
+    let mut state = open_settings();
+    assert!(draft(&state).touch_ptt_enabled);
+    assert_eq!(
+        SettingsTab::General.fields()[2],
+        SettingsField::TouchPttEnabled,
+        "right under the shortcut box"
+    );
+    focus_on(&mut state, SettingsField::TouchPttEnabled);
+    let saved = saved(press(&mut state, KeyCode::Char(' ')));
+    assert!(!saved.touch_ptt_enabled);
+    assert!(saved.global_ptt_enabled, "its neighbour is a separate switch");
+    assert!(draft(&state).global_ptt_shortcut == "ctrl+alt+p");
+}

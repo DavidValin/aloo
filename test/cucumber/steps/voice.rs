@@ -1,13 +1,15 @@
 //! Push-to-talk voice steps (US-007, client side).
 
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use std::time::Instant;
+
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use cucumber::{given, then, when};
 
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     END_CALL_CONFIRM_TITLE, MessageBody, PendingCallInvite, UiAction, VoiceTarget,
 };
-use aloo::client::tui::ui::format_duration_label;
+use aloo::client::tui::ui::{TOUCH_HOLD_THRESHOLD, format_duration_label};
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::{header_row, ui_rows, ui_rows_wide};
@@ -35,6 +37,58 @@ async fn release_space(w: &mut AlooWorld) {
         KeyModifiers::NONE,
         KeyEventKind::Release,
     );
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+// Hold-to-talk by touch (`UiState::handle_mouse_at`/`tick_touch_hold`):
+// a left button held anywhere on the screen. The clock is passed in, so
+// "the press outlasts a tap" is a tick one threshold later rather than a
+// real wait.
+
+fn touch(kind: MouseEventKind) -> MouseEvent {
+    MouseEvent { kind, column: 3, row: 3, modifiers: KeyModifiers::NONE }
+}
+
+#[when("I press and hold anywhere on the screen")]
+async fn press_and_hold(w: &mut AlooWorld) {
+    let action = w
+        .ui_mut()
+        .handle_mouse_at(touch(MouseEventKind::Down(MouseButton::Left)), Instant::now());
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+#[when("I tap the screen")]
+async fn tap(w: &mut AlooWorld) {
+    let now = Instant::now();
+    let ui = w.ui_mut();
+    ui.handle_mouse_at(touch(MouseEventKind::Down(MouseButton::Left)), now);
+    let action = ui.handle_mouse_at(touch(MouseEventKind::Up(MouseButton::Left)), now);
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+#[when("the press outlasts a tap")]
+async fn press_outlasts_a_tap(w: &mut AlooWorld) {
+    let action = w.ui_mut().tick_touch_hold(Instant::now() + TOUCH_HOLD_THRESHOLD);
+    w.action_was_none = w.action_was_none && action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+#[when("I lift my finger")]
+async fn lift_finger(w: &mut AlooWorld) {
+    let action = w
+        .ui_mut()
+        .handle_mouse_at(touch(MouseEventKind::Up(MouseButton::Left)), Instant::now());
     w.action_was_none = action.is_none();
     if action.is_some() {
         w.last_action = action;
@@ -238,6 +292,38 @@ async fn a_recording_starts(w: &mut AlooWorld) {
         w.ui_ref().recording,
         "with somewhere to hold it, recording for someone away must begin"
     );
+}
+
+/// The bar's inner text starts right after its left border, so the
+/// indicator at the very start means the cell before it is that border -
+/// and that border is red. Nothing typed shows anywhere on the row.
+#[then("the compose bar shows only the recording indicator, in red")]
+async fn compose_bar_is_only_the_indicator(w: &mut AlooWorld) {
+    let ui = w.ui_ref();
+    let buffer = crate::support::ui_buffer(ui, 100, 30);
+    let rows = crate::support::rows_of(&buffer);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("recording..."))
+        .unwrap_or_else(|| panic!("expected the recording indicator: {rows:?}")) as u16;
+    // A cell index, not a byte offset: the border and the dot are
+    // multi-byte, one cell each.
+    let at = rows[y as usize].find("recording...").unwrap();
+    let x = rows[y as usize][..at].chars().count() as u16;
+    // "<dot> recording..." - the dot's cell, then a space, then the text;
+    // the cell before the dot is the bar's left border.
+    let border_x = x - 3;
+    assert_eq!(buffer[(border_x, y)].symbol(), "\u{2502}", "the indicator sits at the start of the bar: {:?}", rows[y as usize]);
+    assert_eq!(buffer[(border_x, y)].style().fg, Some(ratatui::style::Color::Red), "and the border is red");
+    assert_eq!(buffer[(x, y)].style().fg, Some(ratatui::style::Color::Red), "and so is the indicator");
+    assert!(!rows[y as usize].contains(&ui.input), "what was typed is hidden while recording: {:?}", rows[y as usize]);
+}
+
+#[then("the compose bar shows what I typed again")]
+async fn compose_bar_shows_input_again(w: &mut AlooWorld) {
+    let ui = w.ui_ref();
+    let rows = ui_rows(ui);
+    assert!(rows.iter().any(|r| r.contains(&ui.input)), "expected {:?} back on screen: {rows:?}", ui.input);
 }
 
 #[then("a recording indicator is shown")]

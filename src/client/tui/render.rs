@@ -1587,39 +1587,50 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         .is_some_and(|peer| state.is_otp_active(peer))
         .then(|| format!("{OTP_ICON} "));
 
-    let mut spans = if dm_peer_trust_gated {
+    // A recording takes the whole bar over: the blinking red indicator
+    // sits at the start, in the same place every time, and whatever was
+    // typed (and the pad marker and placeholders) is out of sight until
+    // the recording ends - not lost, `input` is untouched, just not shown
+    // alongside. The one thing the bar is saying right now is that the
+    // microphone is live, and it should say it where the eye lands first
+    // rather than wherever the typed text happens to end.
+    let spans = if state.recording {
+        let dot = if state.blink_on { "\u{23FA}" } else { " " };
         vec![Span::styled(
-            "(identity not verified)",
-            Style::default().fg(Color::Red),
-        )]
-    } else if dm_peer_offline && state.input.is_empty() {
-        vec![Span::styled(
-            "(user offline)",
-            Style::default().fg(Color::Red),
+            format!("{dot} recording..."),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]
     } else {
-        vec![Span::raw(state.input.as_str())]
+        let mut spans = if dm_peer_trust_gated {
+            vec![Span::styled(
+                "(identity not verified)",
+                Style::default().fg(Color::Red),
+            )]
+        } else if dm_peer_offline && state.input.is_empty() {
+            vec![Span::styled(
+                "(user offline)",
+                Style::default().fg(Color::Red),
+            )]
+        } else {
+            vec![Span::raw(state.input.as_str())]
+        };
+        if let Some(prefix) = &pad_prefix {
+            spans.insert(
+                0,
+                Span::styled(prefix.clone(), Style::default().fg(OTP_TAG_COLOR)),
+            );
+        }
+        spans
     };
-    if let Some(prefix) = &pad_prefix {
-        spans.insert(
-            0,
-            Span::styled(prefix.clone(), Style::default().fg(OTP_TAG_COLOR)),
-        );
-    }
-    if state.recording {
-        let dot = if state.blink_on { "\u{23FA}" } else { " " };
-        spans.push(Span::styled(
-            format!(" {dot} recording..."),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 
     // Only show a blinking cursor here when this bar is actually focused,
-    // nothing else (e.g. the join-channel popup) is drawn on top of it, and
-    // there's actually text to edit (not one of the placeholders above).
+    // nothing else (e.g. the join-channel popup) is drawn on top of it,
+    // there's actually text to edit (not one of the placeholders above),
+    // and no recording has taken the bar over.
     if state.focus == Focus::Input
         && state.mode == Mode::Normal
+        && !state.recording
         && !dm_peer_trust_gated
         && (!dm_peer_offline || !state.input.is_empty())
     {

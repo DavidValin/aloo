@@ -1562,7 +1562,7 @@ impl UiState {
     /// rather than misreading it as a message send while one of these is
     /// absorbing every key instead (an open identity review, an invite, a
     /// popup, the help screen, ...).
-    fn overlay_absorbing_input(&self) -> bool {
+    pub(crate) fn overlay_absorbing_input(&self) -> bool {
         self.identity_review_queue.front().is_some()
             || self.unknown_peer_review_queue.front().is_some()
             || self.otp_invite_queue.front().is_some()
@@ -1688,12 +1688,42 @@ impl UiState {
     /// Right clicks, scrolling, and drags do nothing yet - this covers the
     /// two targets a click most obviously means "go here", not every
     /// clickable thing in the app.
+    ///
+    /// The left button is also hold-to-talk, anywhere on the screen: a
+    /// press arms `touch_press`, and `tick_touch_hold` starts a
+    /// `RecordSource::Touch` recording if it is still down after
+    /// `TOUCH_HOLD_THRESHOLD`. The click itself is honored on the press
+    /// as before, so a hold on the input bar both focuses it and records
+    /// - nothing a tap did changes, and no on-screen target is needed,
+    /// which is the point on a tablet with no keyboard. The release stops
+    /// a touch recording (and only a touch one; Space and the global
+    /// shortcut end their own). A press *while* a touch recording is
+    /// running stops it too, rather than starting another: that is what a
+    /// stuck recording looks like on a terminal that kept the release for
+    /// its own long-press gesture, and a tap is the natural way out.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<UiAction> {
-        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return None;
+        self.handle_mouse_at(event, Instant::now())
+    }
+
+    /// `handle_mouse` with the clock passed in, so a hold can be
+    /// exercised without waiting for one.
+    pub fn handle_mouse_at(&mut self, event: MouseEvent, now: Instant) -> Option<UiAction> {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {}
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.touch_press = None;
+                return self.touch_record_stop();
+            }
+            _ => return None,
+        }
+        if self.recording && self.recording_source == Some(RecordSource::Touch) {
+            return self.touch_record_stop();
         }
         if self.overlay_absorbing_input() {
             return None;
+        }
+        if self.touch_ptt_enabled {
+            self.touch_press = Some(now);
         }
         let (x, y) = (event.column, event.row);
         let input_area = unpack_rect(self.last_input_bar_area.load(Ordering::Relaxed));

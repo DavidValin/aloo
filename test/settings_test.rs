@@ -613,6 +613,7 @@ const EXPECTED_FIRST_RUN_SCAFFOLD: &str = "\
 # -----------------------------------------\n\
 global_ptt_enabled=on\n\
 global_ptt_shortcut=ctrl+alt+p\n\
+touch_ptt_enabled=on\n\
 # voice_echo_ducking: auto (decide from the audio), on, off\n\
 voice_echo_ducking=auto\n\
 voice_autoplay=on\n\
@@ -1538,4 +1539,27 @@ fn every_switch_is_written_on_or_off_and_still_reads_the_old_spelling() {
     assert!(!loaded.global_ptt_enabled);
     assert!(loaded.daemon_otp);
     std::fs::remove_file(&new).ok();
+}
+
+/// `touch_ptt_enabled` (hold-to-talk by touch, docs/SPEC.md Functionality
+/// #4) is on out of the box, is written in the client section as on/off
+/// like every other switch, and reads back either way round.
+/// @requirement AC-447
+#[test]
+fn touch_ptt_enabled_is_on_by_default_and_round_trips() {
+    assert!(Settings::default().touch_ptt_enabled);
+
+    let path = temp_settings_path();
+    let saved = Settings {
+        touch_ptt_enabled: false,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("touch_ptt_enabled=off"), "{contents}");
+    assert!(!Settings::load_or_create(&path).unwrap().touch_ptt_enabled);
+
+    std::fs::write(&path, "touch_ptt_enabled=on\n").unwrap();
+    assert!(Settings::load_or_create(&path).unwrap().touch_ptt_enabled);
+    std::fs::remove_file(&path).ok();
 }

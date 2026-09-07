@@ -52,13 +52,20 @@ impl UiState {
     /// shortcut fired while the app isn't focused. A no-op while any
     /// recording is in progress.
     pub fn global_record_start(&mut self) -> Option<UiAction> {
+        self.record_start_from(RecordSource::Global)
+    }
+
+    /// What `global_record_start` and `tick_touch_hold` share: start a
+    /// recording tagged `source`, addressed to wherever the eye is right
+    /// now, or nowhere. A no-op while any recording is in progress.
+    fn record_start_from(&mut self, source: RecordSource) -> Option<UiAction> {
         if self.recording {
             return None;
         }
         match self.current_voice_target() {
             Some(target) => {
                 self.recording = true;
-                self.recording_source = Some(RecordSource::Global);
+                self.recording_source = Some(source);
                 self.audio_error = None;
                 Some(UiAction::VoiceRecordStart(target))
             }
@@ -67,6 +74,41 @@ impl UiState {
                 None
             }
         }
+    }
+
+    /// Call periodically: turns a left button still held past
+    /// `TOUCH_HOLD_THRESHOLD` (armed by `handle_mouse_at`) into a
+    /// `RecordSource::Touch` recording - hold-to-talk anywhere on the
+    /// screen, for a tablet with no keyboard. The press is consumed
+    /// either way, so one hold is one recording. Nothing starts while
+    /// some overlay has come up in the meantime (a popup, `/mail`, a
+    /// decision queue - the same rule a click follows), or while a Space
+    /// or global recording is already running; a hold that finds nowhere
+    /// to send to (`current_voice_target`) is refused exactly as Space is.
+    pub fn tick_touch_hold(&mut self, now: Instant) -> Option<UiAction> {
+        let pressed_at = self.touch_press?;
+        if now.duration_since(pressed_at) < TOUCH_HOLD_THRESHOLD {
+            return None;
+        }
+        self.touch_press = None;
+        if self.overlay_absorbing_input() {
+            return None;
+        }
+        self.record_start_from(RecordSource::Touch)
+    }
+
+    /// Stops a recording a held touch/mouse press itself started - a
+    /// no-op if nothing is recording, or if the current recording was
+    /// started by Space or the global shortcut (each trigger only ever
+    /// ends its own; see `global_record_stop`).
+    pub fn touch_record_stop(&mut self) -> Option<UiAction> {
+        if !self.recording || self.recording_source != Some(RecordSource::Touch) {
+            return None;
+        }
+        self.recording = false;
+        self.recording_source = None;
+        self.recording_last_seen = None;
+        Some(UiAction::VoiceRecordStop)
     }
 
     /// Stops a recording the global shortcut itself started - a no-op if
@@ -104,10 +146,12 @@ impl UiState {
     /// for `RECORD_HOLD_TIMEOUT`, for terminals that never send `Release`
     /// (see `handle_key`). A no-op when `keyboard_release_reporting` is
     /// `true` - a real `Release` is guaranteed there, so the guess must
-    /// never fire. Also a no-op for a `Global`-sourced recording: a held
-    /// OS hotkey has no repeat heartbeat to go quiet, and its backends all
-    /// deliver a real release - the idle guess would wrongly auto-stop
-    /// every global recording after ~`RECORD_HOLD_TIMEOUT`.
+    /// never fire. Also a no-op for a `Global`- or `Touch`-sourced
+    /// recording: a held OS hotkey or a held finger has no repeat
+    /// heartbeat to go quiet, and both deliver a real release (or, for a
+    /// touch, fall back to the next press - `handle_mouse_at`) - the idle
+    /// guess would wrongly auto-stop every one of them after
+    /// ~`RECORD_HOLD_TIMEOUT`.
     pub fn tick_recording_timeout(&mut self, now: Instant) -> Option<UiAction> {
         if !self.recording
             || self.keyboard_release_reporting

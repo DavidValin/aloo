@@ -45,6 +45,42 @@ Feature: Sending a voice message by holding a key
     When I hold Space
     Then no recording starts
 
+  @AC-447
+  Scenario: Holding a finger anywhere on the screen streams like Space
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I press and hold anywhere on the screen
+    And the press outlasts a tap
+    Then a voice message starts streaming to the channel, addressed to bob
+    And a recording indicator is shown
+    When I lift my finger
+    Then the voice message is sent
+
+  @AC-447
+  Scenario: A tap is a click, not a hold
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I tap the screen
+    And the press outlasts a tap
+    Then no recording starts
+
+  @AC-447
+  Scenario: Holding with nowhere to send does not record
+    Given I am connected but have not joined any channel
+    When I press and hold anywhere on the screen
+    And the press outlasts a tap
+    Then no recording starts
+
+  @AC-447
+  Scenario: A stuck touch recording ends on the next tap
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I press and hold anywhere on the screen
+    And the press outlasts a tap
+    Then a voice message starts streaming to the channel, addressed to bob
+    When I press and hold anywhere on the screen
+    Then the voice message is sent
+
   @AC-035
   Scenario: An incoming voice message appears while it is still arriving
     Given I am connected and viewing a channel
@@ -111,6 +147,18 @@ Feature: Sending a voice message by holding a key
       | 3000  | voice (3sec)   |
       | 12000 | voice (12sec)  |
       | 47000 | voice (47sec)  |
+
+  @AC-038
+  Scenario: Recording takes over the compose bar
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I type "hello all"
+    And I move focus to the log
+    And I hold Space
+    Then the compose bar shows only the recording indicator, in red
+    When I release Space
+    Then the compose bar holds "hello all"
+    And the compose bar shows what I typed again
 
   @AC-038 @TB-043
   Scenario: A recorder that will not start stops pretending it did

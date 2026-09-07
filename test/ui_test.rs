@@ -1825,6 +1825,54 @@ fn render_shows_recording_indicator_while_recording() {
     );
 }
 
+/// The bar is taken over while recording: red border, the indicator at
+/// the very start (right after the left border, wherever the typed text
+/// would have ended), the typed text out of sight, and no cursor even
+/// with the bar focused. Release brings the text back, untouched.
+/// @requirement AC-038
+#[test]
+fn while_recording_the_compose_bar_shows_only_the_indicator_in_red_with_no_cursor() {
+    use ratatui::style::Color;
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Input;
+    type_str(&mut state, "half-typed message");
+    // Started by the global shortcut so the bar can stay focused - the
+    // one case where a cursor would otherwise be drawn.
+    assert!(matches!(state.global_record_start(), Some(UiAction::VoiceRecordStart(_))));
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| aloo::client::tui::ui::render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows = rows_of(&buffer);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("recording..."))
+        .unwrap_or_else(|| panic!("expected the recording indicator: {rows:?}")) as u16;
+    let at = rows[y as usize].find("recording...").unwrap();
+    let x = rows[y as usize][..at].chars().count() as u16;
+    // "<dot> recording..." - the cell before the dot is the left border.
+    let border_x = x - 3;
+    assert_eq!(buffer[(border_x, y)].symbol(), "\u{2502}", "indicator at the start of the bar: {:?}", rows[y as usize]);
+    assert_eq!(buffer[(border_x, y)].style().fg, Some(Color::Red), "red border while recording");
+    assert_eq!(buffer[(x, y)].style().fg, Some(Color::Red));
+    assert!(
+        !rows.iter().any(|r| r.contains("half-typed message")),
+        "typed text is hidden while recording: {rows:?}"
+    );
+    assert!(!terminal.backend().cursor_visible(), "no cursor while recording");
+    assert_eq!(state.input, "half-typed message", "but the text itself is kept");
+
+    assert_eq!(state.global_record_stop(), Some(UiAction::VoiceRecordStop));
+    terminal.draw(|f| aloo::client::tui::ui::render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows = rows_of(&buffer);
+    assert!(rows.iter().any(|r| r.contains("half-typed message")), "back after release: {rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("recording...")));
+    assert!(terminal.backend().cursor_visible(), "and the cursor is back");
+    assert_eq!(buffer[(border_x, y)].style().fg, Some(Color::Yellow), "focused border again");
+}
+
 /// @requirement AC-038
 #[test]
 fn render_does_not_show_recording_or_playback_errors() {

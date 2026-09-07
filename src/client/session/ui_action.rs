@@ -762,6 +762,7 @@ fn save_settings_draft(
     // cannot do mid-session.
     crate::client::global_ptt::set_enabled(draft.global_ptt_enabled);
     ui_state.voice_autoplay = draft.voice_autoplay;
+    ui_state.touch_ptt_enabled = draft.touch_ptt_enabled;
     ui_state.autosave_messages = draft.autosave_messages;
     ui_state.resume_from_log = draft.resume_from_log;
     ui_state.queue_send_messages = draft.queue_send_messages;

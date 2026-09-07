@@ -149,6 +149,7 @@ message or saved a file, `-> DELIVERED+LISTENED` / `-> DELIVERED+SAVED`.
 |---|---|
 | hold `Space` | Record and send live — release to stop. Not while composing |
 | hold `Ctrl+Alt+P` | The same, from any app, even when aloo isn't focused |
+| hold a finger / the mouse button | The same, anywhere on the screen — for a tablet with no keyboard. A tap still just clicks |
 | `Enter` | Replay a voice message (messages focused) |
 | `Esc` | Stop a replay that's playing |
 
@@ -159,6 +160,11 @@ an incoming stream is never accepted past it either.
 The global shortcut is on by default — change the combo or turn it off with
 `global_ptt_shortcut` / `global_ptt_enabled` in `~/.aloo/settings`. Linux
 needs X11; it isn't available under Wayland.
+
+On a touch screen, hold a finger anywhere for a quarter of a second and
+talk; lift it to stop. If the recording ever sticks because your terminal
+app keeps long presses for itself, tap once to end it. `touch_ptt_enabled`
+turns the gesture off.
 
 ### Muting someone's voice
 
@@ -198,7 +204,7 @@ start.)
 
 | Tab | What's on it |
 |---|---|
-| **General** | `global_ptt_enabled` / `global_ptt_shortcut` (see "Voice messages"), `voice_autoplay`, `roger_beep`, `sound_notifications` (see "Turning the sounds off"), `autosave_messages` / `resume_from_log` (see "Exporting your chat history"), `queue_send_messages` (see "Talking to someone who isn't there") |
+| **General** | `global_ptt_enabled` / `global_ptt_shortcut` / `touch_ptt_enabled` (see "Voice messages"), `voice_autoplay`, `roger_beep`, `sound_notifications` (see "Turning the sounds off"), `autosave_messages` / `resume_from_log` (see "Exporting your chat history"), `queue_send_messages` (see "Talking to someone who isn't there") |
 | **Direct Punch** | The `direct_punch` switch, the list of people to punch at, and the No-IP account that keeps a moving address reachable — see "Punching straight to someone" |
 | **OTP** | `otp_low_key_warn_pct` and `otp_binary_path` |
 
