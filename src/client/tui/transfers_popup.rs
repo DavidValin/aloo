@@ -1,4 +1,4 @@
-//! The global transfers popup (`Ctrl+Alt+D` by default, see
+//! The global transfers popup (`Ctrl+D` by default, see
 //! `settings::transfers_shortcut`): every shared-folder transfer this
 //! client has taken part in, both directions and every peer, live rows
 //! above finished ones.
@@ -15,16 +15,23 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
 use crate::client::shared_folders::format_size;
 use crate::client::transfer_log::{TransferDirection, TransferStatus};
 
 use super::ui::{Mode, UiAction, UiState, centered_rect};
 use super::widgets::progress_bar::{DEFAULT_BAR_CELLS, percent_of, progress_line};
+use super::widgets::text::elide_start;
 
-const POPUP_WIDTH: u16 = 96;
+/// Wide, because every row is a path and a path is what a reader is
+/// scanning for - the columns after it are short and fixed.
+const POPUP_WIDTH: u16 = 120;
 const POPUP_HEIGHT: u16 = 28;
+/// What the fixed part of a row costs: the marker, the arrow, the
+/// preposition and peer, the state and the counts. What is left is the
+/// path's (`elide_start`).
+const ROW_FURNITURE: usize = 46;
 
 /// Which rows are on screen. Everything, or one direction of it - a
 /// person sharing a lot of folders wants to see what is going out
@@ -37,6 +44,9 @@ pub enum TransfersFilter {
 }
 
 impl TransfersFilter {
+    /// The three, in the order the tab strip shows them.
+    pub const ALL: [TransfersFilter; 3] = [Self::All, Self::Downloads, Self::Uploads];
+
     fn next(self) -> Self {
         match self {
             Self::All => Self::Downloads,
@@ -45,12 +55,16 @@ impl TransfersFilter {
         }
     }
 
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
-            Self::All => "all",
-            Self::Downloads => "downloads",
-            Self::Uploads => "uploads",
+            Self::All => "All",
+            Self::Downloads => "Downloads",
+            Self::Uploads => "Uploads",
         }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
     }
 
     fn keeps(self, direction: TransferDirection) -> bool {
@@ -105,12 +119,13 @@ impl UiState {
     }
 
     pub(crate) fn handle_transfers_popup_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        let rows: Vec<(TransferDirection, u64, bool, bool)> = self
+        let rows: Vec<(TransferDirection, String, u64, bool, bool)> = self
             .transfers_popup_rows()
             .iter()
             .map(|r| {
                 (
                     r.direction,
+                    r.peer_name.clone(),
                     r.request_id,
                     r.status.is_active(),
                     r.is_clearable(),
@@ -119,7 +134,7 @@ impl UiState {
             .collect();
         let state = self.transfers_popup.as_mut()?;
         state.selected = state.selected.min(rows.len().saturating_sub(1));
-        let selected = rows.get(state.selected).copied();
+        let selected = rows.get(state.selected).cloned();
         match code {
             KeyCode::Esc => {
                 self.close_transfers_popup();
@@ -141,7 +156,7 @@ impl UiState {
                 None
             }
             KeyCode::Char('c') => {
-                let (direction, request_id, active, _) = selected?;
+                let (direction, peer_name, request_id, active, _) = selected?;
                 if !active {
                     return None;
                 }
@@ -150,18 +165,21 @@ impl UiState {
                 // tells the requester to stop waiting (§7.8).
                 Some(match direction {
                     TransferDirection::Download => UiAction::CancelSharedDownload { request_id },
-                    TransferDirection::Upload => UiAction::CancelSharedUpload { request_id },
+                    TransferDirection::Upload => UiAction::CancelSharedUpload {
+                        peer_name,
+                        request_id,
+                    },
                 })
             }
             KeyCode::Char('r') => {
-                let (direction, request_id, active, _) = selected?;
+                let (direction, _peer_name, request_id, active, _) = selected?;
                 (!active && direction == TransferDirection::Download)
                     .then_some(UiAction::ResumeSharedDownload { request_id })
             }
             KeyCode::Char('x') | KeyCode::Delete => {
-                let (direction, request_id, _, clearable) = selected?;
+                let (direction, peer_name, request_id, _, clearable) = selected?;
                 if clearable {
-                    self.clear_transfer(direction, request_id);
+                    self.clear_transfer(direction, &peer_name, request_id);
                     return Some(UiAction::SaveTransferHistory);
                 }
                 None
@@ -182,18 +200,9 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
     let rows = state.transfers_popup_rows();
     let active = state.transfers.active();
     let title = if active > 0 {
-        format!(
-            "Transfers - {} running ({}) \u{2502} Tab: {}",
-            active,
-            popup_state.filter.title(),
-            popup_state.filter.next().title()
-        )
+        format!("Transfers - {active} running")
     } else {
-        format!(
-            "Transfers ({}) \u{2502} Tab: {}",
-            popup_state.filter.title(),
-            popup_state.filter.next().title()
-        )
+        "Transfers".to_string()
     };
     let popup = centered_rect(POPUP_WIDTH, POPUP_HEIGHT, area);
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -201,17 +210,56 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
     frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
 
-    let help = Rect { height: 1.min(inner.height), ..inner };
+    // The two directions read as tabs across the top, the same shape the
+    // settings popup uses, rather than as a hint buried in the title -
+    // which way you are looking is the first thing to see.
+    let tab_row = Rect { height: 2.min(inner.height), ..inner };
+    let titles: Vec<String> = TransfersFilter::ALL
+        .iter()
+        .map(|f| {
+            let running = match f {
+                TransfersFilter::All => state.transfers.active(),
+                TransfersFilter::Downloads => {
+                    state.transfers.active_in(TransferDirection::Download)
+                }
+                TransfersFilter::Uploads => state.transfers.active_in(TransferDirection::Upload),
+            };
+            if running > 0 {
+                format!(" {} ({running}) ", f.title())
+            } else {
+                format!(" {} ", f.title())
+            }
+        })
+        .collect();
+    frame.render_widget(
+        Tabs::new(titles)
+            .select(popup_state.filter.index())
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(" "),
+        tab_row,
+    );
+
+    let help = Rect {
+        y: inner.y.saturating_add(2),
+        height: 1.min(inner.height.saturating_sub(2)),
+        ..inner
+    };
     frame.render_widget(
         Paragraph::new(
-            "c: cancel \u{2502} r: resume a download \u{2502} x: remove \u{2502} X: clear finished \u{2502} Esc: close",
+            "Tab: switch \u{2502} c: cancel \u{2502} r: resume a download \u{2502} x: remove \u{2502} X: clear finished \u{2502} Esc: close",
         )
         .style(Style::default().fg(Color::DarkGray)),
         help,
     );
     let body = Rect {
-        y: inner.y.saturating_add(2),
-        height: inner.height.saturating_sub(2),
+        y: inner.y.saturating_add(4),
+        height: inner.height.saturating_sub(4),
         ..inner
     };
     if rows.is_empty() {
@@ -223,6 +271,7 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
         return;
     }
 
+    let path_width = (inner.width as usize).saturating_sub(ROW_FURNITURE).max(12);
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in rows.iter().enumerate() {
         let marker = if i == popup_state.selected { "\u{25b8} " } else { "  " };
@@ -234,17 +283,26 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
         };
         // The arrow says which way it went and the preposition says who
         // with, so a row reads without having to know the convention.
-        let (arrow, preposition) = match item.direction {
-            TransferDirection::Download => (item.direction.marker(), "from"),
-            TransferDirection::Upload => (item.direction.marker(), "to"),
+        let preposition = match item.direction {
+            TransferDirection::Download => "from",
+            TransferDirection::Upload => "to",
         };
         let counted = match item.files_total {
             Some(total) => format!("{}/{total} files", item.files_done),
             None => format!("{} files", item.files_done),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{arrow} "), Style::default().fg(color)),
-            Span::styled(item.label(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{marker}{} ", item.direction.marker()),
+                Style::default().fg(color),
+            ),
+            // The tail of the path, not the head: the last components
+            // say which file this is, the first ones repeat down the
+            // whole list.
+            Span::styled(
+                elide_start(&item.label(), path_width),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!(" {preposition} {}", item.peer_name),
                 Style::default().fg(Color::Gray),

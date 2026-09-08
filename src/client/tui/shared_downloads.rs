@@ -29,7 +29,7 @@ pub use crate::client::transfer_log::{
 
 /// A download, as this module has always called it - one direction of a
 /// `TransferRecord`, which is now the one shape both the per-peer
-/// Downloads tab and the global `Ctrl+Alt+D` popup are drawn from
+/// Downloads tab and the global `Ctrl+D` popup are drawn from
 /// (`client::transfer_log`).
 pub type SharedDownload = TransferRecord;
 
@@ -117,23 +117,23 @@ impl UiState {
     }
 
     fn download_mut(&mut self, request_id: u64) -> Option<&mut SharedDownload> {
-        self.transfers
-            .get_mut(TransferDirection::Download, request_id)
+        self.transfers.download_mut(request_id)
     }
 
     pub fn shared_download(&self, request_id: u64) -> Option<&SharedDownload> {
-        self.transfers.get(TransferDirection::Download, request_id)
+        self.transfers.download(request_id)
     }
 
     /// What the peer's plan says a transfer covers, either direction.
     pub fn set_transfer_plan(
         &mut self,
         direction: TransferDirection,
+        peer_name: &str,
         request_id: u64,
         files: u32,
         bytes: u64,
     ) {
-        if let Some(item) = self.transfers.get_mut(direction, request_id) {
+        if let Some(item) = self.transfers.get_mut(direction, peer_name, request_id) {
             item.files_total = Some(files);
             item.bytes_total = Some(bytes);
             if item.status == SharedDownloadStatus::Asking {
@@ -143,7 +143,13 @@ impl UiState {
     }
 
     pub fn set_shared_download_plan(&mut self, request_id: u64, files: u32, bytes: u64) {
-        self.set_transfer_plan(TransferDirection::Download, request_id, files, bytes);
+        if let Some(item) = self.transfers.download_mut(request_id) {
+            item.files_total = Some(files);
+            item.bytes_total = Some(bytes);
+            if item.status == SharedDownloadStatus::Asking {
+                item.status = SharedDownloadStatus::Running;
+            }
+        }
     }
 
     /// Bytes written for a file still arriving. `delta` is what is new,
@@ -160,8 +166,11 @@ impl UiState {
 
     /// One file of an upload has gone out - the sender's own progress,
     /// counted in bytes so its bar reads like the receiver's.
-    pub fn on_upload_file_done(&mut self, request_id: u64, size: u64) {
-        if let Some(item) = self.transfers.get_mut(TransferDirection::Upload, request_id) {
+    pub fn on_upload_file_done(&mut self, peer_name: &str, request_id: u64, size: u64) {
+        if let Some(item) = self
+            .transfers
+            .get_mut(TransferDirection::Upload, peer_name, request_id)
+        {
             item.files_done += 1;
             item.bytes_done = item.bytes_done.saturating_add(size);
             if item.status == SharedDownloadStatus::Asking {
@@ -186,10 +195,11 @@ impl UiState {
     pub fn finish_transfer(
         &mut self,
         direction: TransferDirection,
+        peer_name: &str,
         request_id: u64,
         error: Option<String>,
     ) {
-        if let Some(item) = self.transfers.get_mut(direction, request_id) {
+        if let Some(item) = self.transfers.get_mut(direction, peer_name, request_id) {
             if !item.status.is_active() {
                 return;
             }
@@ -209,14 +219,33 @@ impl UiState {
     }
 
     pub fn finish_shared_download(&mut self, request_id: u64, error: Option<String>) {
-        self.finish_transfer(TransferDirection::Download, request_id, error);
+        let Some(item) = self.transfers.download_mut(request_id) else {
+            return;
+        };
+        if !item.status.is_active() {
+            return;
+        }
+        item.status = match error {
+            Some(why) => SharedDownloadStatus::Failed(why),
+            None => {
+                if let Some(total) = item.bytes_total {
+                    item.bytes_done = item.bytes_done.max(total);
+                }
+                SharedDownloadStatus::Completed
+            }
+        };
     }
 
     /// Marks a transfer stopped from this side. Returns whether there
     /// was a live one to stop, which is what decides whether the peer is
     /// told at all.
-    pub fn cancel_transfer(&mut self, direction: TransferDirection, request_id: u64) -> bool {
-        match self.transfers.get_mut(direction, request_id) {
+    pub fn cancel_transfer(
+        &mut self,
+        direction: TransferDirection,
+        peer_name: &str,
+        request_id: u64,
+    ) -> bool {
+        match self.transfers.get_mut(direction, peer_name, request_id) {
             Some(item) if item.status.is_active() => {
                 item.status = SharedDownloadStatus::Cancelled;
                 true
@@ -226,18 +255,37 @@ impl UiState {
     }
 
     pub fn cancel_shared_download(&mut self, request_id: u64) -> bool {
-        self.cancel_transfer(TransferDirection::Download, request_id)
+        match self.transfers.download_mut(request_id) {
+            Some(item) if item.status.is_active() => {
+                item.status = SharedDownloadStatus::Cancelled;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Drops one finished record. A live one is never removed - it has
     /// to be cancelled first, so nothing is forgotten while it is still
     /// moving.
-    pub fn clear_transfer(&mut self, direction: TransferDirection, request_id: u64) -> bool {
-        self.transfers.clear(direction, request_id)
+    pub fn clear_transfer(
+        &mut self,
+        direction: TransferDirection,
+        peer_name: &str,
+        request_id: u64,
+    ) -> bool {
+        self.transfers.clear(direction, peer_name, request_id)
     }
 
     pub fn clear_shared_download(&mut self, request_id: u64) -> bool {
-        self.clear_transfer(TransferDirection::Download, request_id)
+        let Some(peer_name) = self
+            .transfers
+            .download(request_id)
+            .map(|r| r.peer_name.clone())
+        else {
+            return false;
+        };
+        self.transfers
+            .clear(TransferDirection::Download, &peer_name, request_id)
     }
 
     /// Drops every finished record, leaving whatever is still moving.

@@ -10,7 +10,7 @@
 //!
 //! Deliberately not the message log: a shared transfer is not something
 //! one person said to another, and putting it there would mix a fetch
-//! into the conversation. `Ctrl+Alt+D` renders this whole log
+//! into the conversation. `Ctrl+D` renders this whole log
 //! (`client::tui::transfers_popup`); the per-peer Downloads tab renders
 //! the downloads in it from one peer.
 //!
@@ -132,8 +132,10 @@ fn sanitize(s: &str) -> String {
 /// One transfer, as both the popup and the file see it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransferRecord {
-    /// The request this is - unique per peer and direction, and what a
-    /// cancel names. Taken from the shared-folder request id.
+    /// The request this is. Taken from the shared-folder request id,
+    /// which is the *requester's* own counter - so it identifies a
+    /// record only together with the peer and the direction, since every
+    /// requester's first ask is number one.
     pub request_id: u64,
     pub direction: TransferDirection,
     /// Who the other side is, by nickname - the identity that survives a
@@ -317,28 +319,55 @@ impl TransferLog {
         rows
     }
 
-    pub fn get(&self, direction: TransferDirection, request_id: u64) -> Option<&TransferRecord> {
-        self.records
-            .iter()
-            .find(|r| r.direction == direction && r.request_id == request_id)
+    /// One record, named the only way that is unique: direction, who it
+    /// is with, and their request id. Two people's first download from
+    /// this client are both request 1, so the peer is part of the name.
+    pub fn get(
+        &self,
+        direction: TransferDirection,
+        peer_name: &str,
+        request_id: u64,
+    ) -> Option<&TransferRecord> {
+        self.records.iter().find(|r| {
+            r.direction == direction && r.peer_name == peer_name && r.request_id == request_id
+        })
     }
 
     pub fn get_mut(
         &mut self,
         direction: TransferDirection,
+        peer_name: &str,
         request_id: u64,
     ) -> Option<&mut TransferRecord> {
-        self.records
-            .iter_mut()
-            .find(|r| r.direction == direction && r.request_id == request_id)
+        self.records.iter_mut().find(|r| {
+            r.direction == direction && r.peer_name == peer_name && r.request_id == request_id
+        })
     }
 
-    /// Opens a record, replacing any earlier one with the same direction
-    /// and id (a resumed download reuses neither, but a restarted
-    /// session's counter can).
-    pub fn start(&mut self, record: TransferRecord) {
+    /// The one download under `request_id`, whoever it is from - a
+    /// download's id is *this* side's own counter, so it is unique on its
+    /// own and the paths that only know the id can still find it.
+    pub fn download_mut(&mut self, request_id: u64) -> Option<&mut TransferRecord> {
         self.records
-            .retain(|r| !(r.direction == record.direction && r.request_id == record.request_id));
+            .iter_mut()
+            .find(|r| r.direction == TransferDirection::Download && r.request_id == request_id)
+    }
+
+    pub fn download(&self, request_id: u64) -> Option<&TransferRecord> {
+        self.records
+            .iter()
+            .find(|r| r.direction == TransferDirection::Download && r.request_id == request_id)
+    }
+
+    /// Opens a record, replacing any earlier one naming the same
+    /// transfer - a restarted session's counter can reach an id it has
+    /// used before.
+    pub fn start(&mut self, record: TransferRecord) {
+        self.records.retain(|r| {
+            !(r.direction == record.direction
+                && r.peer_name == record.peer_name
+                && r.request_id == record.request_id)
+        });
         self.records.push(record);
         self.trim();
     }
@@ -363,13 +392,21 @@ impl TransferLog {
 
     /// Removes one finished record. A live one is refused, which is what
     /// the popup's "cancel it first" rule rests on.
-    pub fn clear(&mut self, direction: TransferDirection, request_id: u64) -> bool {
+    pub fn clear(
+        &mut self,
+        direction: TransferDirection,
+        peer_name: &str,
+        request_id: u64,
+    ) -> bool {
         let clearable = self
-            .get(direction, request_id)
+            .get(direction, peer_name, request_id)
             .is_some_and(TransferRecord::is_clearable);
         if clearable {
-            self.records
-                .retain(|r| !(r.direction == direction && r.request_id == request_id));
+            self.records.retain(|r| {
+                !(r.direction == direction
+                    && r.peer_name == peer_name
+                    && r.request_id == request_id)
+            });
         }
         clearable
     }

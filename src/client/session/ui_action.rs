@@ -614,8 +614,11 @@ pub(super) async fn handle_ui_action(
             shared::resume_shared_download(wr, ui_state, session, request_id).await?;
             ui_state.transfers.save_or_warn();
         }
-        UiAction::CancelSharedUpload { request_id } => {
-            shared::cancel_upload(wr, ui_state, session, request_id).await?;
+        UiAction::CancelSharedUpload {
+            peer_name,
+            request_id,
+        } => {
+            shared::cancel_upload(wr, ui_state, session, peer_name, request_id).await?;
             ui_state.transfers.save_or_warn();
         }
         UiAction::SaveTransferHistory => {

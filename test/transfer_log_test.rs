@@ -58,18 +58,18 @@ fn a_history_round_trips_through_save_and_load() {
 
     let loaded = TransferLog::load(path);
     assert_eq!(loaded.records().len(), 3);
-    let down = loaded.get(TransferDirection::Download, 1).expect("the download");
+    let down = loaded.get(TransferDirection::Download, "alice", 1).expect("the download");
     assert_eq!(down.peer_name, "alice");
     assert_eq!(down.status, TransferStatus::Completed);
     assert_eq!(down.label(), "Photos/holiday");
     assert_eq!(down.bytes_total, Some(4_000));
     assert_eq!(
-        loaded.get(TransferDirection::Upload, 3).unwrap().status,
+        loaded.get(TransferDirection::Upload, "carol", 3).unwrap().status,
         TransferStatus::Failed("the link went away".into()),
         "the reason survives with the record"
     );
     // The two directions are separate records even under one id.
-    assert!(loaded.get(TransferDirection::Upload, 1).is_none());
+    assert!(loaded.get(TransferDirection::Upload, "alice", 1).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -88,14 +88,17 @@ fn a_transfer_running_at_shutdown_loads_as_interrupted() {
 
     let loaded = TransferLog::load(path);
     assert_eq!(loaded.active(), 0, "nothing loads as still going");
-    for (direction, id) in [(TransferDirection::Download, 1), (TransferDirection::Upload, 2)] {
-        match &loaded.get(direction, id).unwrap().status {
+    for (direction, peer, id) in [
+        (TransferDirection::Download, "alice", 1),
+        (TransferDirection::Upload, "bob", 2),
+    ] {
+        match &loaded.get(direction, peer, id).unwrap().status {
             TransferStatus::Failed(why) => assert!(why.contains("restart"), "{why}"),
             other => panic!("expected an interrupted record, got {other:?}"),
         }
     }
     assert_eq!(
-        loaded.get(TransferDirection::Download, 3).unwrap().status,
+        loaded.get(TransferDirection::Download, "carol", 3).unwrap().status,
         TransferStatus::Completed,
         "one that had finished is untouched"
     );
@@ -132,11 +135,11 @@ fn only_finished_records_can_be_removed() {
     log.start(record(TransferDirection::Upload, 2, "bob", TransferStatus::Completed));
 
     assert!(
-        !log.clear(TransferDirection::Download, 1),
+        !log.clear(TransferDirection::Download, "alice", 1),
         "a running transfer is not forgotten while it is still moving"
     );
     assert_eq!(log.records().len(), 2);
-    assert!(log.clear(TransferDirection::Upload, 2));
+    assert!(log.clear(TransferDirection::Upload, "bob", 2));
     assert_eq!(log.records().len(), 1);
 
     log.start(record(TransferDirection::Upload, 3, "bob", TransferStatus::Cancelled));
@@ -162,7 +165,7 @@ fn the_history_is_capped_and_keeps_the_live_ones() {
     }
     assert_eq!(log.records().len(), MAX_RECORDS);
     assert!(
-        log.get(TransferDirection::Download, 0).is_some(),
+        log.get(TransferDirection::Download, "alice", 0).is_some(),
         "the live one survives however much history piles up after it"
     );
 }
@@ -187,10 +190,10 @@ fn a_short_or_damaged_line_loads_for_what_it_carries() {
     let log = TransferLog::load(path);
     let ids: Vec<u64> = log.records().iter().map(|r| r.request_id).collect();
     assert_eq!(ids, vec![7, 11], "the unreadable ones are skipped, the rest load");
-    let short = log.get(TransferDirection::Download, 7).unwrap();
+    let short = log.get(TransferDirection::Download, "alice", 7).unwrap();
     assert_eq!(short.share, "Photos");
     assert_eq!(short.files_done, 0, "a missing column reads as nothing");
-    let full = log.get(TransferDirection::Upload, 11).unwrap();
+    let full = log.get(TransferDirection::Upload, "bob", 11).unwrap();
     assert_eq!(full.bytes_done, 20);
     assert_eq!(full.started_unix, 555);
     std::fs::remove_dir_all(&dir).ok();
@@ -215,4 +218,28 @@ fn a_field_carrying_a_tab_cannot_break_the_line() {
     assert_eq!(loaded.records().len(), 1);
     assert_eq!(loaded.records()[0].share, "Photos");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A request id is the requester's own counter, so two people's first
+/// ask is number one for both - the record has to be named by peer as
+/// well, or one silently replaces the other and a cancel acts on the
+/// wrong transfer.
+/// @requirement AC-466
+#[test]
+fn two_peers_first_requests_do_not_collide() {
+    let mut log = TransferLog::new_empty(PathBuf::from("unused"));
+    log.start(record(TransferDirection::Upload, 1, "alice", TransferStatus::Running));
+    log.start(record(TransferDirection::Upload, 1, "bob", TransferStatus::Running));
+
+    assert_eq!(log.records().len(), 2, "both are kept");
+    assert_eq!(log.active(), 2);
+    assert!(log.get(TransferDirection::Upload, "alice", 1).is_some());
+    assert!(log.get(TransferDirection::Upload, "bob", 1).is_some());
+
+    // And clearing one leaves the other alone.
+    log.get_mut(TransferDirection::Upload, "alice", 1).unwrap().status =
+        TransferStatus::Completed;
+    assert!(log.clear(TransferDirection::Upload, "alice", 1));
+    assert_eq!(log.records().len(), 1);
+    assert_eq!(log.records()[0].peer_name, "bob");
 }

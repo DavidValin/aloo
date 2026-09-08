@@ -55,6 +55,22 @@ impl UiState {
             };
         }
 
+        // The configured transfers shortcut (`ctrl+d` unless the settings
+        // file says otherwise) toggles the global transfers popup from
+        // anywhere. Checked before every popup below, because some of
+        // them read a bare letter without looking at the modifiers (the
+        // preview's own `d` saves the file) and would otherwise swallow
+        // it. Gated on `Press`: a kitty terminal delivers the matching
+        // `Release` too, and toggling on both would open and instantly
+        // close it.
+        if kind == KeyEventKind::Press && self.matches_transfers_shortcut(code, modifiers) {
+            match self.transfers_popup {
+                Some(_) => self.close_transfers_popup(),
+                None => self.open_transfers_popup(),
+            }
+            return None;
+        }
+
         // An outstanding identity review takes priority over *everything*
         // else, including Ctrl+H - a peer's identity needs an explicit
         // decision before anything else happens, and unlike the help
@@ -449,18 +465,6 @@ impl UiState {
         // on both would open and instantly close it. Both kinds return
         // `None` so the `Release` is absorbed rather than falling through
         // to a bare 'h'.
-        // The configured transfers shortcut (`ctrl+alt+d` unless the
-        // settings file says otherwise) toggles the global transfers
-        // popup from anywhere, the same tier as Ctrl+H and gated on
-        // `Press` for the same reason. Checked before the overlay below,
-        // so it works with the help open too.
-        if kind == KeyEventKind::Press && self.matches_transfers_shortcut(code, modifiers) {
-            match self.transfers_popup {
-                Some(_) => self.close_transfers_popup(),
-                None => self.open_transfers_popup(),
-            }
-            return None;
-        }
         if modifiers.contains(KeyModifiers::CONTROL)
             && matches!(code, KeyCode::Char('h') | KeyCode::Char('H'))
         {

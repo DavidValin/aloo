@@ -59,6 +59,8 @@ fn chord(state: &mut UiState, code: KeyCode, modifiers: KeyModifiers) -> Option<
     state.handle_key(code, modifiers, KeyEventKind::Press)
 }
 
+/// The default chord, `ctrl+d`.
+const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 const CTRL_ALT: KeyModifiers = KeyModifiers::from_bits_truncate(
     KeyModifiers::CONTROL.bits() | KeyModifiers::ALT.bits(),
 );
@@ -69,17 +71,17 @@ fn the_default_shortcut_opens_and_closes_the_popup_from_anywhere() {
     let mut state = state_with_transfers();
     assert!(state.transfers_popup.is_none());
 
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
-    assert!(state.transfers_popup.is_some(), "ctrl+alt+d opens it");
+    chord(&mut state, KeyCode::Char('d'), CTRL);
+    assert!(state.transfers_popup.is_some(), "ctrl+d opens it");
     assert_eq!(state.mode, Mode::Transfers);
 
     // Pressing it again closes it, like Ctrl+H does for help.
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     assert!(state.transfers_popup.is_none());
     assert_eq!(state.mode, Mode::Normal);
 
     // And Esc closes it too.
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     press(&mut state, KeyCode::Esc);
     assert!(state.transfers_popup.is_none());
 }
@@ -92,7 +94,7 @@ fn the_shortcut_is_whatever_the_settings_say() {
     let mut state = state_with_transfers();
     state.transfers_shortcut = KeyChord::parse("alt+t").expect("parses");
 
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     assert!(state.transfers_popup.is_none(), "the old default no longer opens it");
 
     chord(&mut state, KeyCode::Char('t'), KeyModifiers::ALT);
@@ -118,7 +120,7 @@ fn closing_the_popup_gives_back_the_view_it_was_opened_over() {
     press(&mut state, KeyCode::Enter);
     assert_eq!(state.mode, Mode::SharedFiles, "the browser is up");
 
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     assert_eq!(state.mode, Mode::Transfers);
     press(&mut state, KeyCode::Esc);
     assert_eq!(state.mode, Mode::SharedFiles, "the browser is back");
@@ -130,8 +132,8 @@ fn closing_the_popup_gives_back_the_view_it_was_opened_over() {
 #[test]
 fn a_chord_needs_exactly_its_own_modifiers() {
     let mut state = state_with_transfers();
-    chord(&mut state, KeyCode::Char('d'), KeyModifiers::CONTROL);
-    assert!(state.transfers_popup.is_none(), "ctrl alone is not ctrl+alt");
+    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    assert!(state.transfers_popup.is_none(), "ctrl+alt is not ctrl");
     chord(&mut state, KeyCode::Char('d'), KeyModifiers::ALT);
     assert!(state.transfers_popup.is_none(), "nor is alt alone");
     chord(&mut state, KeyCode::Char('d'), KeyModifiers::NONE);
@@ -142,7 +144,7 @@ fn a_chord_needs_exactly_its_own_modifiers() {
 #[test]
 fn the_popup_lists_both_directions_with_who_and_which_way() {
     let mut state = state_with_transfers();
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     let rows = rendered_rows_at(&state, 110, 44);
     let joined = rows.join("\n");
 
@@ -159,7 +161,7 @@ fn the_popup_lists_both_directions_with_who_and_which_way() {
 #[test]
 fn tab_filters_the_list_by_direction() {
     let mut state = state_with_transfers();
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     assert_eq!(state.transfers_popup_rows().len(), 2);
 
     press(&mut state, KeyCode::Tab);
@@ -189,12 +191,18 @@ fn c_cancels_a_download_or_an_upload_depending_on_the_row() {
         TransferStatus::Running,
         300,
     ));
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
 
     // Rows are live-first, most recent first: the upload to carol, then
     // the download from alice, then the finished upload to bob.
     let action = press(&mut state, KeyCode::Char('c'));
-    assert_eq!(action, Some(UiAction::CancelSharedUpload { request_id: 3 }));
+    assert_eq!(
+        action,
+        Some(UiAction::CancelSharedUpload {
+            peer_name: "carol".into(),
+            request_id: 3,
+        })
+    );
 
     press(&mut state, KeyCode::Down);
     let action = press(&mut state, KeyCode::Char('c'));
@@ -216,7 +224,7 @@ fn r_resumes_only_a_stopped_download() {
         TransferStatus::Cancelled,
         400,
     ));
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
 
     // The running download is first; resume does not apply to it.
     assert!(press(&mut state, KeyCode::Char('r')).is_none());
@@ -234,7 +242,7 @@ fn r_resumes_only_a_stopped_download() {
 #[test]
 fn x_removes_a_finished_row_and_capital_x_clears_them_all() {
     let mut state = state_with_transfers();
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
 
     // On the running download: refused.
     assert!(press(&mut state, KeyCode::Char('x')).is_none());
@@ -260,11 +268,66 @@ fn x_removes_a_finished_row_and_capital_x_clears_them_all() {
     assert!(state.transfers.records()[0].status.is_active());
 }
 
+/// The two directions read as tabs across the top, each naming what is
+/// running under it - not a hint buried in the title.
+/// @requirement AC-467
+#[test]
+fn the_directions_are_tabs_across_the_top() {
+    let mut state = state_with_transfers();
+    chord(&mut state, KeyCode::Char('d'), CTRL);
+    let rows = rendered_rows_at(&state, 130, 44);
+    let strip = rows
+        .iter()
+        .find(|r| r.contains("Downloads") && r.contains("Uploads") && r.contains("All"))
+        .unwrap_or_else(|| panic!("no tab strip in {rows:?}"));
+    assert!(strip.contains("(1)"), "the live count sits on its tab: {strip}");
+    // And the tabs come before any transfer row.
+    let strip_at = rows.iter().position(|r| r.contains("Uploads")).unwrap();
+    let first_row = rows.iter().position(|r| r.contains("from alice")).unwrap();
+    assert!(strip_at < first_row, "the tabs are on top: {rows:?}");
+}
+
+/// A long path is shown by its end, which is the part that says which
+/// file this is - the beginning repeats down the whole list.
+/// @requirement AC-467
+#[test]
+fn a_long_path_keeps_its_tail() {
+    use aloo::client::tui::widgets::text::elide_start;
+    assert_eq!(elide_start("short", 20), "short");
+    assert_eq!(elide_start("Photos/holiday/norway/boat.jpg", 14), "\u{2026}rway/boat.jpg");
+    assert_eq!(
+        elide_start("Photos/holiday/norway/boat.jpg", 30),
+        "Photos/holiday/norway/boat.jpg"
+    );
+
+    let mut state = joined_general_with(vec![]);
+    let mut deep = record(
+        TransferDirection::Download,
+        1,
+        "alice",
+        TransferStatus::Running,
+        100,
+    );
+    deep.share = "Photos".into();
+    deep.rel_path = "holiday/2019/norway/day-three/afternoon/boat.jpg".into();
+    state.transfers.start(deep);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
+    let rows = rendered_rows_at(&state, 90, 44);
+    let row = rows
+        .iter()
+        .find(|r| r.contains("boat.jpg"))
+        .unwrap_or_else(|| panic!("the file's own name must survive: {rows:?}"));
+    assert!(
+        row.contains('\u{2026}'),
+        "and what was dropped is marked at the front: {row}"
+    );
+}
+
 /// @requirement AC-467
 #[test]
 fn an_empty_history_says_so() {
     let mut state = joined_general_with(vec![]);
-    chord(&mut state, KeyCode::Char('d'), CTRL_ALT);
+    chord(&mut state, KeyCode::Char('d'), CTRL);
     let rows = rendered_rows_at(&state, 110, 44);
     assert!(
         rows.iter().any(|r| r.contains("no file-share transfers yet")),
@@ -277,6 +340,7 @@ fn an_empty_history_says_so() {
 #[test]
 fn a_shortcut_is_parsed_and_written_back_the_same_way() {
     for (text, expected) in [
+        ("ctrl+d", "ctrl+d"),
         ("ctrl+alt+d", "ctrl+alt+d"),
         ("CTRL+ALT+D", "ctrl+alt+d"),
         ("control+option+d", "ctrl+alt+d"),
@@ -292,8 +356,10 @@ fn a_shortcut_is_parsed_and_written_back_the_same_way() {
             "{text} should round-trip"
         );
     }
-    for bad in ["", "ctrl", "ctrl+", "ctrl+alt", "ctrl+ab", "ctrl+f99", "d+t"] {
+    for bad in ["", "ctrl", "ctrl+", "ctrl+alt", "ctrl+ab", "ctrl+f99", "d+t", "d", "x"] {
         assert!(KeyChord::parse(bad).is_none(), "{bad:?} should be refused");
     }
-    assert_eq!(KeyChord::default().to_setting_value(), "ctrl+alt+d");
+    // A bare letter would swallow typing; a bare function key would not.
+    assert!(KeyChord::parse("f5").is_some());
+    assert_eq!(KeyChord::default().to_setting_value(), "ctrl+d");
 }

@@ -1364,7 +1364,7 @@ pub struct UiState {
     /// printed in their DM already - once per room, and again only after
     /// a later announce (`set_peer_shares`).
     pub(crate) share_notice_shown: HashSet<UserId>,
-    /// The global transfers popup (`Ctrl+Alt+D`) - see
+    /// The global transfers popup (`Ctrl+D`) - see
     /// `super::transfers_popup`. An overlay over whatever is on screen,
     /// like the user-info popup.
     pub transfers_popup: Option<super::transfers_popup::TransfersPopupState>,
@@ -1375,7 +1375,7 @@ pub struct UiState {
     /// Every shared-folder transfer this client has taken part in, both
     /// directions, durable across restarts
     /// (`client::transfer_log::TransferLog`) - the browser's Downloads
-    /// tab renders one peer's downloads out of it, and `Ctrl+Alt+D` the
+    /// tab renders one peer's downloads out of it, and `Ctrl+D` the
     /// whole thing. Deliberately not the message log: a transfer is
     /// something one side fetched, not something either side said (§7.8).
     pub transfers: crate::client::transfer_log::TransferLog,

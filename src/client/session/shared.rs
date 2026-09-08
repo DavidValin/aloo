@@ -109,6 +109,14 @@ pub struct PendingSharedRequest {
     pub share: String,
     pub rel_path: String,
     pub kind: SharedRequestKind,
+    /// Given up on from this side, but kept rather than forgotten: the
+    /// owner may already have several files in flight when the cancel
+    /// reaches it, and their tags and offers are still on their way.
+    /// Dropping the request outright made those offers look unasked-for,
+    /// and the ordinary Accept popup went up for each of them. They are
+    /// refused instead (`drain_auto_accepts`), and the record goes when
+    /// the owner's `SharedDownloadDone` closes it.
+    pub cancelled: bool,
 }
 
 /// An offer this side is expecting, from the `SharedFileTag` that
@@ -386,7 +394,7 @@ pub async fn on_shared_event(
             // The sender's own record of this transfer, so it shows in
             // the global transfers popup and can be cancelled from there
             // (§7.8) - one per request, per requester.
-            let peer_name = ui_state
+            let peer_name_for_record = ui_state
                 .known_users
                 .get(&peer)
                 .map(|u| u.name.clone())
@@ -394,15 +402,17 @@ pub async fn on_shared_event(
             ui_state.start_transfer(
                 crate::client::transfer_log::TransferDirection::Upload,
                 request_id,
-                peer_name,
+                peer_name_for_record.clone(),
                 share.clone(),
                 rel_path,
             );
+            let total_bytes: u64 = files.iter().map(|f| f.size).sum();
             ui_state.set_transfer_plan(
                 crate::client::transfer_log::TransferDirection::Upload,
+                &peer_name_for_record,
                 request_id,
                 files.len() as u32,
-                files.iter().map(|f| f.size).sum(),
+                total_bytes,
             );
             ui_state.transfers.save_or_warn();
             // What this actually covers, before a byte of it moves, so
@@ -616,8 +626,13 @@ fn finish_job_file(
     sent: Option<u64>,
 ) {
     use crate::client::transfer_log::TransferDirection::Upload;
+    let peer_name = ui_state
+        .known_users
+        .get(&peer)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
     if let Some(size) = sent {
-        ui_state.on_upload_file_done(request_id, size);
+        ui_state.on_upload_file_done(&peer_name, request_id, size);
     }
     let Some(job) = session.shared_jobs.get_mut(&(peer, request_id)) else {
         return;
@@ -630,6 +645,7 @@ fn finish_job_file(
             .expect("just found");
         ui_state.finish_transfer(
             Upload,
+            &peer_name,
             request_id,
             job.error.map(|e| e.describe().to_string()),
         );
@@ -912,6 +928,7 @@ pub async fn request_shared_listing(
             share: share.clone(),
             rel_path: rel_path.clone(),
             kind: SharedRequestKind::List,
+            cancelled: false,
         },
     );
     session.peer_link.ensure_link(wr, peer).await;
@@ -949,6 +966,7 @@ pub async fn request_shared_download(
             share: share.clone(),
             rel_path: rel_path.clone(),
             kind: SharedRequestKind::Download,
+            cancelled: false,
         },
     );
     session.peer_link.ensure_link(wr, peer).await;
@@ -1010,14 +1028,23 @@ pub async fn cancel_shared_download(
         return Ok(());
     }
     abandon_receiving(session, request_id);
-    let pending = session.shared_requests.remove(&request_id);
-    if let Some(pending) = pending {
+    // Marked, not dropped: files the owner already had in flight are
+    // still coming, and their offers have to be refused rather than put
+    // to the user as if nobody had asked for them.
+    let peer = match session.shared_requests.get_mut(&request_id) {
+        Some(pending) => {
+            pending.cancelled = true;
+            Some(pending.peer)
+        }
+        None => None,
+    };
+    if let Some(peer) = peer {
         let cancel = SharedDownloadCancel { request_id };
-        session.peer_link.ensure_link(wr, pending.peer).await;
+        session.peer_link.ensure_link(wr, peer).await;
         send_sealed(
             session,
             ui_state,
-            pending.peer,
+            peer,
             Content::SharedDownloadCancel,
             &cancel,
             |envelope| P2pPayload::SharedDownloadCancel { envelope },
@@ -1034,17 +1061,17 @@ pub async fn cancel_upload(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
+    peer_name: String,
     request_id: u64,
 ) -> proto::Result<()> {
     use crate::client::transfer_log::TransferDirection::Upload;
-    let Some(record) = ui_state.transfers.get(Upload, request_id) else {
+    let Some(record) = ui_state.transfers.get(Upload, &peer_name, request_id) else {
         return Ok(());
     };
     if !record.status.is_active() {
         return Ok(());
     }
-    let peer_name = record.peer_name.clone();
-    ui_state.cancel_transfer(Upload, request_id);
+    ui_state.cancel_transfer(Upload, &peer_name, request_id);
     let Some(peer) = peer_by_name(ui_state, &peer_name) else {
         // Gone already: nothing to tell, and nothing left queued for a
         // link that is down (`on_peer_link_lost`).
@@ -1163,6 +1190,19 @@ pub async fn drain_auto_accepts(
         else {
             continue;
         };
+        // Asked for once, given up on since: refused rather than shown,
+        // and nothing of it is written.
+        if session
+            .shared_requests
+            .get(&request_id)
+            .is_some_and(|r| r.cancelled)
+        {
+            ui_state.take_file_offer(from, stream_id);
+            session
+                .peer_link
+                .send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
+            continue;
+        }
         if already_have(&dest, offer.size) {
             ui_state.take_file_offer(from, stream_id);
             session

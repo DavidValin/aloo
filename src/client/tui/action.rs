@@ -366,10 +366,15 @@ pub enum UiAction {
     /// `c` on a running *upload* in the transfers popup - the owner
     /// stops offering the rest of it and tells the requester, who would
     /// otherwise wait for files that are not coming (§7.8).
-    CancelSharedUpload { request_id: u64 },
+    CancelSharedUpload {
+        /// A request id is the *requester's* own counter, so it names a
+        /// transfer only together with who it is with.
+        peer_name: String,
+        request_id: u64,
+    },
     /// The transfer history changed in a way worth keeping (a row
     /// removed, everything finished cleared) - written back to disk, so
-    /// `Ctrl+Alt+D` shows the same list after a restart.
+    /// `Ctrl+D` shows the same list after a restart.
     SaveTransferHistory,
     /// `r` on the contacts modal - re-runs the same gather, e.g. after the
     /// remaining OTP key has moved since it was last opened.

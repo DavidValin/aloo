@@ -569,7 +569,7 @@ fn the_help_overlay_documents_shared_folders() {
         "download the selected",
         "your Downloads",
         "cancel a running download",
-        "Ctrl+Alt+D",
+        "Ctrl+D",
         "both directions and every person",
         "transfers_shortcut",
     ] {

@@ -288,7 +288,7 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                down arrow with the current speed.",
     },
     HelpLine::Item {
-        keys: "Ctrl+Alt+D",
+        keys: "Ctrl+D",
         text: "the transfers popup: every file-share transfer, both directions and every \
                person - what you are pulling from others and what others are pulling from \
                your shared folders. Tab narrows it to downloads or uploads. The history \
@@ -302,7 +302,7 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                finished ones, each with a progress bar. Cancelling keeps every file that \
                already arrived and drops only what was half-written; resuming moves only \
                what is still missing. None of this is written into the conversation - only \
-               a /file send is. The same four keys work in the Ctrl+Alt+D popup, where \
+               a /file send is. The same four keys work in the Ctrl+D popup, where \
                'c' also stops an upload someone is pulling from you.",
     },
     HelpLine::Blank,

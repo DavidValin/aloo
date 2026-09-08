@@ -516,10 +516,10 @@ impl DirectPunchTarget {
 
 /// The default for `transfers_shortcut` - the key that opens the global
 /// transfers popup (`client::tui::transfers_popup`).
-pub const DEFAULT_TRANSFERS_SHORTCUT: &str = "ctrl+alt+d";
+pub const DEFAULT_TRANSFERS_SHORTCUT: &str = "ctrl+d";
 
 /// One in-app key combination, as a settings line spells it:
-/// `ctrl+alt+d`, `alt+t`, `f5`. Distinct from `global_ptt_shortcut`,
+/// `ctrl+d`, `alt+t`, `f5`. Distinct from `global_ptt_shortcut`,
 /// which names an *OS-level* hotkey the window manager grabs - this one
 /// is an ordinary key this app matches while it has focus, so it is
 /// parsed here rather than handed to `global-hotkey`.
@@ -548,10 +548,15 @@ impl Default for KeyChord {
 }
 
 impl KeyChord {
-    /// Parses `ctrl+alt+d`-style text, in any order and any case, with
+    /// Parses `ctrl+d`-style text, in any order and any case, with
     /// `control` and `option` accepted as the names some keyboards use.
     /// `None` for anything that names no key, an unknown modifier, or
     /// more than one key.
+    ///
+    /// A plain character with no modifier at all is refused too: this
+    /// app has a compose bar, so a bare letter as an app-wide shortcut
+    /// would swallow the letter rather than open anything. A function
+    /// key needs no modifier, having nothing to collide with.
     pub fn parse(value: &str) -> Option<Self> {
         let mut chord = Self {
             ctrl: false,
@@ -586,6 +591,9 @@ impl KeyChord {
             }
         }
         chord.key = key?;
+        if matches!(chord.key, KeyChordKey::Char(_)) && !(chord.ctrl || chord.alt || chord.shift) {
+            return None;
+        }
         Some(chord)
     }
 
@@ -1050,7 +1058,7 @@ pub struct Settings {
     pub file_sharing_max_pct: u8,
     /// The key that opens the global transfers popup
     /// (`client::tui::transfers_popup`, `docs/PROTOCOL.md` §7.8) -
-    /// `ctrl+alt+d` unless the file says otherwise. An in-app key, not an
+    /// `ctrl+d` unless the file says otherwise. An in-app key, not an
     /// OS-level one, so unlike `global_ptt_shortcut` it needs nothing
     /// registering and takes effect the moment it is changed.
     pub transfers_shortcut: KeyChord,

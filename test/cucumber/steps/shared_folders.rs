@@ -694,7 +694,7 @@ async fn popup_says_running(w: &mut AlooWorld, count: usize) {
 #[then("cancelling that upload is requested")]
 async fn cancel_upload_requested(w: &mut AlooWorld) {
     match w.last_action.clone() {
-        Some(UiAction::CancelSharedUpload { request_id }) => assert_eq!(request_id, 2),
+        Some(UiAction::CancelSharedUpload { request_id, .. }) => assert_eq!(request_id, 2),
         other => panic!("expected an upload cancel, got {other:?}"),
     }
 }

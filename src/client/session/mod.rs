@@ -1066,7 +1066,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     ui_state.daemon_mode = is_daemon;
     ui_state.set_keyboard_release_reporting(keyboard_release_reporting);
     ui_state.set_muted_voice(settings.muted_voice.clone());
-    // The shared-transfer history, so `Ctrl+Alt+D` shows what happened
+    // The shared-transfer history, so `Ctrl+D` shows what happened
     // before this session as well as during it (§7.8). Anything that was
     // still running when the last one ended loads as interrupted.
     ui_state.transfers = crate::client::transfer_log::TransferLog::load(

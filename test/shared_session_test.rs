@@ -1221,6 +1221,93 @@ async fn an_injected_path_lists_nothing_and_downloads_nothing() {
     w.cleanup();
 }
 
+/// Cancelling does not stop what the owner already had in flight, so
+/// tags and offers for the abandoned request keep arriving. They must be
+/// refused, not put to the user as if nobody had asked for them - which
+/// is what a cancel-then-resume looked like: an Accept popup for a file
+/// the requester had asked for and then given up on.
+/// @requirement AC-455, AC-464
+#[tokio::test]
+async fn offers_still_arriving_after_a_cancel_are_refused_not_offered() {
+    let mut w = world("cancel-late-offer").await;
+    w.open_link(ALICE).await;
+    shared::request_shared_download(
+        &mut NullSink,
+        &mut w.ui,
+        &mut w.session,
+        ALICE,
+        "Photos".into(),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    let request_id = shared_payloads::<SharedDownloadRequest>(
+        &mut w,
+        ALICE,
+        true,
+        Content::SharedDownloadRequest,
+    )[0]
+    .request_id;
+
+    shared::cancel_shared_download(&mut NullSink, &mut w.ui, &mut w.session, request_id)
+        .await
+        .unwrap();
+
+    // A tag the owner sent before the cancel reached it, then its offer.
+    let stream_id = 88;
+    let tag = SharedFileTag {
+        request_id,
+        stream_id,
+        rel_path: "late.jpg".into(),
+    };
+    let envelope = w.sealed_from(
+        &w.alice,
+        41,
+        Content::SharedFileTag,
+        &proto::encode(&tag).unwrap(),
+    );
+    shared::on_shared_folder_message(&mut w.ui, &mut w.session, ALICE, envelope)
+        .await
+        .unwrap();
+    let offer = aloo::client::file_transfer::FileOfferPayload {
+        filename: "late.jpg".into(),
+        size: 10,
+    };
+    let envelope = w.sealed_from(
+        &w.alice,
+        42,
+        Content::FileOffer,
+        &proto::encode(&offer).unwrap(),
+    );
+    w.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::FileOffer {
+            channel: None,
+            from: ALICE,
+            stream_id,
+            msg_id: Some(1),
+            envelope,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut w.ui, &mut w.session)
+        .await
+        .unwrap();
+
+    assert!(
+        w.ui.file_offer_open().is_none(),
+        "a file from a download this side gave up on is never put to the user"
+    );
+    let refused = w
+        .queued(ALICE)
+        .into_iter()
+        .any(|p| matches!(p, P2pPayload::FileReject { stream_id: s } if s == stream_id));
+    assert!(refused, "it is refused instead");
+    let accepted = w
+        .queued(ALICE)
+        .into_iter()
+        .any(|p| matches!(p, P2pPayload::FileAccept { .. }));
+    assert!(!accepted, "and certainly not accepted");
+    w.cleanup();
+}
+
 /// @requirement TB-302
 #[tokio::test]
 async fn a_lost_link_drops_what_was_queued_for_that_peer() {

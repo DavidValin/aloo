@@ -399,7 +399,7 @@ others only by its last name (`Photos`), never by where it lives.
 | `/info` (in the DM), then `Enter` | **Browse shared files** — the button is only there for someone who shares something with you |
 | `Enter` / `Backspace` | Open a folder / go up (`Esc` closes) |
 | `d` | Download the selected file, or a whole folder with its structure |
-| `Ctrl+Alt+D` | **All** transfers, both directions, everyone — see below |
+| `Ctrl+D` | **All** transfers, both directions, everyone — see below |
 | `Tab` | Switch between their folders and your **Downloads** |
 | `c` / `r` / `x` / `X` | On Downloads: cancel, resume, remove a finished row, clear all finished |
 
@@ -418,10 +418,10 @@ the missing files move. A file being written is a `.part` until it's
 whole, so nothing half-arrived looks finished. While anything is
 downloading the header shows a blinking `↓` and the speed.
 
-**`Ctrl+Alt+D`** opens the transfers popup: everything you've pulled from
+**`Ctrl+D`** opens the transfers popup: everything you've pulled from
 anyone, alongside everything anyone has pulled from your shared folders,
-each row marked `↓` or `↑` with who it was with. `Tab` narrows it to one
-direction. `c` stops the selected one — on a download that tells them to
+each row marked `↓` or `↑` with who it was with. Tabs across the top switch between all, downloads and uploads, and long
+paths are shown by their end so the filename is always visible. `c` stops the selected one — on a download that tells them to
 stop sending, on an upload it tells them to stop waiting — `r` resumes a
 stopped download, `x` drops a finished row and `X` clears all of them. A
 running transfer has to be cancelled before it can be removed. **The list

@@ -24,6 +24,7 @@ use crate::proto::UserId;
 use super::shared_downloads::SharedDownloadStatus;
 use super::ui::{Mode, UiAction, UiState, centered_rect};
 use super::widgets::progress_bar::{DEFAULT_BAR_CELLS, percent_of, progress_line};
+use super::widgets::text::elide_start;
 
 /// Which half of the popup is showing. Downloads are a tab rather than a
 /// popup of their own because they are the other half of one activity:
@@ -513,9 +514,12 @@ fn render_downloads_tab(frame: &mut Frame, inner: Rect, state: &UiState, selecte
         } else {
             String::new()
         };
+        // The tail of the path, not the head - see `text::elide_start`.
+        let path_width = (body.width as usize).saturating_sub(44).max(12);
         lines.push(Line::from(vec![
+            Span::raw(marker.to_string()),
             Span::styled(
-                format!("{marker}{} ", item.label()),
+                format!("{} ", elide_start(&item.label(), path_width)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("from {}", item.peer_name), Style::default().fg(Color::Gray)),
