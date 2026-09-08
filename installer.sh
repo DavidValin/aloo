@@ -8,8 +8,8 @@
 #   ./installer.sh [options]
 #
 # Options:
-#   --aloo-version <tag>   Version/tag of aloo to install (default: 0.3.0-alpha.8)
-#   --otp-version <tag>    Version/tag of otp-toolkit to install (default: 1.7.1)
+#   --aloo-version <tag>   Version/tag of aloo to install (default: latest)
+#   --otp-version <tag>    Version/tag of otp-toolkit to install (default: latest)
 #   --install-dir <dir>    Where to install the binaries (default: /usr/local/bin,
 #                           or $HOME/.local/bin if that is not writable/available)
 #   --from-source           Compile both from source instead of asking
@@ -42,9 +42,14 @@ set -eo pipefail
 ALOO_REPO="DavidValin/aloo"
 OTP_REPO="DavidValin/otp-toolkit"
 
-# Keep ALOO_VERSION in sync with the `version` field in this repo's Cargo.toml.
-ALOO_VERSION="${ALOO_VERSION:-0.3.0-alpha.8}"
-OTP_VERSION="${OTP_VERSION:-1.7.1}"
+# Both default to "latest": the newest published release of each repo is
+# resolved at run time. The pinned fallbacks below are only used when the
+# GitHub API cannot be reached; keep ALOO_FALLBACK_VERSION in sync with the
+# `version` field in this repo's Cargo.toml.
+ALOO_VERSION="${ALOO_VERSION:-latest}"
+OTP_VERSION="${OTP_VERSION:-latest}"
+ALOO_FALLBACK_VERSION="0.5.0-beta.2"
+OTP_FALLBACK_VERSION="1.7.1"
 INSTALL_DIR="${INSTALL_DIR:-}"
 INSTALL_MODE="${INSTALL_MODE:-}"
 ASSUME_YES="${ASSUME_YES:-0}"
@@ -99,7 +104,7 @@ confirm() {
 cleanup() {
   local d
   for d in "${NEED_CLEANUP[@]-}"; do
-    [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
+    { [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"; } || true
   done
 }
 trap cleanup EXIT
@@ -241,6 +246,53 @@ fetch_to() {
   else
     err "Neither curl nor wget is available; cannot download binaries."
   fi
+}
+
+fetch_stdout() {
+  local url="$1"
+  if need_cmd curl; then
+    curl -fsSL "$url"
+  elif need_cmd wget; then
+    wget -qO- "$url"
+  else
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Latest-tag resolution
+#
+# "latest" means the most recently published release of the repo, including
+# pre-releases (aloo ships alpha/beta tags). /releases lists newest first;
+# /releases/latest is the stable-only fallback, and the pinned constants above
+# are the last resort when the API is unreachable (offline, rate-limited).
+# ---------------------------------------------------------------------------
+
+first_tag_name() {
+  grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -n1 \
+    | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/'
+}
+
+resolve_latest_version() {
+  # resolve_latest_version <repo> <fallback> -> prints a tag on stdout
+  local repo="$1" fallback="$2" tag=""
+  local api="https://api.github.com/repos/${repo}"
+
+  info "Resolving latest release of ${repo}..."
+  tag="$(fetch_stdout "${api}/releases?per_page=1" 2>/dev/null | first_tag_name)" || tag=""
+  if [ -z "$tag" ]; then
+    tag="$(fetch_stdout "${api}/releases/latest" 2>/dev/null | first_tag_name)" || tag=""
+  fi
+
+  if [ -z "$tag" ]; then
+    warn "Could not reach the GitHub API; falling back to pinned version ${fallback}."
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  info "Latest ${repo} release: ${tag}"
+  printf '%s\n' "$tag"
 }
 
 list_release_assets_hint() {
@@ -796,6 +848,13 @@ main() {
     INSTALL_MODE="binary"
   fi
   info "Install mode: ${INSTALL_MODE}$([ "$INSTALL_MODE" = "source" ] && echo " (${CC_BIN}, cargo, git)")"
+
+  if [ "$ALOO_VERSION" = "latest" ]; then
+    ALOO_VERSION="$(resolve_latest_version "$ALOO_REPO" "$ALOO_FALLBACK_VERSION")"
+  fi
+  if [ "$OTP_VERSION" = "latest" ]; then
+    OTP_VERSION="$(resolve_latest_version "$OTP_REPO" "$OTP_FALLBACK_VERSION")"
+  fi
 
   backup_aloo_home
 
