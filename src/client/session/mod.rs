@@ -11,6 +11,7 @@
 mod identity;
 mod link_events;
 mod server_events;
+pub mod shared;
 mod ui_action;
 
 // Brought into scope here because the loop below and these four modules
@@ -233,6 +234,48 @@ pub struct SessionState {
     /// (`FileEvent::SendDone`/`SendFailed`) - the *real* file the user
     /// picked is never touched or deleted.
     pub(crate) otp_send_temp_files: HashMap<u64, std::path::PathBuf>,
+    // -----------------------------------------------------------------
+    // Shared folders (`docs/PROTOCOL.md` §7.8, `session::shared`)
+    // -----------------------------------------------------------------
+    /// What this side shares, from `~/.aloo/settings` (`share=` lines),
+    /// replaced live by the settings popup.
+    pub(crate) shares: Vec<crate::settings::SharedFolder>,
+    /// The one upload budget every shared send debits.
+    pub(crate) share_pacer: std::sync::Arc<crate::client::shared_folders::SharePacer>,
+    /// Owner side: files waiting to be offered, per requester.
+    pub(crate) shared_send_queue:
+        HashMap<UserId, std::collections::VecDeque<shared::QueuedSharedFile>>,
+    /// Owner side: every file currently offered and not yet finished,
+    /// keyed by `(requester, stream_id)` - several at a time per peer
+    /// (`shared::MAX_PARALLEL_SHARED_SENDS`).
+    pub(crate) shared_sending: HashMap<(UserId, u64), shared::SharedSending>,
+    /// Requester side: what each arriving shared file is being written to
+    /// while it arrives, and where it goes once whole
+    /// (`shared::SharedReceiving`).
+    pub(crate) shared_receiving: HashMap<(UserId, u64), shared::SharedReceiving>,
+    /// Owner side: which requester and request each shared stream serves.
+    pub(crate) shared_request_of_stream: HashMap<u64, (UserId, u64)>,
+    /// Owner side: each download request's progress, keyed by
+    /// `(requester, request_id)`.
+    pub(crate) shared_jobs: HashMap<(UserId, u64), shared::SharedJob>,
+    /// Requester side: what this side has asked and not yet seen answered.
+    pub(crate) shared_requests: HashMap<u64, shared::PendingSharedRequest>,
+    /// Requester side: offers a `SharedFileTag` announced, keyed
+    /// `(owner, stream_id)`, taken by `shared::tag_incoming_offer`.
+    pub(crate) expected_shared_offers: HashMap<(UserId, u64), shared::ExpectedSharedOffer>,
+    pub(crate) next_shared_request_id: u64,
+    /// Where the owner-side filesystem work reports back
+    /// (`shared::serve_listing`/`serve_download`), drained by the select
+    /// loop into `shared::on_shared_event`.
+    pub(crate) shared_events_tx: tokio::sync::mpsc::UnboundedSender<shared::SharedEvent>,
+    /// `for_test` keeps the receiving end so `shared::await_shared_event`
+    /// can apply results; the real loop owns its own.
+    pub(crate) test_shared_events:
+        Option<tokio::sync::mpsc::UnboundedReceiver<shared::SharedEvent>>,
+    /// Where a shared download lands (`shared_folders::download_dest`):
+    /// `file_transfer::default_download_dir()`, or a scratch directory
+    /// under test.
+    pub(crate) shared_download_dir: std::path::PathBuf,
     /// Where a file-transfer worker thread (`file_transfer::spawn_send_file_worker`/
     /// `spawn_receive_file_worker`) reports progress/completion/failure,
     /// polled by `run_connected_session`'s select loop (`handle_file_event`).
@@ -602,6 +645,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
     let (file_events_tx, mut file_events_rx) =
         tokio::sync::mpsc::unbounded_channel::<file_transfer::FileEvent>();
+    let (shared_events_tx, mut shared_events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<shared::SharedEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // `~/.aloo/settings`, for the serverless direct-punch configuration
@@ -619,6 +664,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         });
     for (line, reason) in &settings.direct_punch_invalid {
         crate::log_warn!("ignoring direct_punch_to={line}: {reason}");
+    }
+    for (line, reason) in &settings.shares_invalid {
+        crate::log_warn!("ignoring share={line}: {reason}");
     }
     // The No-IP updater (`client::noip`, docs/PROTOCOL.md §7.1.5) only
     // ever matters while direct punch has somewhere to send it - resolved
@@ -767,6 +815,24 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         staged_text_receives: HashMap::new(),
         viewed_previews: std::collections::HashSet::new(),
         otp_send_temp_files: HashMap::new(),
+        shares: settings.shares.clone(),
+        share_pacer: std::sync::Arc::new(crate::client::shared_folders::SharePacer::new(
+            crate::client::shared_folders::rate_from_settings(
+                settings.file_sharing_link_speed_kbps,
+                settings.file_sharing_max_pct,
+            ),
+        )),
+        shared_send_queue: HashMap::new(),
+        shared_sending: HashMap::new(),
+        shared_receiving: HashMap::new(),
+        shared_request_of_stream: HashMap::new(),
+        shared_jobs: HashMap::new(),
+        shared_requests: HashMap::new(),
+        expected_shared_offers: HashMap::new(),
+        next_shared_request_id: 1,
+        shared_events_tx,
+        test_shared_events: None,
+        shared_download_dir: file_transfer::default_download_dir(),
         file_events_tx,
         record_out_tx,
         own_stream_done_tx,
@@ -1000,6 +1066,17 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     ui_state.daemon_mode = is_daemon;
     ui_state.set_keyboard_release_reporting(keyboard_release_reporting);
     ui_state.set_muted_voice(settings.muted_voice.clone());
+    // The shared-transfer history, so `Ctrl+Alt+D` shows what happened
+    // before this session as well as during it (§7.8). Anything that was
+    // still running when the last one ended loads as interrupted.
+    ui_state.transfers = crate::client::transfer_log::TransferLog::load(
+        crate::client::transfer_log::TransferLog::path_beside(&client_home),
+    );
+    ui_state.transfers_shortcut = settings.transfers_shortcut.clone();
+    // A configured share whose folder is missing would otherwise fail
+    // silently here and surface only as a red error on whoever tried to
+    // browse it - the one person who cannot fix it (§7.8).
+    shared::report_unusable_shares(&session, &mut ui_state);
     // Ticks fast enough that `tick_recording_timeout` can detect a
     // released Space key within one `RECORD_HOLD_TIMEOUT` window without
     // adding much latency; also drives the idle-stream sweep below.
@@ -1261,7 +1338,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
             }
             event = file_events_rx.recv() => {
                 let Some(event) = event else { break };
-                handle_file_event(&mut ui_state, &mut session, event).await;
+                handle_file_event(&mut wr, &mut ui_state, &mut session, event).await?;
+            }
+            event = shared_events_rx.recv() => {
+                let Some(event) = event else { break };
+                shared::on_shared_event(&mut wr, &mut ui_state, &mut session, event).await?;
             }
             stopped = auto_stop_rx.recv() => {
                 let Some(()) = stopped else { break };
@@ -1332,11 +1413,22 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 if tick_count % 4 == 0 {
                     ui_state.toggle_blink();
                 }
+                // A queued shared send waiting on a gate that has since
+                // cleared, or an offer nobody answered
+                // (`shared::SHARED_OFFER_TIMEOUT`) - once a second is
+                // plenty for either.
+                if tick_count % 7 == 0 {
+                    shared::pump_all_shared_sends(&mut wr, &mut ui_state, &mut session).await?;
+                }
                 // Independent of any progress report: a spinner that only
                 // moved when bytes landed would stall exactly when the user
                 // most needs to see the app is still alive (a slow disk, a
                 // subprocess still starting up).
                 ui_state.tick_otp_keygen_spinner();
+                // What the header's download arrow shows (§7.8) - read
+                // off the byte window here rather than at render time,
+                // like every other header figure.
+                ui_state.tick_download_speed(Instant::now());
                 // Republish each in-flight pad transfer's link depth for
                 // its worker thread to pace against - the worker cannot
                 // reach into `peer_link` itself (`otp_pad::OutgoingPad`'s
@@ -2391,6 +2483,19 @@ impl SessionState {
     /// The stream id the next voice or file send will use - so a test can
     /// lay down the row that send will look for (`own_stream_msg_id`),
     /// which is where its `msg_id` comes from.
+    /// Starts tracking `peer`'s rotating key, and spends its one permit -
+    /// exposed so a test can put a peer in the state where the next send
+    /// to them is refused for want of a fresh key
+    /// (`rekey::RemoteKeys::try_use`), which is one of the ways a shared
+    /// send bails out after its tag has already gone (§7.8).
+    pub fn track_remote_key_for_test(&mut self, peer: UserId) {
+        self.remote_keys.track(peer);
+    }
+
+    pub fn try_use_remote_key_for_test(&mut self, peer: UserId) -> bool {
+        self.remote_keys.try_use(peer)
+    }
+
     pub fn next_stream_id_for_test(&self) -> u64 {
         self.next_stream_id
     }
@@ -2460,6 +2565,7 @@ impl SessionState {
     /// `PeerLinkManager::pending_payloads`, since nothing is `Active`.
     pub async fn for_test(spec: TestSessionSpec) -> Self {
         let (file_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (shared_events_tx, shared_events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (record_out_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (own_stream_done_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (otp_keygen_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -2517,6 +2623,19 @@ impl SessionState {
             staged_text_receives: HashMap::new(),
             viewed_previews: std::collections::HashSet::new(),
             otp_send_temp_files: HashMap::new(),
+            shares: Vec::new(),
+            share_pacer: std::sync::Arc::new(crate::client::shared_folders::SharePacer::new(0)),
+            shared_send_queue: HashMap::new(),
+            shared_sending: HashMap::new(),
+            shared_receiving: HashMap::new(),
+            shared_request_of_stream: HashMap::new(),
+            shared_jobs: HashMap::new(),
+            shared_requests: HashMap::new(),
+            expected_shared_offers: HashMap::new(),
+            next_shared_request_id: 1,
+            shared_events_tx,
+            test_shared_events: Some(shared_events_rx),
+            shared_download_dir: spec.scratch.join("downloads"),
             file_events_tx,
             record_out_tx,
             own_stream_done_tx,
@@ -2824,7 +2943,7 @@ fn handle_incoming_file_offer(
         return false;
     };
     let filename = crate::client::file_transfer::truncate_filename(&payload.filename);
-    let offer = PendingFileOffer {
+    let mut offer = PendingFileOffer {
         from,
         from_name,
         filename,
@@ -2832,7 +2951,12 @@ fn handle_incoming_file_offer(
         stream_id,
         channel,
         otp_contact_name: None,
+        auto_dest: None,
+        shared_request_id: None,
     };
+    // An offer this side asked for (a shared-folder download, §7.8) is
+    // given its destination here, which is what keeps it out of the popup.
+    shared::tag_incoming_offer(session, &mut offer);
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
         return true;
@@ -2911,10 +3035,11 @@ fn sweep_idle_streams(ui_state: &mut UiState, session: &mut SessionState, now: I
 }
 
 async fn handle_file_event(
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     event: file_transfer::FileEvent,
-) {
+) -> proto::Result<()> {
     let me = ui_state.own_id.unwrap_or(UserId(0));
     match event {
         file_transfer::FileEvent::SendProgress { stream_id, bytes } => {
@@ -2929,24 +3054,41 @@ async fn handle_file_event(
             if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
                 crate::client::otp::secure_remove_file(&temp);
             }
-            ui_state.set_file_completed(me, stream_id)
+            ui_state.set_file_completed(me, stream_id);
+            // A shared send finishing is what releases the next one
+            // queued for that peer (§7.8).
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id).await?;
         }
         file_transfer::FileEvent::SendFailed { stream_id } => {
             session.otp_sending_streams.remove(&stream_id);
             if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
                 crate::client::otp::secure_remove_file(&temp);
             }
-            ui_state.set_file_failed(me, stream_id)
+            ui_state.set_file_failed(me, stream_id);
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id).await?;
         }
         file_transfer::FileEvent::ReceiveProgress {
             from,
             stream_id,
             bytes,
-        } => ui_state.set_file_progress(from, stream_id, bytes),
+        } => {
+            // A shared download reports into its own row on the Downloads
+            // tab (§7.8); only a `/file` receive has a row in the log.
+            if session.shared_receiving.contains_key(&(from, stream_id)) {
+                shared::on_shared_receive_progress(session, ui_state, from, stream_id, bytes);
+            } else {
+                ui_state.set_file_progress(from, stream_id, bytes);
+            }
+        }
         file_transfer::FileEvent::ReceiveDone {
             from, stream_id, ..
         } => {
             session.active_file_transfers.remove(&(from, stream_id));
+            // A shared file arrives under a `.part` and only becomes
+            // itself here (§7.8) - and says nothing in the conversation.
+            if shared::finish_shared_receive(session, ui_state, from, stream_id, true) {
+                return Ok(());
+            }
             let staged_path = session.staged_text_receives.remove(&(from, stream_id));
             let is_staged = staged_path.is_some();
             match session
@@ -2980,6 +3122,9 @@ async fn handle_file_event(
         }
         file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
+            if shared::finish_shared_receive(session, ui_state, from, stream_id, false) {
+                return Ok(());
+            }
             session.staged_text_receives.remove(&(from, stream_id));
             session.viewed_previews.remove(&(from, stream_id));
             if let Some(pending) = session
@@ -2992,4 +3137,5 @@ async fn handle_file_event(
             settle_delivery_id(session, from, stream_id, false);
         }
     }
+    Ok(())
 }

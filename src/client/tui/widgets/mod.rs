@@ -9,3 +9,4 @@
 
 pub mod confirm_popup;
 pub mod field;
+pub mod progress_bar;

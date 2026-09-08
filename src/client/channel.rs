@@ -252,6 +252,7 @@ pub(crate) async fn handle_send_file(
                 path: path.clone(),
                 key,
                 otp: None,
+                pacer: None,
             },
         );
         session.peer_link.ensure_link(wr, id).await;

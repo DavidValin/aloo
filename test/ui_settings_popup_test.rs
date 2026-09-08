@@ -1,4 +1,4 @@
-//! The Ctrl+S settings popup (US-039): its three tabs, moving between
+//! The Ctrl+S settings popup (US-039): its four tabs, moving between
 //! them and between the fields on them, what each key does to a toggle or
 //! a text box, and the draft that every one of those changes hands the
 //! session to persist.
@@ -69,14 +69,19 @@ fn ctrl_s_opens_the_settings_popup_on_its_first_tab_and_requests_a_load() {
 
 /// @requirement AC-397
 #[test]
-fn tab_and_backtab_cycle_the_three_tabs_and_wrap() {
+fn tab_and_backtab_cycle_the_four_tabs_and_wrap() {
     let mut state = open_settings();
-    for want in [SettingsTab::DirectPunch, SettingsTab::Otp, SettingsTab::General] {
+    for want in [
+        SettingsTab::DirectPunch,
+        SettingsTab::Otp,
+        SettingsTab::FileSharing,
+        SettingsTab::General,
+    ] {
         press(&mut state, KeyCode::Tab);
         assert_eq!(state.settings_popup.as_ref().unwrap().tab, want);
     }
     press(&mut state, KeyCode::BackTab);
-    assert_eq!(state.settings_popup.as_ref().unwrap().tab, SettingsTab::Otp);
+    assert_eq!(state.settings_popup.as_ref().unwrap().tab, SettingsTab::FileSharing);
 }
 
 /// Every tab starts on its own first field, whichever field the previous
@@ -431,8 +436,13 @@ fn every_tab_names_itself_and_the_open_one_is_marked() {
     let rows = rendered_rows_at(&state, 100, 46);
     let tab_row = rows
         .iter()
-        .find(|r| r.contains("General") && r.contains("Direct Punch") && r.contains("OTP"))
-        .expect("expected a tab row naming all three tabs");
+        .find(|r| {
+            r.contains("General")
+                && r.contains("Direct Punch")
+                && r.contains("OTP")
+                && r.contains("File Sharing")
+        })
+        .expect("expected a tab row naming all four tabs");
     assert!(tab_row.contains("General"), "{tab_row}");
 }
 
@@ -658,9 +668,9 @@ fn touch_ptt_enabled_is_a_switch_on_the_general_tab() {
     let mut state = open_settings();
     assert!(draft(&state).touch_ptt_enabled);
     assert_eq!(
-        SettingsTab::General.fields()[2],
+        SettingsTab::General.fields()[3],
         SettingsField::TouchPttEnabled,
-        "right under the shortcut box"
+        "under the two shortcut boxes"
     );
     focus_on(&mut state, SettingsField::TouchPttEnabled);
     let saved = saved(press(&mut state, KeyCode::Char(' ')));

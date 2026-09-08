@@ -2,7 +2,9 @@
 //! split across three tabs - **General** (push-to-talk, the sounds, the
 //! message log), **Direct Punch** (the serverless punching configuration
 //! and the No-IP updater that keeps a moving address reachable, see
-//! `docs/PROTOCOL.md` §7.1.5) and **OTP**.
+//! `docs/PROTOCOL.md` §7.1.5), **OTP**, and **File Sharing** (the folders
+//! this client shares with peers and the upload budget they get,
+//! `docs/PROTOCOL.md` §7.8).
 //!
 //! Only the fields a user has a reason to change while the app is running
 //! live here. Everything a server reads (`server_*`), everything a daemon
@@ -42,6 +44,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use crate::settings::Settings;
 
 use super::direct_punch_popup::{DirectPunchPopupState, render_edit_form, render_punch_list};
+use super::share_popup::{SharePopupState, render_share_edit_form, render_share_list};
 use super::ui::{Mode, UiAction, UiState, centered_rect};
 use super::widgets::field::{place_text_cursor, render_bordered_field};
 
@@ -54,6 +57,9 @@ pub const SETTINGS_TEXT_MAX_LEN: usize = 200;
 /// `otp_low_key_warn_pct` is a percentage, so three digits is the whole
 /// range it could ever need.
 const PERCENT_MAX_DIGITS: usize = 3;
+/// `file_sharing_link_speed_kbps` in digits: room for a 10 Gbit/s link,
+/// far past anything a percentage of matters for.
+const LINK_SPEED_MAX_DIGITS: usize = 8;
 
 // ---------------------------------------------------------------------
 // Tabs and fields
@@ -64,16 +70,23 @@ pub enum SettingsTab {
     General,
     DirectPunch,
     Otp,
+    FileSharing,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 3] = [SettingsTab::General, SettingsTab::DirectPunch, SettingsTab::Otp];
+    pub const ALL: [SettingsTab; 4] = [
+        SettingsTab::General,
+        SettingsTab::DirectPunch,
+        SettingsTab::Otp,
+        SettingsTab::FileSharing,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             SettingsTab::General => "General",
             SettingsTab::DirectPunch => "Direct Punch",
             SettingsTab::Otp => "OTP",
+            SettingsTab::FileSharing => "File Sharing",
         }
     }
 
@@ -90,6 +103,7 @@ impl SettingsTab {
             SettingsTab::General => &[
                 GlobalPttEnabled,
                 GlobalPttShortcut,
+                TransfersShortcut,
                 TouchPttEnabled,
                 VoiceAutoplay,
                 RogerBeep,
@@ -108,6 +122,7 @@ impl SettingsTab {
                 NoipPassword,
             ],
             SettingsTab::Otp => &[OtpLowKeyWarnPct, OtpBinaryPath],
+            SettingsTab::FileSharing => &[FileSharingLinkSpeedKbps, FileSharingMaxPct, Shares],
         }
     }
 }
@@ -119,6 +134,7 @@ impl SettingsTab {
 pub enum SettingsField {
     GlobalPttEnabled,
     GlobalPttShortcut,
+    TransfersShortcut,
     TouchPttEnabled,
     VoiceAutoplay,
     RogerBeep,
@@ -138,6 +154,9 @@ pub enum SettingsField {
     NoipPassword,
     OtpLowKeyWarnPct,
     OtpBinaryPath,
+    FileSharingLinkSpeedKbps,
+    FileSharingMaxPct,
+    Shares,
 }
 
 /// What a field is, which decides how it is drawn and which keys mean
@@ -150,7 +169,7 @@ pub enum FieldKind {
     Text,
     /// Digits only, drawn as a bordered box.
     Digits,
-    /// The direct-punch list.
+    /// The direct-punch list, or the shared-folder list.
     List,
 }
 
@@ -161,6 +180,7 @@ impl SettingsField {
         match self {
             SettingsField::GlobalPttEnabled => "global_ptt_enabled",
             SettingsField::GlobalPttShortcut => "global_ptt_shortcut",
+            SettingsField::TransfersShortcut => "transfers_shortcut",
             SettingsField::TouchPttEnabled => "touch_ptt_enabled",
             SettingsField::VoiceAutoplay => "voice_autoplay",
             SettingsField::RogerBeep => "roger_beep",
@@ -177,6 +197,9 @@ impl SettingsField {
             SettingsField::NoipPassword => "noip_password",
             SettingsField::OtpLowKeyWarnPct => "otp_low_key_warn_pct",
             SettingsField::OtpBinaryPath => "otp_binary_path",
+            SettingsField::FileSharingLinkSpeedKbps => "file_sharing_link_speed_kbps",
+            SettingsField::FileSharingMaxPct => "file_sharing_max_pct",
+            SettingsField::Shares => "shared folders",
         }
     }
 
@@ -189,6 +212,9 @@ impl SettingsField {
                 "push to talk from any app (on, from off at startup: next run)"
             }
             SettingsField::GlobalPttShortcut => "which OS-wide combo does it",
+            SettingsField::TransfersShortcut => {
+                "the key that opens the file-share transfers popup, in this app"
+            }
             SettingsField::TouchPttEnabled => {
                 "hold a finger or the mouse button anywhere on screen to talk"
             }
@@ -211,6 +237,11 @@ impl SettingsField {
             SettingsField::NoipPassword => "its password, stored as plain text like every other",
             SettingsField::OtpLowKeyWarnPct => "warn when this % of a one-time pad is left",
             SettingsField::OtpBinaryPath => "the otp binary to run (empty: found on PATH)",
+            SettingsField::FileSharingLinkSpeedKbps => {
+                "your upload speed in kbit/s (0: unknown, shared sends are not capped)"
+            }
+            SettingsField::FileSharingMaxPct => "the % of that speed shared-folder downloads may use",
+            SettingsField::Shares => "folders peers may browse and download, and who may see each",
         }
     }
 
@@ -227,13 +258,25 @@ impl SettingsField {
             | SettingsField::DirectPunchEnabled
             | SettingsField::NoipEnabled => FieldKind::Toggle,
             SettingsField::GlobalPttShortcut
+            | SettingsField::TransfersShortcut
             | SettingsField::DirectPunchChannels
             | SettingsField::NoipHostname
             | SettingsField::NoipUsername
             | SettingsField::NoipPassword
             | SettingsField::OtpBinaryPath => FieldKind::Text,
-            SettingsField::OtpLowKeyWarnPct => FieldKind::Digits,
-            SettingsField::Punches => FieldKind::List,
+            SettingsField::OtpLowKeyWarnPct
+            | SettingsField::FileSharingLinkSpeedKbps
+            | SettingsField::FileSharingMaxPct => FieldKind::Digits,
+            SettingsField::Punches | SettingsField::Shares => FieldKind::List,
+        }
+    }
+
+    /// How many digits a `Digits` field takes - a percentage three, a
+    /// link speed enough for any real link.
+    fn max_digits(self) -> usize {
+        match self {
+            SettingsField::FileSharingLinkSpeedKbps => LINK_SPEED_MAX_DIGITS,
+            _ => PERCENT_MAX_DIGITS,
         }
     }
 }
@@ -254,6 +297,7 @@ impl SettingsField {
 pub struct SettingsDraft {
     pub global_ptt_enabled: bool,
     pub global_ptt_shortcut: String,
+    pub transfers_shortcut: String,
     pub touch_ptt_enabled: bool,
     pub voice_autoplay: bool,
     pub roger_beep: bool,
@@ -271,6 +315,8 @@ pub struct SettingsDraft {
     pub noip_password: String,
     pub otp_low_key_warn_pct: String,
     pub otp_binary_path: String,
+    pub file_sharing_link_speed_kbps: String,
+    pub file_sharing_max_pct: String,
 }
 
 impl Default for SettingsDraft {
@@ -284,6 +330,7 @@ impl SettingsDraft {
         Self {
             global_ptt_enabled: settings.global_ptt_enabled,
             global_ptt_shortcut: settings.global_ptt_shortcut.clone(),
+            transfers_shortcut: settings.transfers_shortcut.to_setting_value(),
             touch_ptt_enabled: settings.touch_ptt_enabled,
             voice_autoplay: settings.voice_autoplay,
             roger_beep: settings.roger_beep,
@@ -299,6 +346,8 @@ impl SettingsDraft {
             noip_password: settings.noip_password.clone(),
             otp_low_key_warn_pct: settings.otp_low_key_warn_pct.to_string(),
             otp_binary_path: settings.otp_binary_path.clone().unwrap_or_default(),
+            file_sharing_link_speed_kbps: settings.file_sharing_link_speed_kbps.to_string(),
+            file_sharing_max_pct: settings.file_sharing_max_pct.to_string(),
         }
     }
 
@@ -313,6 +362,11 @@ impl SettingsDraft {
         // here keeps the file and the popup saying the same thing.
         if !self.global_ptt_shortcut.trim().is_empty() {
             settings.global_ptt_shortcut = self.global_ptt_shortcut.trim().to_string();
+        }
+        // A chord that names no key is not one to save - the stored one
+        // stays, exactly as an unparseable percentage does.
+        if let Some(chord) = crate::settings::KeyChord::parse(&self.transfers_shortcut) {
+            settings.transfers_shortcut = chord;
         }
         settings.touch_ptt_enabled = self.touch_ptt_enabled;
         settings.voice_autoplay = self.voice_autoplay;
@@ -352,6 +406,25 @@ impl SettingsDraft {
             "" => None,
             path => Some(path.to_string()),
         };
+        // Same rule as the OTP percentage: only a value that is one is
+        // saved; an empty box mid-edit leaves the stored one alone.
+        if let Ok(kbps) = self.file_sharing_link_speed_kbps.parse::<u32>() {
+            settings.file_sharing_link_speed_kbps = kbps;
+        }
+        if let Ok(pct) = self.file_sharing_max_pct.parse::<u8>()
+            && (1..=100).contains(&pct)
+        {
+            settings.file_sharing_max_pct = pct;
+        }
+    }
+
+    /// The bytes-per-second cap this draft asks for, as
+    /// `shared_folders::rate_from_settings` computes it from the saved
+    /// values - `None` while either box holds nothing usable.
+    pub fn file_sharing_rate(&self) -> Option<u64> {
+        let kbps = self.file_sharing_link_speed_kbps.parse::<u32>().ok()?;
+        let pct = self.file_sharing_max_pct.parse::<u8>().ok()?;
+        (1..=100).contains(&pct).then(|| crate::client::shared_folders::rate_from_settings(kbps, pct))
     }
 
     fn toggle_mut(&mut self, field: SettingsField) -> Option<&mut bool> {
@@ -389,12 +462,15 @@ impl SettingsDraft {
     fn text_mut(&mut self, field: SettingsField) -> Option<&mut String> {
         Some(match field {
             SettingsField::GlobalPttShortcut => &mut self.global_ptt_shortcut,
+            SettingsField::TransfersShortcut => &mut self.transfers_shortcut,
             SettingsField::DirectPunchChannels => &mut self.direct_punch_channels,
             SettingsField::NoipHostname => &mut self.noip_hostname,
             SettingsField::NoipUsername => &mut self.noip_username,
             SettingsField::NoipPassword => &mut self.noip_password,
             SettingsField::OtpLowKeyWarnPct => &mut self.otp_low_key_warn_pct,
             SettingsField::OtpBinaryPath => &mut self.otp_binary_path,
+            SettingsField::FileSharingLinkSpeedKbps => &mut self.file_sharing_link_speed_kbps,
+            SettingsField::FileSharingMaxPct => &mut self.file_sharing_max_pct,
             _ => return None,
         })
     }
@@ -402,12 +478,15 @@ impl SettingsDraft {
     pub fn text_value(&self, field: SettingsField) -> &str {
         match field {
             SettingsField::GlobalPttShortcut => &self.global_ptt_shortcut,
+            SettingsField::TransfersShortcut => &self.transfers_shortcut,
             SettingsField::DirectPunchChannels => &self.direct_punch_channels,
             SettingsField::NoipHostname => &self.noip_hostname,
             SettingsField::NoipUsername => &self.noip_username,
             SettingsField::NoipPassword => &self.noip_password,
             SettingsField::OtpLowKeyWarnPct => &self.otp_low_key_warn_pct,
             SettingsField::OtpBinaryPath => &self.otp_binary_path,
+            SettingsField::FileSharingLinkSpeedKbps => &self.file_sharing_link_speed_kbps,
+            SettingsField::FileSharingMaxPct => &self.file_sharing_max_pct,
             _ => "",
         }
     }
@@ -426,6 +505,9 @@ pub struct SettingsPopupState {
     /// The Direct Punch tab's target list, add/edit form and all - see
     /// `super::direct_punch_popup`.
     pub punches: DirectPunchPopupState,
+    /// The File Sharing tab's folder list, add/edit form and all - see
+    /// `super::share_popup`.
+    pub shares: SharePopupState,
 }
 
 impl SettingsPopupState {
@@ -451,6 +533,11 @@ impl UiState {
                 selected: 0,
                 edit: None,
             },
+            shares: SharePopupState {
+                rows: Vec::new(),
+                selected: 0,
+                edit: None,
+            },
         });
     }
 
@@ -468,6 +555,9 @@ impl UiState {
     pub(crate) fn handle_settings_key(&mut self, code: KeyCode) -> Option<UiAction> {
         if self.settings_popup.as_ref()?.punches.edit.is_some() {
             return self.handle_direct_punches_edit_key(code);
+        }
+        if self.settings_popup.as_ref()?.shares.edit.is_some() {
+            return self.handle_share_edit_key(code);
         }
         match code {
             KeyCode::Esc => {
@@ -506,6 +596,9 @@ impl UiState {
         if state.focused_field() == SettingsField::Punches && state.punches.step_selection(up) {
             return None;
         }
+        if state.focused_field() == SettingsField::Shares && state.shares.step_selection(up) {
+            return None;
+        }
         let len = state.tab.fields().len();
         state.focus = if up { (state.focus + len - 1) % len } else { (state.focus + 1) % len };
         // Entering the list from above starts at its first row, from
@@ -514,6 +607,13 @@ impl UiState {
         if state.focused_field() == SettingsField::Punches {
             state.punches.selected = if up {
                 state.punches.rows.len().saturating_sub(1)
+            } else {
+                0
+            };
+        }
+        if state.focused_field() == SettingsField::Shares {
+            state.shares.selected = if up {
+                state.shares.rows.len().saturating_sub(1)
             } else {
                 0
             };
@@ -530,6 +630,9 @@ impl UiState {
         if field == SettingsField::Punches {
             return self.handle_punches_key(code);
         }
+        if field == SettingsField::Shares {
+            return self.handle_shares_key(code);
+        }
         let state = self.settings_popup.as_mut()?;
         match code {
             KeyCode::Char(' ') | KeyCode::Enter if field.kind() == FieldKind::Toggle => {
@@ -544,7 +647,7 @@ impl UiState {
             }
             KeyCode::Char(c) => {
                 let (max_len, accepted) = match field.kind() {
-                    FieldKind::Digits => (PERCENT_MAX_DIGITS, c.is_ascii_digit()),
+                    FieldKind::Digits => (field.max_digits(), c.is_ascii_digit()),
                     // A settings line is one `key=value` on one line, so
                     // the two characters that would break that shape are
                     // the two this refuses.
@@ -616,7 +719,7 @@ impl UiState {
 /// - `centered_rect` clamps it to the terminal on anything narrower, and
 /// `render_descriptions` still wraps when it has to.
 const POPUP_WIDTH: u16 = 102;
-const POPUP_HEIGHT: u16 = 40;
+const POPUP_HEIGHT: u16 = 44;
 
 /// Hands out rows from the top of an area, refusing anything that no
 /// longer fits.
@@ -712,11 +815,18 @@ pub(crate) fn render_settings_popup(frame: &mut Frame, area: Rect, state: &UiSta
         }
         return;
     }
+    if let Some(edit) = &popup.shares.edit {
+        if let Some(row) = stack.take(stack.remaining()) {
+            render_share_edit_form(frame, row, edit);
+        }
+        return;
+    }
 
     match popup.tab {
         SettingsTab::General => render_general_tab(frame, &mut stack, popup),
         SettingsTab::DirectPunch => render_direct_punch_tab(frame, &mut stack, popup),
         SettingsTab::Otp => render_otp_tab(frame, &mut stack, popup),
+        SettingsTab::FileSharing => render_file_sharing_tab(frame, &mut stack, popup),
     }
     render_descriptions(frame, &mut stack, popup.tab);
 }
@@ -801,9 +911,10 @@ fn render_general_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopu
     use SettingsField::*;
     // 10, not 9: a blank row under the shortcut box, so the three switches
     // below it do not read as belonging to it.
-    if let Some(mut inner) = group(frame, stack, "voice / ptt", 10) {
+    if let Some(mut inner) = group(frame, stack, "voice / ptt", 13) {
         render_toggle(frame, &mut inner, popup, GlobalPttEnabled);
         render_text_field(frame, &mut inner, popup, GlobalPttShortcut);
+        render_text_field(frame, &mut inner, popup, TransfersShortcut);
         inner.gap();
         render_toggle(frame, &mut inner, popup, TouchPttEnabled);
         render_toggle(frame, &mut inner, popup, VoiceAutoplay);
@@ -855,6 +966,22 @@ fn render_otp_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopupSta
     if let Some(mut inner) = group(frame, stack, "otp", 8) {
         render_text_field(frame, &mut inner, popup, OtpLowKeyWarnPct);
         render_text_field(frame, &mut inner, popup, OtpBinaryPath);
+    }
+    stack.gap();
+}
+
+fn render_file_sharing_tab(frame: &mut Frame, stack: &mut Stack, popup: &SettingsPopupState) {
+    use SettingsField::*;
+    let focused = popup.focused_field();
+    if let Some(mut inner) = group(frame, stack, "upload budget", 8) {
+        render_text_field(frame, &mut inner, popup, FileSharingLinkSpeedKbps);
+        render_text_field(frame, &mut inner, popup, FileSharingMaxPct);
+    }
+    stack.gap();
+    if let Some(mut inner) = group(frame, stack, "shared folders", 10)
+        && let Some(area) = inner.take(inner.remaining())
+    {
+        render_share_list(frame, area, &popup.shares, focused == Shares);
     }
     stack.gap();
 }

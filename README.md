@@ -188,7 +188,7 @@ you're actually viewing.
 ### Settings, without leaving aloo
 
 **`Ctrl+S`** opens the settings — the same `~/.aloo/settings` file aloo
-reads at startup, in three tabs. `Tab` moves between them, `Up`/`Down`
+reads at startup, in four tabs. `Tab` moves between them, `Up`/`Down`
 between the fields of the one you're on, `Space` flips a switch, typing
 fills a box, `Esc` closes. The open tab is filled in, and each bordered
 area is separated from the next by a blank line. **There's no Save
@@ -204,9 +204,10 @@ start.)
 
 | Tab | What's on it |
 |---|---|
-| **General** | `global_ptt_enabled` / `global_ptt_shortcut` / `touch_ptt_enabled` (see "Voice messages"), `voice_autoplay`, `roger_beep`, `sound_notifications` (see "Turning the sounds off"), `autosave_messages` / `resume_from_log` (see "Exporting your chat history"), `queue_send_messages` (see "Talking to someone who isn't there") |
+| **General** | `global_ptt_enabled` / `global_ptt_shortcut` / `transfers_shortcut` (the key for the transfers popup) / `touch_ptt_enabled` (see "Voice messages"), `voice_autoplay`, `roger_beep`, `sound_notifications` (see "Turning the sounds off"), `autosave_messages` / `resume_from_log` (see "Exporting your chat history"), `queue_send_messages` (see "Talking to someone who isn't there") |
 | **Direct Punch** | The `direct_punch` switch, the list of people to punch at, and the No-IP account that keeps a moving address reachable — see "Punching straight to someone" |
 | **OTP** | `otp_low_key_warn_pct` and `otp_binary_path` |
+| **File Sharing** | Your upload speed and the share of it shared-folder downloads may use, and the list of folders you share and with whom — see "Sharing folders" |
 
 Server options (`server_*`), daemon options (`daemon_*`) and the connect
 cache (`connect_*`) aren't here: the first two belong to a different
@@ -367,6 +368,77 @@ The recipient gets a popup with a chime naming you and the file, Accept
 focused by default — nothing moves until they accept. It then streams
 straight to `~/.aloo/downloads` with a live progress bar. Nothing is held
 whole in memory on either side, and there's no size cap.
+
+### Sharing folders
+
+A file send is one file, once, with a popup on the other side. A **shared
+folder** is standing: name a folder and who may see it, and those people
+can browse it and pull whatever they like from it, whenever you're
+linked, with no popup per file — they asked.
+
+```
+share=~/Public,all
+share=~/Photos,alice,bob
+```
+
+One line per folder in `~/.aloo/settings`, or `Ctrl+S` → **File
+Sharing**: `a` adds, `Enter`/`e` edits, `d` deletes, and every change is
+saved and announced to everyone you're linked to, right then.
+
+Write the path absolute (`/srv/Public`, `C:\Users\me\Public`) or
+starting `~/`. `$HOME` and `%USERPROFILE%` aren't expanded, and a
+relative path would depend on where you started aloo — both are refused
+in the form with the reason. If a shared folder goes missing later, aloo
+tells **you** in the status line, since the other side only sees that it
+isn't readable on your machine. People are
+named by nickname, so a grant survives reconnects. A folder is known to
+others only by its last name (`Photos`), never by where it lives.
+
+| Key / command | What it does |
+|---|---|
+| `/info` (in the DM), then `Enter` | **Browse shared files** — the button is only there for someone who shares something with you |
+| `Enter` / `Backspace` | Open a folder / go up (`Esc` closes) |
+| `d` | Download the selected file, or a whole folder with its structure |
+| `Ctrl+Alt+D` | **All** transfers, both directions, everyone — see below |
+| `Tab` | Switch between their folders and your **Downloads** |
+| `c` / `r` / `x` / `X` | On Downloads: cancel, resume, remove a finished row, clear all finished |
+
+When someone shares something with you, opening the DM with them says
+so once: `<nickname> has given you access to files, type /info to
+access`. The browser lists name, created, updated and size for every
+entry.
+
+Downloads land under `~/.aloo/downloads/fileshare/<nickname>/<folder>/`,
+keeping their layout — pull a folder called `test` and you get a folder
+called `test`. They **don't** appear in the chat: the browser's
+**Downloads** tab is where they live, with a progress bar each, four
+files arriving at once, and running ones listed above finished ones.
+Cancel one and everything already downloaded stays; resume it and only
+the missing files move. A file being written is a `.part` until it's
+whole, so nothing half-arrived looks finished. While anything is
+downloading the header shows a blinking `↓` and the speed.
+
+**`Ctrl+Alt+D`** opens the transfers popup: everything you've pulled from
+anyone, alongside everything anyone has pulled from your shared folders,
+each row marked `↓` or `↑` with who it was with. `Tab` narrows it to one
+direction. `c` stops the selected one — on a download that tells them to
+stop sending, on an upload it tells them to stop waiting — `r` resumes a
+stopped download, `x` drops a finished row and `X` clears all of them. A
+running transfer has to be cancelled before it can be removed. **The list
+survives restarting aloo**; anything still running when you quit comes
+back marked interrupted, since nothing picks itself back up. Change the
+key with `transfers_shortcut` in the settings, or on `Ctrl+S` → General.
+
+Only what you asked for skips the Accept popup — an unasked-for offer
+still gets one. And if one shared folder sits inside another, the
+stricter of the two wins: a folder you're not on the list for stays
+invisible even inside one you are.
+
+Two settings cap what sharing may cost you: `file_sharing_link_speed_kbps`
+(your upload speed — aloo can't measure it, so you say; `0` means no cap)
+and `file_sharing_max_pct` (default 50). Together they hold every shared
+send, across everyone downloading at once, to that fraction of that
+speed — live, even mid-transfer. Ordinary `/file` sends aren't capped.
 
 ### Live voice calls
 

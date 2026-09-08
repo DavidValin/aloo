@@ -330,6 +330,47 @@ pub enum UiAction {
     /// concurrent daemon's own keys are untouched) and immediately
     /// reconfigures `PeerLinkManager`'s scheduler with it.
     SaveDirectPunchTargets(Vec<crate::settings::DirectPunchTarget>),
+    /// The File Sharing tab's list, saved whole after an add/edit/delete
+    /// (`crate::client::tui::share_popup`) - written to `~/.aloo/settings`
+    /// with the same merging write `SaveDirectPunchTargets` uses, applied
+    /// to the running session, and re-announced to every linked peer
+    /// (`docs/PROTOCOL.md` §7.8).
+    SaveShares(Vec<crate::settings::SharedFolder>),
+    /// Enter on a folder in the shared-files browser
+    /// (`crate::client::tui::shared_browser`) - asks `peer` what is in
+    /// `share`/`rel_path` (`Content::SharedListRequest`, §7.8); the answer
+    /// lands through `UiState::set_shared_listing`.
+    RequestSharedListing {
+        peer: UserId,
+        share: String,
+        rel_path: String,
+    },
+    /// `d` in the shared-files browser - asks `peer` to send the file, or
+    /// every file under the folder, at `share`/`rel_path`
+    /// (`Content::SharedDownloadRequest`, §7.8). Each file then arrives
+    /// as an ordinary transfer, accepted without a popup.
+    DownloadShared {
+        peer: UserId,
+        share: String,
+        rel_path: String,
+    },
+    /// `c` on a running download in the browser's Downloads tab - tells
+    /// the owner to stop offering what is still queued and drops this
+    /// side's half-written files, keeping everything already complete
+    /// (§7.8).
+    CancelSharedDownload { request_id: u64 },
+    /// `r` on a stopped download - asks for the same folder again; every
+    /// file already on disk at full size is refused as it is offered, so
+    /// only what is missing moves.
+    ResumeSharedDownload { request_id: u64 },
+    /// `c` on a running *upload* in the transfers popup - the owner
+    /// stops offering the rest of it and tells the requester, who would
+    /// otherwise wait for files that are not coming (§7.8).
+    CancelSharedUpload { request_id: u64 },
+    /// The transfer history changed in a way worth keeping (a row
+    /// removed, everything finished cleared) - written back to disk, so
+    /// `Ctrl+Alt+D` shows the same list after a restart.
+    SaveTransferHistory,
     /// `r` on the contacts modal - re-runs the same gather, e.g. after the
     /// remaining OTP key has moved since it was last opened.
     RefreshContacts,

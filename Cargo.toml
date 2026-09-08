@@ -150,6 +150,26 @@ name = "docs_test"
 path = "test/docs_test.rs"
 
 [[test]]
+name = "ui_transfers_popup_test"
+path = "test/ui_transfers_popup_test.rs"
+
+[[test]]
+name = "transfer_log_test"
+path = "test/transfer_log_test.rs"
+
+[[test]]
+name = "shared_folders_test"
+path = "test/shared_folders_test.rs"
+
+[[test]]
+name = "shared_session_test"
+path = "test/shared_session_test.rs"
+
+[[test]]
+name = "ui_shared_browser_test"
+path = "test/ui_shared_browser_test.rs"
+
+[[test]]
 name = "vectors_test"
 path = "test/vectors_test.rs"
 

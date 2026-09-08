@@ -152,6 +152,10 @@ impl UiState {
         if needs_initial_history {
             self.load_history_chunk();
         }
+        // Opening the room is when a peer's shared folders are pointed
+        // out (`docs/SPEC.md` "Shared folders") - once, until they share
+        // again.
+        self.maybe_show_share_notice(peer);
         let log_len = self.private_rooms.get(&peer).map(|r| r.log.len()).unwrap_or(0);
         self.message_selected = log_len.saturating_sub(1);
     }
@@ -342,10 +346,77 @@ impl UiState {
     /// session before the user has ever opened a DM with them), same as
     /// `on_direct_message`.
     pub fn push_otp_system_message(&mut self, peer: UserId, peer_name: &str, text: String) {
+        self.push_dm_system_message(peer, peer_name, text);
+    }
+
+    /// A system row in `peer`'s DM - what `push_otp_system_message` has
+    /// always written, under a name that says it is not OTP's alone.
+    pub fn push_dm_system_message(&mut self, peer: UserId, peer_name: &str, text: String) {
         let fallback_peer = self.peer_or_fallback(peer, peer_name);
         self.ensure_private_room(peer, fallback_peer);
         let entry = LogEntry::system(peer, peer_name.to_string(), text);
         self.append_to_dm(peer, peer_name, entry, Unread::Mark);
+    }
+
+    /// The exact line a DM shows once its peer has shared folders with us
+    /// (`docs/SPEC.md` "Shared folders").
+    pub fn share_notice_text(peer_name: &str) -> String {
+        format!("{peer_name} has given you access to files, type /info to access")
+    }
+
+    /// Records what `from` currently shares with us
+    /// (`Content::SharedFolders`, `docs/PROTOCOL.md` §7.8) - replacing,
+    /// never adding to, what they said before, so an empty list
+    /// withdraws everything. Access newly granted makes the DM notice
+    /// due again; it is printed now if that room is on screen, otherwise
+    /// the next time it is opened (`select_dm`).
+    /// A link to `from` is gone, so what they share is no longer
+    /// browsable - but they have not *withdrawn* it, and will announce it
+    /// again when they return. Distinct from `set_peer_shares(_, [])` for
+    /// exactly that reason: the notice must not be printed afresh on
+    /// every link flap, only when access is genuinely granted anew.
+    pub fn forget_peer_shares_until_they_return(&mut self, from: UserId) {
+        self.peer_shares.remove(&from);
+        self.refresh_shared_browser_top_level(from);
+    }
+
+    pub fn set_peer_shares(&mut self, from: UserId, names: Vec<String>) {
+        if names.is_empty() {
+            // A genuine withdrawal - they said they share nothing. Only
+            // this re-arms the notice, so that a later grant is news
+            // again; a link merely dropping
+            // (`forget_peer_shares_until_they_return`) leaves the marker
+            // alone and stays quiet when they come back.
+            self.peer_shares.remove(&from);
+            self.share_notice_shown.remove(&from);
+        } else {
+            self.peer_shares.insert(from, names);
+        }
+        self.refresh_shared_browser_top_level(from);
+        if self.is_viewing_dm(from) {
+            self.maybe_show_share_notice(from);
+        }
+    }
+
+    /// Prints `share_notice_text` into `peer`'s room if they share
+    /// something with us and it has not been said since they did.
+    pub(crate) fn maybe_show_share_notice(&mut self, peer: UserId) {
+        if !self.peer_shares.get(&peer).is_some_and(|s| !s.is_empty())
+            || self.share_notice_shown.contains(&peer)
+        {
+            return;
+        }
+        let Some(peer_name) = self
+            .private_rooms
+            .get(&peer)
+            .map(|r| r.peer.name.clone())
+            .or_else(|| self.known_users.get(&peer).map(|u| u.name.clone()))
+        else {
+            return;
+        };
+        self.share_notice_shown.insert(peer);
+        let text = Self::share_notice_text(&peer_name);
+        self.push_dm_system_message(peer, &peer_name, text);
     }
 
     /// `push_outgoing_channel`'s DM counterpart - see there for why this

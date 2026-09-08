@@ -61,6 +61,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
     }
+    if state.mode == Mode::SharedFiles {
+        super::shared_browser::render_shared_browser_popup(frame, area, state);
+    }
+    if state.transfers_popup.is_some() {
+        super::transfers_popup::render_transfers_popup(frame, area, state);
+    }
     if state.mode == Mode::Contacts {
         super::contacts::render_contacts_popup(frame, area, state);
     }
@@ -453,18 +459,13 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
         rows[0],
     );
 
-    let filled = (progress.fraction() * KEYGEN_BAR_CELLS as f64).round() as usize;
-    let filled = filled.min(KEYGEN_BAR_CELLS);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Green)),
-            Span::styled(
-                "\u{2591}".repeat(KEYGEN_BAR_CELLS - filled),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(format!("  {}%", progress.percent())),
-        ])),
+    super::widgets::progress_bar::render_progress_bar(
+        frame,
         rows[1],
+        progress.fraction(),
+        KEYGEN_BAR_CELLS,
+        Color::Green,
+        &format!("  {}%", progress.percent()),
     );
 
     frame.render_widget(

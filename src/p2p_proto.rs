@@ -521,4 +521,49 @@ pub enum P2pPayload {
         call_id: u64,
         members: Vec<UserId>,
     },
+
+    /// The folders the sender shares with the recipient, sealed
+    /// (`Content::SharedFolders`, docs/PROTOCOL.md §7.8) - sent once a
+    /// link is `Active`, exactly when `DeviceIdAnnounce` is, and again
+    /// whenever the sender's own share list changes.
+    SharedFolders {
+        envelope: Envelope,
+    },
+    /// "What is in this shared folder?" - a sealed
+    /// `Content::SharedListRequest` (§7.8).
+    SharedListRequest {
+        envelope: Envelope,
+    },
+    /// The owner's listing, sealed (`Content::SharedListResponse`, §7.8).
+    SharedListResponse {
+        envelope: Envelope,
+    },
+    /// "Send me this shared file, or every file under this shared
+    /// folder" - a sealed `Content::SharedDownloadRequest` (§7.8).
+    SharedDownloadRequest {
+        envelope: Envelope,
+    },
+    /// Precedes each `FileOffer`/`OtpFileOffer` a download request
+    /// produces, on the same reliable, ordered link, naming the request
+    /// it answers (`Content::SharedFileTag`, §7.8). The file itself then
+    /// travels exactly as any other transfer (§7.6, §16.2): the tag is
+    /// what lets the requester accept it without a popup.
+    SharedFileTag {
+        envelope: Envelope,
+    },
+    /// What a download request turned out to cover, sent before the
+    /// first file of it (`Content::SharedDownloadPlan`, §7.8).
+    SharedDownloadPlan {
+        envelope: Envelope,
+    },
+    /// The requester has given up on a download
+    /// (`Content::SharedDownloadCancel`, §7.8).
+    SharedDownloadCancel {
+        envelope: Envelope,
+    },
+    /// Every file the request covered has been offered, or the owner
+    /// could not serve it (`Content::SharedDownloadDone`, §7.8).
+    SharedDownloadDone {
+        envelope: Envelope,
+    },
 }

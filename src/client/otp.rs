@@ -4235,6 +4235,8 @@ async fn release_queued_recording(
         stream_id,
         session.record_out_tx.clone(),
         session.file_events_tx.clone(),
+        // A queued recording is never a shared-folder send.
+        None,
     );
 }
 
@@ -4632,6 +4634,7 @@ pub async fn send_file_offer(
     path: std::path::PathBuf,
     filename: String,
     size: u64,
+    row: crate::client::direct_message::SendFileRow,
 ) -> proto::Result<()> {
     let peer_name = peer_name_for(ui_state, to);
     let unacked = session
@@ -4743,8 +4746,17 @@ pub async fn send_file_offer(
     if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await {
         end_live_session_if_exhausted(session, ui_state, to, &detail, contact_name).await;
     }
-    let (msg_id, delivery) = ui_state.start_delivery(&[to]);
-    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
+    // A shared-folder send writes no row into the conversation (§7.8),
+    // and so earns no delivery id either - there is nothing for a
+    // receipt to mark.
+    let msg_id = match row {
+        crate::client::direct_message::SendFileRow::Logged => {
+            let (msg_id, delivery) = ui_state.start_delivery(&[to]);
+            ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
+            Some(msg_id)
+        }
+        crate::client::direct_message::SendFileRow::Silent => None,
+    };
     // Staged durably before the offer goes out, so a restart between now
     // and the peer's acceptance still resumes rather than silently losing
     // the file (`OtpStore::PendingContentSend`'s doc,
@@ -4760,6 +4772,7 @@ pub async fn send_file_offer(
             path,
             key,
             otp: Some(contact_name.to_string()),
+            pacer: None,
         },
     );
     session.peer_link.ensure_link(wr, to).await;
@@ -4770,15 +4783,20 @@ pub async fn send_file_offer(
             channel: None,
             stream_id,
             seq,
-            msg_id: Some(msg_id),
+            msg_id,
             envelope: otp_envelope,
             sender_device_id: own_device_id,
         },
     );
-    ui_state.mark_awaiting_pad_ack(to, msg_id);
-    session
-        .otp_ack_rows
-        .insert((contact_name.to_string(), seq), msg_id);
+    // Only a logged send has a row for the pad's own acknowledgement to
+    // mark; a silent one still spends and acknowledges the pad exactly
+    // the same way, with nothing on screen to update.
+    if let Some(msg_id) = msg_id {
+        ui_state.mark_awaiting_pad_ack(to, msg_id);
+        session
+            .otp_ack_rows
+            .insert((contact_name.to_string(), seq), msg_id);
+    }
     crate::client::session::request_rotation(session, to);
     Ok(())
 }
@@ -5274,6 +5292,7 @@ pub async fn send_voice_offer(
             path: plain_path,
             key,
             otp: Some(contact_name.to_string()),
+            pacer: None,
         },
     );
     session.peer_link.ensure_link(wr, to).await;
@@ -5597,7 +5616,7 @@ pub async fn on_file_offer(
         return;
     };
     let filename = crate::client::file_transfer::truncate_filename(&payload.filename);
-    let offer = crate::client::tui::ui::PendingFileOffer {
+    let mut offer = crate::client::tui::ui::PendingFileOffer {
         from,
         from_name,
         filename,
@@ -5605,7 +5624,12 @@ pub async fn on_file_offer(
         stream_id,
         channel,
         otp_contact_name: Some(contact_name),
+        auto_dest: None,
+        shared_request_id: None,
     };
+    // Same as the plain path: a shared-folder download's offer is
+    // accepted without the popup (§7.8), pad spend and all.
+    crate::client::session::shared::tag_incoming_offer(session, &mut offer);
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
     } else if ui_state.push_file_offer(offer) {
@@ -5996,6 +6020,7 @@ pub async fn start_outgoing_file_content(
             stream_id,
             session.record_out_tx.clone(),
             session.file_events_tx.clone(),
+            target.pacer,
         );
         return Ok(());
     };
@@ -6053,6 +6078,13 @@ pub async fn start_outgoing_file_content(
         secure_remove_file(&temp_path);
         let me = ui_state.own_id.unwrap_or(UserId(0));
         ui_state.set_file_failed(me, stream_id);
+        // Said out loud, not just drawn: this stream is over before a
+        // worker ever existed to report it, and whoever is tracking it -
+        // a shared-folder download waiting to offer its next file
+        // (§7.8) - would otherwise wait on a send that is never coming.
+        let _ = session
+            .file_events_tx
+            .send(crate::client::file_transfer::FileEvent::SendFailed { stream_id });
         let peer_name = peer_name_for(ui_state, to);
         notify(
             ui_state,
@@ -6113,6 +6145,7 @@ pub async fn start_outgoing_file_content(
                 stream_id,
                 session.record_out_tx.clone(),
                 session.file_events_tx.clone(),
+                target.pacer,
             );
         }
         _ => {
@@ -6121,6 +6154,12 @@ pub async fn start_outgoing_file_content(
             secure_remove_file(&temp_path);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_failed(me, stream_id);
+            // See the same send above: a stream that ends with no worker
+            // must still be reported, or a shared-folder download stalls
+            // on it for good.
+            let _ = session
+                .file_events_tx
+                .send(crate::client::file_transfer::FileEvent::SendFailed { stream_id });
             let peer_name = peer_name_for(ui_state, to);
             notify(
                 ui_state,
@@ -6252,6 +6291,10 @@ pub async fn resume_pending_content_sends(
                 path: target.path,
                 key,
                 otp: Some(target.contact_name),
+                // A target rebuilt from a restart's write-ahead record
+                // has lost its pacer: a shared send resumed this way goes
+                // unpaced, the documented degradation (§7.8).
+                pacer: None,
             },
         );
         begin_file_content(session, ui_state, stream_id).await?;
@@ -7149,6 +7192,7 @@ async fn recover_and_resend_file_content(
         stream_id,
         session.record_out_tx.clone(),
         session.file_events_tx.clone(),
+        session.own_file_targets.get(&stream_id).and_then(|t| t.pacer.clone()),
     );
     Ok(())
 }

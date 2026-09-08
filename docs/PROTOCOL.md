@@ -67,6 +67,7 @@ falling back to a server relay (§7.1).
   - [7.5 `RotateKey` / `KeyRotated` - per-peer key rotation relay](#75-rotatekey-keyrotated---per-peer-key-rotation-relay)
   - [7.6 File transfer](#76-file-transfer)
   - [7.7 Live voice calls](#77-live-voice-calls)
+  - [7.8 Shared folders](#78-shared-folders)
 - [8. Encryption model](#8-encryption-model)
   - [8.1 RSA-OAEP chunking](#81-rsa-oaep-chunking)
   - [8.2 RSA signatures](#82-rsa-signatures)
@@ -262,6 +263,13 @@ the payload carried inside a reliable or unreliable one.
 | `CallEnd` | reliably | Leaves a call still in progress (§7.7); from the host, ends it for everyone |
 | `CallMute` | reliably | Someone's microphone went off or back on: the host silencing (or restoring) one participant, or a participant reporting its own mute (§7.7) |
 | `CallRoster` | reliably | Hands a late-joining participant the sender's own roster (§7.7) |
+| `SharedFolders` | reliably | The folders the sender shares with this recipient, sealed - sent once `Active` and on every change (§7.8) |
+| `SharedListRequest` / `SharedListResponse` | reliably | What is in one shared folder: name, created, updated, size per entry (§7.8) |
+| `SharedDownloadRequest` | reliably | Asks for one shared file, or every file under a shared folder (§7.8) |
+| `SharedDownloadPlan` | reliably | What that request turned out to cover, sent before the first file so progress counts against something real (§7.8) |
+| `SharedDownloadCancel` | reliably | The requester has given up; the owner stops offering what is still queued (§7.8) |
+| `SharedFileTag` | reliably | Precedes each `FileOffer` a download produces, naming the request - what lets it be accepted with no popup (§7.8) |
+| `SharedDownloadDone` | reliably | Every file the request covered has been offered, or why none could be (§7.8) |
 
 **Server UDP socket** — stateless, no user data.
 
@@ -2732,6 +2740,240 @@ under one from the invite (and, symmetrically, from the `CallAccept`
 broadcast above), the same partial-delivery treatment an ordinary channel
 send already gives a rotating-key recipient without a fresh key (§11.2).
 
+### 7.8 Shared folders
+
+A **shared folder** is a standing offer, where §7.6 is a one-off one: the
+owner names local folders in `~/.aloo/settings` (one `share=<path>,all` or
+`share=<path>,<nickname>,...` line each, or the `Ctrl+S` File Sharing
+tab), and every peer allowed to see one can browse it and pull files from
+it at will, with no Accept/Reject popup per file. Access is by
+**nickname** - the identity a pin (§12) names - never by `UserId`, so a
+grant survives reconnects and can be written before the peer has ever
+been met. A folder is known to peers by its final path component only
+(`Photos`, never `/home/me/Photos`), and two shares with the same name
+cannot coexist.
+
+Every message in this section is an ordinary sealed envelope (§13.3) on
+the reliable link (§7.1.1), `channel: None`, exactly like `ChannelPresence`:
+the names of someone's folders are private to the pair, and an envelope
+that opens under the pinned key is what makes the announcement theirs.
+Six `Content` tags name the six payloads, each carried on the
+`P2pPayload` variant of the same name.
+
+```
+owner                                             requester
+  |                                                    |
+  |-- SharedFolders { [name, ...] } ------------------>|   on link Active, and on
+  |                                                    |   every change (empty =
+  |                                                    |   nothing shared with you)
+  |                                                    |
+  |<-- SharedListRequest { request_id, share, rel } ---|   Enter on a folder
+  |-- SharedListResponse { request_id, entries, ... } >|
+  |                                                    |
+  |<-- SharedDownloadRequest { request_id, share, rel }|   d on a file or folder
+  |                                                    |
+  |   for each file, one at a time:                    |
+  |-- SharedFileTag { request_id, stream_id, rel } --->|
+  |-- FileOffer { stream_id, envelope } -------------->|   accepted with no popup
+  |<-- FileAccept { stream_id } -----------------------|
+  |-- FileChunk ... FileEnd -------------------------->|   (§7.6, unchanged)
+  |                                                    |
+  |-- SharedDownloadDone { request_id, files, error } >|
+```
+
+**Announcing.** The moment a link reaches `Active` the owner sends
+`SharedFolders` with the names *that peer* may see - a share for
+`alice,bob` is never mentioned to carol - alongside `DeviceIdAnnounce`
+(§12.7). For a serverless peer (§7.1.5) that is repeated once their
+`ChannelPresence` has opened, since before it there is no key to seal to.
+A change to the owner's share list re-announces to every live link,
+including an empty list, and the recipient **replaces** what it knew
+rather than adding to it - which is how a withdrawn folder disappears on
+the other side without a restart. Nothing is announced to a peer who may
+see nothing.
+
+**Listing.** `SharedListRequest` names a share and a `/`-separated path
+under it (empty for the root). The owner answers `SharedListResponse`
+with one entry per item - name, whether it is a folder, size, and the
+filesystem's creation and modification times as Unix seconds (`None`
+where it records none) - folders first, each group by name, cut at
+`MAX_SHARED_ENTRIES_PER_RESPONSE` (500) with `truncated` set. `request_id`
+is the requester's own token, echoed back so the answer can be matched to
+the view that asked; an answer to a view already left is dropped.
+
+**Downloading.** `SharedDownloadRequest` names a file, or a folder - in
+which case every file under it, recursively, in name order, up to
+`MAX_SHARED_FILES_PER_DOWNLOAD` (10 000). A directory holding more
+entries than one listing may carry is walked only as far as that cap
+reaches, and the request ends `TooLarge` rather than reporting a complete
+download of an incomplete folder. What the walk found is sent first as a
+`SharedDownloadPlan` - how many files and how many bytes - so the
+requester's own progress counts against the real total from the start
+rather than against files as they appear. The owner then sends the files
+**several at a time per requester** (`MAX_PARALLEL_SHARED_SENDS`, four),
+each as an ordinary §7.6 transfer preceded by a `SharedFileTag` naming
+the request and the file's place under the share; the next goes out as
+each finishes, so a folder of small files is not one round trip per
+file. Tag and offer travel the same reliable, ordered link, so
+the tag always lands first; the requester accepts an offer whose
+`stream_id` it holds a tag for straight away, into
+`~/.aloo/downloads/<owner nickname>/<share>/<rel path>` (folder structure
+kept), and the transfer proceeds exactly as §7.6 - chunks and all.
+Two things differ from an ordinary transfer, and both follow from the
+requester having asked for this rather than been sent it: **neither side
+writes a row into the conversation** (the requester's Downloads list is
+where it lives, and the offer carries no `msg_id`, so there is no
+delivery receipt to earn), and the file is written under its final name
+plus `.part` throughout, becoming itself only once whole. A transfer that
+is cancelled, fails, or dies with the process therefore never leaves
+something that looks like the finished file. An offer the requester never answers - held
+behind their own identity review of the owner, say - is given up after
+`SHARED_OFFER_TIMEOUT` (two minutes) so the files behind it are not
+stalled forever. `SharedDownloadDone` closes the request with how many
+files were offered, or why none could be.
+
+**Only what was asked for skips the popup.** A tag is honoured only for
+a `request_id` this side issued, to this peer, for a download - anyone
+else's tag is dropped and the offer behind it gets the ordinary §7.6
+popup, as does an offer with no tag at all. So a peer can never push a
+file onto a disk unasked by dressing it as a share. A tag whose offer
+then never happens - the sender's pad gate busy, a key that will not seal
+- leaves an expectation the requester holds until the link drops, so the
+sender burns the stream id that tag named rather than letting its next
+send, of any file, inherit it. The trust gate keeps
+its priority too: an offer from a sender still under identity review
+(§12.4) is held, tag or no tag, and auto-accepted only once they are
+accepted. A tag lost to the owner's own restart (the OTP offer recovered
+from its write-ahead record, §16.4, is re-sent with no tag) simply
+degrades to the popup - no data path is skipped.
+
+**Overlapping shares take the most restrictive.** Shares can nest -
+`/work` shared with everyone and `/work/payroll` shared with one person
+is an ordinary pair of lines - and the narrower one is the stricter
+statement. Every listing, walk and path resolution is filtered against
+the canonicalized roots of the shares this requester may *not* see, so
+the narrower folder is not listed inside the wider one, is refused when
+named directly, and is skipped by a download of the wider share. The
+answer is therefore the same however the folder is reached, which is what
+makes it a rule rather than a display convention.
+
+**Checked per file, not per request.** A folder download is walked once
+and then offered over seconds or minutes, so deciding access at the walk
+would let a revocation arrive and change nothing. Every file is therefore
+re-checked as its turn comes: the share must still exist and still be
+visible to that requester, and the path is resolved again from the share
+list as it stands now - through the same confinement and
+most-restrictive rules - with the freshly resolved path being the one
+opened. Taking someone off a share's list, deleting the share, or adding
+a narrower one over part of it stops everything still queued; what was
+already on the wire is left to finish, since the transport cannot unsend
+it. The request is still closed out, so the requester is never left
+waiting on files that will not come.
+
+**Access and confinement.** Visibility is re-checked on every request,
+never trusted from the announce, and a share not meant for the requester
+answers exactly as one that does not exist does (`NoSuchShare`) - telling
+the two apart would let any linked peer probe for the names of folders
+they were never announced. A peer still under identity review (§12.4) is
+served nothing at all and announced nothing, the same gate every other
+content path applies: access is decided by nickname, and a review is
+precisely a dispute over one. The relative path is confined to the share:
+no `.`, `..`, empty or separator-bearing component, and the resolved path
+must still lie under the share's own resolved root - which is what
+refuses a symlink inside a share that points out of it.
+
+The listing is held to that same boundary rather than only the request
+is: an entry is listed only if it genuinely resolves inside the share, so
+a symlink pointing out of it is left out entirely rather than shown and
+then refused. Anything visible is fetchable and anything unfetchable is
+invisible - otherwise the listing itself becomes a way to learn what lies
+outside the folder.
+
+**A link is judged by where it points, not by where it sits.** Every
+entry and every requested path is canonicalized before it is used, so a
+link is followed only while it lands inside the folder that authorised
+it: a link to a file outside, a link to a *directory* outside (and
+anything reached through one), and a link into a nested share this
+requester may not see are each neither listed nor served, and a link
+whose target does not exist resolves to nothing. A link that stays inside
+the share is an ordinary file and is served like one. What this cannot
+see is a hard link, which is indistinguishable from the file it names -
+anyone able to create one inside a shared folder could equally put the
+file there.
+
+**Where a download lands.** `<aloo home>/downloads/fileshare/<owner
+nickname>/<share>/<rel path>` - the owner's own folder layout, so a
+folder called `test` arrives as a folder called `test` with its subfolders
+under it. Kept apart from the plain downloads directory a `/file` send
+writes to, and one directory per person, so two people sharing a
+`notes.txt` never land on each other.
+
+**Folder names across platforms.** A share's name is its own final path
+component, under the *owner's* separator rules - `/` everywhere, `\` on
+Windows too - so a Linux or macOS folder whose name contains a backslash
+is announced under the name its own filesystem uses. What a request may
+name is likewise the owner's rule: `\` and `:` are a separator and a
+drive/stream marker on Windows and are refused there, while on Linux and
+macOS they are ordinary filename characters and such a file is served
+like any other, so a listing and the download that follows it always
+agree. A NUL byte is refused everywhere. Confinement never rests on that
+list - the canonicalized containment check is what enforces it.
+
+Going the other way, nothing the owner names can be unsafe for the
+requester to save: every component of
+`<downloads>/<owner>/<share>/<rel path>` goes through the same
+`safe_filename` an ordinary transfer uses, which strips path traversal,
+replaces the characters Windows forbids and prefixes its reserved device
+names - so a folder called `CON`, or a file called `a<b>|c.txt`, arrives
+under a name every one of the three platforms can create. A deep tree can
+still exceed Windows' own path limit; that surfaces as an ordinary failed
+transfer for the file in question, not as a corrupt one.
+
+**Pacing.** aloo cannot measure the internet speed itself, so the owner
+declares it: `file_sharing_link_speed_kbps` (upload, kilobits per second;
+`0` - the default - means unknown, no cap) and `file_sharing_max_pct`
+(default 50). Every shared send debits one token bucket
+(`shared_folders::SharePacer`) at `kbps * 1000 / 8 * pct / 100` bytes per
+second, so however many shared transfers run at once their total stays at
+that rate; an ordinary `/file` send is never paced. Both values apply
+live from `Ctrl+S`, to transfers already running. A shared send resumed
+from a restart's write-ahead record (§16.4) has lost its pacer and goes
+unpaced - the documented degradation.
+
+**Under the pad.** With a live one-time-pad session (§16) the file itself
+goes exactly as any other file does there - the offer and the content are
+two pad spends, acknowledged in turn (§16.2) - so shared downloads to a
+pad contact are as protected as anything else said to them, and as
+serialised. The six messages of this section are never pad-wrapped: like
+`DeviceIdAnnounce` and `ChannelPresence`, they are metadata sealed under
+`pq_hybrid`, not content.
+
+**Either side can stop it.** `SharedDownloadCancel` names a request the
+requester has given up on; the owner's own withdrawal travels the other
+way as `SharedDownloadDone` carrying `Cancelled`, which is what keeps a
+requester from waiting on files that are not coming. Both sides keep
+their own durable record of every transfer they took part in, so each
+can see, cancel and clear its half without the other being reachable.
+
+**Cancelling and resuming.** `SharedDownloadCancel` names a request the
+requester has given up on. The owner drops whatever is still queued for
+it; a file already in flight is left to finish or fail on its own, since
+the transport cannot unsend it and the requester discards it either way.
+On the requester's side every `.part` of that request is removed and
+every file already complete is kept - cancelling costs only what had not
+arrived. Resuming is the same request made again: there is no partial
+state to restart from, but every file already on disk at exactly the
+size being offered is refused as it is offered, so only what is genuinely
+missing moves. That same rule is what stops a folder being re-fetched
+whole when one file of it failed.
+
+**A link lost** drops everything both sides held for that peer - queued
+files, offers in flight, outstanding requests and tags, and the
+announced share list - rather than waiting on a link that may never
+return under the same id; the announce is repeated when it does. The
+requester's own downloads for that peer end the same way a cancel does:
+partial files removed, completed ones kept.
+
 ## 8. Encryption model
 
 **There is no shared/session key anywhere in this protocol outside the
@@ -4865,6 +5107,13 @@ is *when* that decision is made: a live stream decides once at
 where an OTP voice message has no chunks to gate - the decision is made
 once, the moment the whole clip finishes decrypting, and either the entire
 thing goes to the mixer at once or none of it does.
+
+**Shared-folder downloads** (§7.8) to a pad contact take this same path,
+file by file: each is an `OtpFileOffer` with its own spend, accepted by
+the requester without a popup, and its content a second spend - so a
+folder of ten files is twenty spends, each acknowledged in turn, one file
+at a time. Only the `SharedFileTag` ahead of each offer, and the
+listing/request/done messages around them, stay ordinary sealed metadata.
 
 ### 16.2.1 One conversation end to end: every spend, its acknowledgement, and its retries
 

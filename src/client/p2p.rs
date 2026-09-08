@@ -569,8 +569,17 @@ pub enum P2pEvent {
         from: UserId,
         envelope: crate::proto::Envelope,
     },
+    /// Any of the six sealed shared-folder payloads
+    /// (`p2p_proto::P2pPayload::SharedFolders` through
+    /// `SharedDownloadDone`, docs/PROTOCOL.md §7.8), still sealed - one
+    /// event for all of them, since the envelope's own `Content` tag is
+    /// what `session::shared` dispatches on once it has opened it.
+    SharedFolderMessage {
+        from: UserId,
+        envelope: crate::proto::Envelope,
+    },
 
-    /// Mirrors `p2p_proto::P2pPayload::CallInvite` - see
+    /// Mirrors `p2p_proto::P2pPayload::CallInvite" - see
     /// `crate::client::voice_call` for how a call's roster/audio are handled
     /// from here.
     CallInvite {
@@ -847,6 +856,15 @@ pub struct PeerLinkManager {
     /// the retry timer exists to escape. Every other test of that state
     /// constructs it; this loses a real one.
     test_drop_delivery_acks: usize,
+    /// Every payload handed to `send_reliable_or_queue`, kept only while
+    /// a test has asked for it (`record_sent_payloads_for_test`). Once a
+    /// link is `Active` a payload goes straight into the reliable layer
+    /// as encoded bytes, so `pending_payloads` - which reads the
+    /// not-yet-sent queue - can no longer show it. A test that needs a
+    /// genuinely reachable peer (a shared-folder send only starts for
+    /// one) reads what was decided here instead. `None` in every real
+    /// session, where nothing records anything.
+    test_sent_payloads: Option<Vec<(UserId, P2pPayload)>>,
     /// Whether content that cannot go out right now is handed to the
     /// session as `P2pEvent::Undeliverable` instead of being held in this
     /// manager's own short, in-memory queue (`queue_send_messages`,
@@ -909,6 +927,7 @@ impl PeerLinkManager {
                 addr_index: HashMap::new(),
                 direct: None,
                 test_drop_delivery_acks: 0,
+                test_sent_payloads: None,
                 spill_undeliverable: false,
                 queue_held: HashSet::new(),
                 events_tx,
@@ -1208,6 +1227,9 @@ impl PeerLinkManager {
     }
 
     fn send_reliable_inner(&mut self, peer: UserId, payload: P2pPayload, tag: Option<u64>) {
+        if let Some(recorded) = self.test_sent_payloads.as_mut() {
+            recorded.push((peer, payload.clone()));
+        }
         // Dropped before it reaches the reliable layer, so it is never
         // retransmitted either - a genuinely lost acknowledgement rather
         // than a delayed one. Only ever non-zero under a test.
@@ -1797,6 +1819,16 @@ impl PeerLinkManager {
             }
             P2pPayload::ChannelPresence { envelope } => {
                 P2pEvent::ChannelPresence { from, envelope }
+            }
+            P2pPayload::SharedFolders { envelope }
+            | P2pPayload::SharedListRequest { envelope }
+            | P2pPayload::SharedListResponse { envelope }
+            | P2pPayload::SharedDownloadRequest { envelope }
+            | P2pPayload::SharedFileTag { envelope }
+            | P2pPayload::SharedDownloadPlan { envelope }
+            | P2pPayload::SharedDownloadCancel { envelope }
+            | P2pPayload::SharedDownloadDone { envelope } => {
+                P2pEvent::SharedFolderMessage { from, envelope }
             }
             P2pPayload::KeyRotation {
                 rotation,
@@ -2932,6 +2964,18 @@ impl PeerLinkManager {
     }
 
     /// A snapshot of the direct-punch scheduler for the status line:
+    /// Every peer whose link is `Active` right now, however it was
+    /// arranged - server-introduced or serverless alike. What a
+    /// broadcast that must reach everyone reachable iterates
+    /// (`session::shared::broadcast_shared_folders`).
+    pub fn active_peers(&self) -> Vec<UserId> {
+        self.links
+            .iter()
+            .filter(|(_, l)| matches!(l.state, PeerLinkState::Active { .. }))
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     /// `(active, total, next attempt in)` - how many configured targets
     /// have an established link right now, how many are configured in
     /// total, and how long until the soonest target not already
@@ -3054,6 +3098,24 @@ impl PeerLinkManager {
             };
         }
         self.sync_statuses();
+    }
+
+    /// Starts recording every payload this manager is asked to send, for
+    /// a test whose peer is `Active` (see `test_sent_payloads`). Off
+    /// unless a test turns it on, so a real session records nothing.
+    pub fn record_sent_payloads_for_test(&mut self) {
+        self.test_sent_payloads = Some(Vec::new());
+    }
+
+    /// Everything `record_sent_payloads_for_test` has captured for
+    /// `peer`, oldest first - empty if recording was never turned on.
+    pub fn sent_payloads_for_test(&self, peer: UserId) -> Vec<P2pPayload> {
+        self.test_sent_payloads
+            .iter()
+            .flatten()
+            .filter(|(to, _)| *to == peer)
+            .map(|(_, payload)| payload.clone())
+            .collect()
     }
 
     pub fn pending_payloads(&self, peer: UserId) -> Vec<P2pPayload> {

@@ -131,6 +131,17 @@ pub async fn handle_send_text(
 /// DM counterpart of `channel::handle_send_file` - see there for the
 /// offer/accept/reject/stream shape. A DM has only one recipient, so this
 /// is a single transfer rather than a fan-out.
+/// Whether a send writes a row into the conversation. A `/file` send
+/// does - it is a thing one person did to another, and the row is where
+/// its progress and delivery marks live. A shared-folder send does not
+/// (`docs/PROTOCOL.md` §7.8): the requester went and fetched it, and it
+/// belongs on their Downloads list rather than in either side's chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFileRow {
+    Logged,
+    Silent,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut impl crate::control::ControlSink,
@@ -141,6 +152,7 @@ pub(crate) async fn handle_send_file(
     filename: String,
     size: u64,
     recipient_pubkey_der: Vec<u8>,
+    row: SendFileRow,
 ) -> proto::Result<()> {
     if !session.remote_keys.try_use(to) {
         return Ok(());
@@ -158,6 +170,7 @@ pub(crate) async fn handle_send_file(
             path,
             filename,
             size,
+            row,
         )
         .await;
     }
@@ -184,8 +197,17 @@ pub(crate) async fn handle_send_file(
         return Ok(());
     };
     session.next_stream_id += 1;
-    let (msg_id, delivery) = ui_state.start_delivery(&[to]);
-    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
+    // A silent send earns no delivery id either: nothing is tracking a
+    // row for it, and a receipt with nowhere to land is just a message
+    // the peer sends for no one.
+    let msg_id = match row {
+        SendFileRow::Logged => {
+            let (msg_id, delivery) = ui_state.start_delivery(&[to]);
+            ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
+            Some(msg_id)
+        }
+        SendFileRow::Silent => None,
+    };
     session.own_file_targets.insert(
         stream_id,
         crate::client::file_transfer::OwnFileTarget {
@@ -193,6 +215,7 @@ pub(crate) async fn handle_send_file(
             path,
             key,
             otp: None,
+            pacer: None,
         },
     );
     session.peer_link.ensure_link(wr, to).await;
@@ -201,7 +224,7 @@ pub(crate) async fn handle_send_file(
         P2pPayload::FileOffer {
             channel: None,
             stream_id,
-            msg_id: Some(msg_id),
+            msg_id,
             envelope,
         },
     );

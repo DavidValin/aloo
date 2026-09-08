@@ -412,7 +412,19 @@ impl UiState {
 
         // The user-info popup (`i`/`/info`) is the same "absorb every key,
         // Esc or `i` closes it" tier as message-info above.
-        if self.user_info.is_some() {
+        if let Some(info) = &self.user_info {
+            // Enter presses the popup's one button, "Browse shared files"
+            // - present only for a peer who has shared folders with us
+            // (`docs/SPEC.md` "Shared folders"). It replaces this popup
+            // with the browser; a peer with nothing shared has no button,
+            // and Enter does nothing.
+            if kind == KeyEventKind::Press && code == KeyCode::Enter {
+                let peer = info.peer;
+                if self.open_shared_browser(peer) {
+                    self.user_info = None;
+                }
+                return None;
+            }
             if kind == KeyEventKind::Press
                 && matches!(code, KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('I'))
             {
@@ -437,6 +449,18 @@ impl UiState {
         // on both would open and instantly close it. Both kinds return
         // `None` so the `Release` is absorbed rather than falling through
         // to a bare 'h'.
+        // The configured transfers shortcut (`ctrl+alt+d` unless the
+        // settings file says otherwise) toggles the global transfers
+        // popup from anywhere, the same tier as Ctrl+H and gated on
+        // `Press` for the same reason. Checked before the overlay below,
+        // so it works with the help open too.
+        if kind == KeyEventKind::Press && self.matches_transfers_shortcut(code, modifiers) {
+            match self.transfers_popup {
+                Some(_) => self.close_transfers_popup(),
+                None => self.open_transfers_popup(),
+            }
+            return None;
+        }
         if modifiers.contains(KeyModifiers::CONTROL)
             && matches!(code, KeyCode::Char('h') | KeyCode::Char('H'))
         {
@@ -558,6 +582,12 @@ impl UiState {
         }
         if self.mode == Mode::FileSend {
             return self.handle_file_send_key(code);
+        }
+        if self.mode == Mode::SharedFiles {
+            return self.handle_shared_browser_key(code);
+        }
+        if self.transfers_popup.is_some() {
+            return self.handle_transfers_popup_key(code);
         }
         if self.mode == Mode::Contacts {
             return self.handle_contacts_key(code);
@@ -1006,6 +1036,31 @@ impl UiState {
     /// Focuses the right-hand selector, opening the room it names. A no-op
     /// while no room has ever been opened - that selector isn't rendered
     /// at all then, and `]` from the channel one has nowhere to go.
+    /// Whether this key is the configured transfers shortcut. A letter
+    /// is compared lowercased, so the chord works whether or not shift
+    /// happened to be down, and every modifier must match exactly - a
+    /// chord without shift must not fire on the shifted key.
+    pub(crate) fn matches_transfers_shortcut(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        use crate::settings::KeyChordKey;
+        let chord = &self.transfers_shortcut;
+        if modifiers.contains(KeyModifiers::CONTROL) != chord.ctrl
+            || modifiers.contains(KeyModifiers::ALT) != chord.alt
+        {
+            return false;
+        }
+        match (&chord.key, code) {
+            (KeyChordKey::Char(want), KeyCode::Char(got)) => {
+                got.to_ascii_lowercase() == want.to_ascii_lowercase()
+            }
+            (KeyChordKey::Function(want), KeyCode::F(got)) => *want == got,
+            _ => false,
+        }
+    }
+
     pub(crate) fn focus_dm_selector(&mut self) {
         let Some(peer) = self.selected_dm else {
             return;

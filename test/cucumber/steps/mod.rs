@@ -34,6 +34,7 @@ pub mod presence;
 pub mod reconnect;
 pub mod server;
 pub mod settings;
+pub mod shared_folders;
 pub mod status;
 pub mod ui_common;
 pub mod voice;

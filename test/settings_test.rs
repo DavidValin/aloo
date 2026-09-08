@@ -554,6 +554,8 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
         "# direct_punch_to=bob,bobhost.com:19000,every_1m",
         "# direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m",
         "# direct_punch_channel=direct-punches,the-hall",
+        "# share=~/Public,all",
+        "# share=~/Photos,alice,bob",
         "# server_superadmin=somenickname",
     ] {
         assert!(
@@ -568,6 +570,7 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
     // default rather than picking up "the-hall".
     assert_eq!(settings.direct_punch_channels, vec!["direct-punches".to_string()]);
     assert!(settings.server_superadmin.is_empty());
+    assert!(settings.shares.is_empty());
     std::fs::remove_file(&path).ok();
 }
 
@@ -638,6 +641,11 @@ direct_punch_port=7879\n\
 # direct_punch_to=bob,bobhost.com:19000,every_1m\n\
 # direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m\n\
 # direct_punch_channel=direct-punches,the-hall\n\
+transfers_shortcut=ctrl+alt+d\n\
+file_sharing_link_speed_kbps=0\n\
+file_sharing_max_pct=50\n\
+# share=~/Public,all\n\
+# share=~/Photos,alice,bob\n\
 noip_when_no_server_and_direct_punch_is_active=off\n\
 noip_hostname=\n\
 noip_username=\n\

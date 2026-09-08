@@ -260,6 +260,52 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
          Declining shows as rejected in your log.",
     ),
     HelpLine::Blank,
+    HelpLine::Heading("Shared folders"),
+    HelpLine::Item {
+        keys: "Ctrl+S > File Sharing",
+        text: "share a folder of yours with everyone, or with the nicknames you list (a: add, \
+               Enter/e: edit, d: delete - saved and announced at once), and cap what shared \
+               downloads may use of your upload speed (file_sharing_link_speed_kbps, \
+               file_sharing_max_pct).",
+    },
+    HelpLine::Item {
+        keys: "/info > Enter",
+        text: "Browse shared files - the button is there only for someone who shares \
+               something with you. Opening their DM says so once: '<nickname> has given \
+               you access to files, type /info to access'.",
+    },
+    HelpLine::Item {
+        keys: "Enter / Backspace / d / Esc",
+        text: "in the browser's Files tab: open a folder / go up / download the selected \
+               file or whole folder / close. Rows show name, created, updated and size. \
+               A download needs no Accept popup - you asked for it - and keeps the owner's \
+               own layout under ~/.aloo/downloads/fileshare/<nickname>/<folder>/.",
+    },
+    HelpLine::Item {
+        keys: "Tab",
+        text: "switch between their folders and your Downloads. While anything is arriving \
+               the tab reads 'Downloading <n>...', and the header shows a blinking yellow \
+               down arrow with the current speed.",
+    },
+    HelpLine::Item {
+        keys: "Ctrl+Alt+D",
+        text: "the transfers popup: every file-share transfer, both directions and every \
+               person - what you are pulling from others and what others are pulling from \
+               your shared folders. Tab narrows it to downloads or uploads. The history \
+               survives a restart, and the key itself is transfers_shortcut in \
+               ~/.aloo/settings (Ctrl+S > General).",
+    },
+    HelpLine::Item {
+        keys: "c / r / x / X",
+        text: "on the Downloads tab: cancel a running download, resume a stopped one, remove \
+               a finished row, clear every finished row. Running ones are listed above \
+               finished ones, each with a progress bar. Cancelling keeps every file that \
+               already arrived and drops only what was half-written; resuming moves only \
+               what is still missing. None of this is written into the conversation - only \
+               a /file send is. The same four keys work in the Ctrl+Alt+D popup, where \
+               'c' also stops an upload someone is pulling from you.",
+    },
+    HelpLine::Blank,
     HelpLine::Heading("Live voice calls"),
     HelpLine::Item {
         keys: "/call",
@@ -494,7 +540,7 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
     HelpLine::Blank,
     HelpLine::Item {
         keys: "Ctrl+S",
-        text: "settings, in three tabs (Tab switches, \u{2191}/\u{2193} pick a field, Space \
+        text: "settings, in four tabs (Tab switches, \u{2191}/\u{2193} pick a field, Space \
                flips a switch, typing fills a box, Esc closes). Every change is saved to \
                ~/.aloo/settings the moment you make it - there is no Save button, and a \
                gray line under each tab says what every field does, including whether it \

@@ -4193,6 +4193,8 @@ fn no_popup_shows_the_view_behind_it() {
         stream_id: 7,
         channel: None,
         otp_contact_name: None,
+        auto_dest: None,
+        shared_request_id: None,
     };
 
     /// One popup under test: the title its border carries, and what opens
