@@ -61,6 +61,16 @@ pub struct SharedJob {
     pub total: u32,
     pub finished: u32,
     pub error: Option<SharedError>,
+    /// The requester's nickname as it was when this job opened - the
+    /// name its transfer record is filed under.
+    ///
+    /// Remembered rather than looked up again each time, because every
+    /// later update would otherwise depend on the peer still being in
+    /// `known_users`: one who has gone offline or come back under a new
+    /// `UserId` resolves to no name, the record is then never found, and
+    /// the row sits at "transferring" for good with nothing left that
+    /// could ever close it.
+    pub peer_name: String,
 }
 
 /// How many of a requester's files the owner offers at once. More than
@@ -77,6 +87,9 @@ pub struct SharedSending {
     /// The file's size, credited to the upload's own progress once it is
     /// over - the sender has no receive events to count from.
     pub size: u64,
+    /// Bytes the worker has reported putting on the wire so far, so each
+    /// report contributes only what is new to the header's upload speed.
+    pub sent: u64,
     pub since: Instant,
 }
 
@@ -432,6 +445,7 @@ pub async fn on_shared_event(
                     total: files.len() as u32,
                     finished: 0,
                     error,
+                    peer_name: peer_name_for_record.clone(),
                 },
             );
             let queue = session.shared_send_queue.entry(peer).or_default();
@@ -597,6 +611,7 @@ pub async fn pump_shared_sends(
             SharedSending {
                 request_id: next.request_id,
                 size: next.file.size,
+                sent: 0,
                 since: Instant::now(),
             },
         );
@@ -626,17 +641,13 @@ fn finish_job_file(
     sent: Option<u64>,
 ) {
     use crate::client::transfer_log::TransferDirection::Upload;
-    let peer_name = ui_state
-        .known_users
-        .get(&peer)
-        .map(|u| u.name.clone())
-        .unwrap_or_default();
-    if let Some(size) = sent {
-        ui_state.on_upload_file_done(&peer_name, request_id, size);
-    }
     let Some(job) = session.shared_jobs.get_mut(&(peer, request_id)) else {
         return;
     };
+    let peer_name = job.peer_name.clone();
+    if let Some(size) = sent {
+        ui_state.on_upload_file_done(&peer_name, request_id, size);
+    }
     job.finished += 1;
     if job.finished >= job.total {
         let job = session
@@ -828,7 +839,41 @@ pub async fn on_shared_folder_message(
             if let Some(queue) = session.shared_send_queue.get_mut(&from) {
                 queue.retain(|q| q.request_id != cancel.request_id);
             }
-            session.shared_jobs.remove(&(from, cancel.request_id));
+            // The name the row is filed under, taken from the job while
+            // it is still here - for the same reason `SharedJob::peer_name`
+            // exists at all: `known_users` may no longer hold this peer.
+            let named = session
+                .shared_jobs
+                .remove(&(from, cancel.request_id))
+                .map(|job| job.peer_name)
+                .unwrap_or_else(|| sender.name.clone());
+            // Files of this request already on the wire cannot be
+            // unsent, but they must stop being *attributed* to it: their
+            // completions would otherwise be credited to whatever job
+            // next carries this id - a resume of the very same transfer -
+            // and drive it to "every file sent" while most of them were
+            // still queued. The requester then saw the download complete,
+            // its own row went inactive, and cancelling again did
+            // nothing, which left this side transferring for good.
+            session
+                .shared_request_of_stream
+                .retain(|_, (peer, id)| !(*peer == from && *id == cancel.request_id));
+            session
+                .shared_sending
+                .retain(|(peer, _), sending| {
+                    !(*peer == from && sending.request_id == cancel.request_id)
+                });
+            // And this side's own row says so. Without it the sender went
+            // on showing an upload in progress for a download the other
+            // end had already given up on - nothing was left to finish
+            // the record, since removing the job above is exactly what
+            // stops `finish_job_file` ever closing it.
+            ui_state.cancel_transfer(
+                crate::client::transfer_log::TransferDirection::Upload,
+                &named,
+                cancel.request_id,
+            );
+            ui_state.transfers.save_or_warn();
         }
         Content::SharedDownloadPlan => {
             let Ok(plan) = proto::decode::<SharedDownloadPlan>(&plaintext) else {
@@ -1127,8 +1172,44 @@ pub async fn resume_shared_download(
         );
         return Ok(());
     };
-    ui_state.clear_shared_download(request_id);
-    request_shared_download(wr, ui_state, session, peer, share, rel_path).await
+    // Asked again under the *same* request id, so this is the same
+    // transfer carrying on rather than a second one: the row here is
+    // reset in place, and the owner - which keys its own record by
+    // direction, peer and id - refreshes the row it already has instead
+    // of opening another. A new id gave both sides a duplicate item for
+    // what the user thinks of as one download.
+    ui_state.restart_shared_download(request_id);
+    session.shared_requests.insert(
+        request_id,
+        PendingSharedRequest {
+            peer,
+            share: share.clone(),
+            rel_path: rel_path.clone(),
+            kind: SharedRequestKind::Download,
+            // No longer given up on, so the files it brings are accepted
+            // again rather than refused as a cancelled request's.
+            cancelled: false,
+        },
+    );
+    let req = SharedDownloadRequest {
+        request_id,
+        share,
+        rel_path,
+    };
+    session.peer_link.ensure_link(wr, peer).await;
+    if !send_sealed(
+        session,
+        ui_state,
+        peer,
+        Content::SharedDownloadRequest,
+        &req,
+        |envelope| P2pPayload::SharedDownloadRequest { envelope },
+    ) {
+        session.shared_requests.remove(&request_id);
+        ui_state.finish_shared_download(request_id, Some("could not ask again".to_string()));
+    }
+    ui_state.transfers.save_or_warn();
+    Ok(())
 }
 
 /// Whoever is currently connected under `nickname`, if anyone.
@@ -1224,6 +1305,25 @@ pub async fn drain_auto_accepts(
         super::ui_action::accept_file_offer(wr, ui_state, session, from, stream_id).await?;
     }
     Ok(())
+}
+
+/// One shared file's bytes have gone out - only what is new feeds the
+/// header's upload figure. Reports whether this stream was a shared send
+/// at all, which is what keeps an ordinary `/file` send off it.
+pub fn on_shared_send_progress(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+    stream_id: u64,
+    sent: u64,
+) -> bool {
+    let Some(sending) = session.shared_sending.get_mut(&(peer, stream_id)) else {
+        return false;
+    };
+    let delta = sent.saturating_sub(sending.sent);
+    sending.sent = sent;
+    ui_state.on_shared_upload_progress(delta, Instant::now());
+    true
 }
 
 /// One shared file's bytes have landed - the download's own total gains

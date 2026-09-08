@@ -2961,10 +2961,14 @@ it; a file already in flight is left to finish or fail on its own, since
 the transport cannot unsend it and the requester discards it either way.
 On the requester's side every `.part` of that request is removed and
 every file already complete is kept - cancelling costs only what had not
-arrived. Resuming is the same request made again: there is no partial
-state to restart from, but every file already on disk at exactly the
-size being offered is refused as it is offered, so only what is genuinely
-missing moves. That same rule is what stops a folder being re-fetched
+arrived. Resuming is the same request made again, **under the same request id**:
+it is one transfer carrying on, not a second one, so each side refreshes
+the record it already has rather than opening a duplicate. There is no
+partial state to restart from, but every file already on disk at exactly
+the size being offered is refused as it is offered, so only what is
+genuinely missing moves. The requester clears the cancelled mark as it
+asks again, or the files it brings would be refused as the abandoned
+request's. That same rule is what stops a folder being re-fetched
 whole when one file of it failed.
 
 **A link lost** drops everything both sides held for that peer - queued

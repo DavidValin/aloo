@@ -1308,6 +1308,137 @@ async fn offers_still_arriving_after_a_cancel_are_refused_not_offered() {
     w.cleanup();
 }
 
+/// Cancel, then resume: the same transfer carrying on, not a second
+/// one. Both sides key their record by the request id, so asking again
+/// under the same id refreshes the row each already has rather than
+/// opening a duplicate - and the row leaves "asking..." when the owner's
+/// plan lands.
+/// @requirement AC-464
+#[tokio::test]
+async fn resuming_reuses_the_same_transfer_rather_than_starting_another() {
+    let mut w = world("resume-plan").await;
+    w.open_link(ALICE).await;
+    shared::request_shared_download(
+        &mut NullSink,
+        &mut w.ui,
+        &mut w.session,
+        ALICE,
+        "Photos".into(),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    let first = shared_payloads::<SharedDownloadRequest>(
+        &mut w,
+        ALICE,
+        true,
+        Content::SharedDownloadRequest,
+    );
+    assert_eq!(first.len(), 1);
+    let request_id = first[0].request_id;
+
+    shared::cancel_shared_download(&mut NullSink, &mut w.ui, &mut w.session, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        w.ui.shared_download(request_id).map(|d| d.status.label()),
+        Some("cancelled".to_string())
+    );
+
+    shared::resume_shared_download(&mut NullSink, &mut w.ui, &mut w.session, request_id)
+        .await
+        .unwrap();
+
+    let asks = shared_payloads::<SharedDownloadRequest>(
+        &mut w,
+        ALICE,
+        true,
+        Content::SharedDownloadRequest,
+    );
+    assert_eq!(asks.len(), 2, "resuming asks again");
+    assert_eq!(
+        asks[1].request_id, request_id,
+        "under the same id, so neither side opens a second item"
+    );
+    assert_eq!(
+        w.ui.transfers.records().len(),
+        1,
+        "and there is still exactly one row for it"
+    );
+    assert_eq!(
+        w.ui.shared_download(request_id).map(|d| d.status.label()),
+        Some("asking...".to_string()),
+        "waiting on the owner again"
+    );
+
+    // The owner answers with what it covers, and the row moves on.
+    let plan = aloo::client::shared_folders::SharedDownloadPlan {
+        request_id,
+        files: 3,
+        bytes: 3_000,
+    };
+    let envelope = w.sealed_from(
+        &w.alice,
+        70,
+        Content::SharedDownloadPlan,
+        &proto::encode(&plan).unwrap(),
+    );
+    shared::on_shared_folder_message(&mut w.ui, &mut w.session, ALICE, envelope)
+        .await
+        .unwrap();
+
+    let row = w.ui.shared_download(request_id).expect("the resumed row");
+    assert_eq!(row.status.label(), "transferring", "it is no longer asking");
+    assert_eq!(row.files_total, Some(3));
+    assert_eq!(row.bytes_total, Some(3_000));
+
+    // And a file it brings is accepted, not refused as a cancelled
+    // request's would be.
+    let stream_id = 91;
+    let tag = SharedFileTag {
+        request_id,
+        stream_id,
+        rel_path: "a.txt".into(),
+    };
+    let envelope = w.sealed_from(
+        &w.alice,
+        71,
+        Content::SharedFileTag,
+        &proto::encode(&tag).unwrap(),
+    );
+    shared::on_shared_folder_message(&mut w.ui, &mut w.session, ALICE, envelope)
+        .await
+        .unwrap();
+    let offer = aloo::client::file_transfer::FileOfferPayload {
+        filename: "a.txt".into(),
+        size: 4,
+    };
+    let envelope = w.sealed_from(
+        &w.alice,
+        72,
+        Content::FileOffer,
+        &proto::encode(&offer).unwrap(),
+    );
+    w.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::FileOffer {
+            channel: None,
+            from: ALICE,
+            stream_id,
+            msg_id: Some(1),
+            envelope,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut w.ui, &mut w.session)
+        .await
+        .unwrap();
+    assert!(w.ui.file_offer_open().is_none(), "still no popup");
+    let accepted = w
+        .queued(ALICE)
+        .into_iter()
+        .any(|p| matches!(p, P2pPayload::FileAccept { stream_id: s } if s == stream_id));
+    assert!(accepted, "a resumed download's files are accepted again");
+    w.cleanup();
+}
+
 /// @requirement TB-302
 #[tokio::test]
 async fn a_lost_link_drops_what_was_queued_for_that_peer() {

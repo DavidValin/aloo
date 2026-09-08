@@ -1379,13 +1379,16 @@ pub struct UiState {
     /// whole thing. Deliberately not the message log: a transfer is
     /// something one side fetched, not something either side said (§7.8).
     pub transfers: crate::client::transfer_log::TransferLog,
-    /// The rolling byte window behind the header's download indicator.
+    /// The rolling byte windows behind the header's two speed figures.
     pub(crate) download_speed: super::shared_downloads::DownloadSpeed,
+    pub(crate) upload_speed: super::shared_downloads::DownloadSpeed,
     /// What that indicator currently shows, in kilobits per second -
     /// `None` when nothing is arriving. Refreshed on the session's ticker
     /// rather than computed at render time, so drawing a frame never
     /// depends on the clock (the same split `direct_punch_status` uses).
     pub fileshare_download_kbps: Option<u64>,
+    /// The same for what is going out of this client's shared folders.
+    pub fileshare_upload_kbps: Option<u64>,
     /// Offers that arrived with an `auto_dest` (`PendingFileOffer`) and
     /// are waiting for the session to accept them - `push_file_offer`
     /// parks them here instead of the popup queue, and
@@ -1564,7 +1567,9 @@ impl UiState {
             shared_browser: None,
             transfers: crate::client::transfer_log::TransferLog::default(),
             download_speed: super::shared_downloads::DownloadSpeed::default(),
+            upload_speed: super::shared_downloads::DownloadSpeed::default(),
             fileshare_download_kbps: None,
+            fileshare_upload_kbps: None,
             auto_accept_offers: Vec::new(),
             users_admin: None,
             cpu_usage_pct: 0.0,

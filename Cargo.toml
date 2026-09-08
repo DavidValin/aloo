@@ -162,6 +162,10 @@ name = "shared_folders_test"
 path = "test/shared_folders_test.rs"
 
 [[test]]
+name = "shared_two_sides_test"
+path = "test/shared_two_sides_test.rs"
+
+[[test]]
 name = "shared_session_test"
 path = "test/shared_session_test.rs"
 

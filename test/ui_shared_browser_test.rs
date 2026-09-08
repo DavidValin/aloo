@@ -717,6 +717,68 @@ fn a_finished_download_reads_as_done_and_a_cancelled_one_as_cancelled() {
     assert_eq!(stopped.fraction(), Some(0.25), "what it had got is kept");
 }
 
+/// The header names both directions: what is arriving and what is going
+/// out, each with its own arrow, and neither once it is over.
+/// @requirement AC-465
+#[test]
+fn the_header_shows_an_upload_arrow_too() {
+    use aloo::client::transfer_log::{TransferDirection, TransferRecord, TransferStatus};
+    let mut state = joined_general_with(vec![]);
+    state.transfers.start(TransferRecord {
+        request_id: 1,
+        direction: TransferDirection::Upload,
+        peer_name: "bob".into(),
+        share: "Photos".into(),
+        rel_path: String::new(),
+        status: TransferStatus::Running,
+        files_total: Some(2),
+        bytes_total: Some(2_000),
+        files_done: 0,
+        bytes_done: 0,
+        files_skipped: 0,
+        started_unix: 100,
+    });
+    let now = std::time::Instant::now();
+    state.on_shared_upload_progress(50_000, now);
+    state.tick_transfer_speeds(now);
+    let up = state.fileshare_upload_kbps.expect("a speed while sending");
+    assert!(up > 0);
+    assert!(
+        state.fileshare_download_kbps.is_none(),
+        "nothing is coming in, so no download figure"
+    );
+
+    state.blink_on = true;
+    let rows = rendered_rows_at(&state, 150, 40);
+    let header = rows
+        .iter()
+        .find(|r| r.contains("Conn:"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no header row in {rows:?}"));
+    assert!(header.contains('\u{2191}'), "the up arrow is shown: {header}");
+    assert!(header.contains(&format!("{up} kbps")), "{header}");
+    assert!(!header.contains('\u{2193}'), "and not the down one: {header}");
+
+    // Both at once, when this client is doing both.
+    state.start_shared_download(2, BOB, "alice".into(), "Photos".into(), String::new());
+    state.set_shared_download_plan(2, 1, 1_000);
+    state.on_shared_download_progress(2, 80_000, now);
+    state.tick_transfer_speeds(now);
+    let rows = rendered_rows_at(&state, 150, 40);
+    let header = rows.iter().find(|r| r.contains("Conn:")).cloned().unwrap();
+    assert!(
+        header.contains('\u{2191}') && header.contains('\u{2193}'),
+        "both arrows when both are moving: {header}"
+    );
+
+    // Nothing running: neither figure is shown.
+    state.finish_transfer(TransferDirection::Upload, "bob", 1, None);
+    state.finish_shared_download(2, None);
+    state.tick_transfer_speeds(now);
+    assert!(state.fileshare_upload_kbps.is_none());
+    assert!(state.fileshare_download_kbps.is_none());
+}
+
 /// The header says something is arriving, and stops saying it when
 /// nothing is.
 /// @requirement AC-465
@@ -725,7 +787,7 @@ fn the_header_shows_a_blinking_arrow_and_the_speed_while_downloading() {
     let mut state = browser_with_downloads();
     let now = std::time::Instant::now();
     state.on_shared_download_progress(1, 100_000, now);
-    state.tick_download_speed(now);
+    state.tick_transfer_speeds(now);
     let kbps = state.fileshare_download_kbps.expect("a speed while running");
     assert!(kbps > 0, "{kbps}");
 
@@ -744,7 +806,7 @@ fn the_header_shows_a_blinking_arrow_and_the_speed_while_downloading() {
     // Nothing running: nothing shown.
     state.finish_shared_download(1, None);
     state.finish_shared_download(2, None);
-    state.tick_download_speed(now);
+    state.tick_transfer_speeds(now);
     assert!(state.fileshare_download_kbps.is_none());
 }
 

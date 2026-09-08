@@ -1428,7 +1428,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // What the header's download arrow shows (§7.8) - read
                 // off the byte window here rather than at render time,
                 // like every other header figure.
-                ui_state.tick_download_speed(Instant::now());
+                ui_state.tick_transfer_speeds(Instant::now());
                 // Republish each in-flight pad transfer's link depth for
                 // its worker thread to pace against - the worker cannot
                 // reach into `peer_link` itself (`otp_pad::OutgoingPad`'s
@@ -3047,7 +3047,18 @@ async fn handle_file_event(
             if let Some(seen) = session.otp_sending_streams.get_mut(&stream_id) {
                 *seen = Instant::now();
             }
-            ui_state.set_file_progress(me, stream_id, bytes)
+            // A shared send has no row in the log to update, but its
+            // bytes are what the header's upload figure counts (§7.8).
+            let peer = session
+                .shared_request_of_stream
+                .get(&stream_id)
+                .map(|(peer, _)| *peer);
+            match peer {
+                Some(peer) => {
+                    shared::on_shared_send_progress(session, ui_state, peer, stream_id, bytes);
+                }
+                None => ui_state.set_file_progress(me, stream_id, bytes),
+            }
         }
         file_transfer::FileEvent::SendDone { stream_id } => {
             session.otp_sending_streams.remove(&stream_id);

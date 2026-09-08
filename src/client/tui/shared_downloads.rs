@@ -40,7 +40,8 @@ struct SpeedSample {
     bytes: u64,
 }
 
-/// The rolling window behind `UiState::fileshare_download_speed_bps`.
+/// A rolling window of bytes moved, behind each of the header's two
+/// speed figures - one per direction (`UiState::tick_transfer_speeds`).
 #[derive(Debug, Default)]
 pub struct DownloadSpeed {
     samples: Vec<SpeedSample>,
@@ -170,6 +171,10 @@ impl UiState {
         if let Some(item) = self
             .transfers
             .get_mut(TransferDirection::Upload, peer_name, request_id)
+            // A file finishing after the transfer was cancelled must not
+            // keep the counts moving - it was already in flight when the
+            // other end gave up, and the row is history now.
+            .filter(|item| item.status.is_active())
         {
             item.files_done += 1;
             item.bytes_done = item.bytes_done.saturating_add(size);
@@ -215,6 +220,23 @@ impl UiState {
                     SharedDownloadStatus::Completed
                 }
             };
+        }
+    }
+
+    /// Puts a stopped download back to waiting on its owner, in place -
+    /// what resuming does, since it is the same transfer asked for
+    /// again rather than a new one. The counts start over because every
+    /// file is offered again; the ones already on disk are refused as
+    /// they arrive and counted as skipped (`already_have`).
+    pub fn restart_shared_download(&mut self, request_id: u64) {
+        if let Some(item) = self.transfers.download_mut(request_id) {
+            item.status = SharedDownloadStatus::Asking;
+            item.files_total = None;
+            item.bytes_total = None;
+            item.files_done = 0;
+            item.bytes_done = 0;
+            item.files_skipped = 0;
+            item.started_unix = crate::client::transfer_log::now_unix();
         }
     }
 
@@ -325,6 +347,22 @@ impl UiState {
         }
         self.download_speed.bytes_per_second(now)
     }
+
+    /// The same figure for what is going *out* of this client's shared
+    /// folders. Both sides of a pair can show both at once: a peer can be
+    /// serving one folder while pulling another.
+    pub fn fileshare_upload_speed_bps(&mut self, now: Instant) -> Option<f64> {
+        if self.transfers.active_in(TransferDirection::Upload) == 0 {
+            return None;
+        }
+        self.upload_speed.bytes_per_second(now)
+    }
+
+    /// Bytes of a shared *upload* that have gone out - `delta` is what is
+    /// new since the last report for that file.
+    pub fn on_shared_upload_progress(&mut self, delta: u64, now: Instant) {
+        self.upload_speed.record(delta, now);
+    }
 }
 
 /// Bytes per second as the header spells it - kilobits, since that is
@@ -335,8 +373,10 @@ pub fn kbps_of(bytes_per_second: f64) -> u64 {
 }
 
 impl UiState {
-    /// Recomputes what the header shows, on the session's own ticker.
-    pub fn tick_download_speed(&mut self, now: Instant) {
+    /// Recomputes both of the header's speed figures, on the session's
+    /// own ticker rather than at render time.
+    pub fn tick_transfer_speeds(&mut self, now: Instant) {
         self.fileshare_download_kbps = self.fileshare_download_speed_bps(now).map(kbps_of);
+        self.fileshare_upload_kbps = self.fileshare_upload_speed_bps(now).map(kbps_of);
     }
 }

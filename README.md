@@ -416,7 +416,8 @@ files arriving at once, and running ones listed above finished ones.
 Cancel one and everything already downloaded stays; resume it and only
 the missing files move. A file being written is a `.part` until it's
 whole, so nothing half-arrived looks finished. While anything is
-downloading the header shows a blinking `↓` and the speed.
+moving the header shows a blinking `↓` with the speed coming in, an `↑`
+with the speed going out, or both.
 
 **`Ctrl+D`** opens the transfers popup: everything you've pulled from
 anyone, alongside everything anyone has pulled from your shared folders,
