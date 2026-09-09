@@ -129,6 +129,7 @@ fn attach_messages_round_trip_through_a_frame() {
             KeyModifiers::NONE,
             KeyEventKind::Press,
         )),
+        AttachMessage::Paste("hi bob\nhow are you".to_string()),
         AttachMessage::Resize { cols: 80, rows: 24 },
         AttachMessage::Detach,
         AttachMessage::Status,
@@ -511,6 +512,23 @@ async fn attaching_forwards_keys_and_resizes_and_detaches_cleanly() {
             assert_eq!(key.code, KeyCode::Char('x'));
         }
         other => panic!("expected a key, got {other:?}"),
+    }
+
+    // A paste reaches it whole, newlines included - the same
+    // `Event::Paste` a terminal-owning session gets from bracketed paste,
+    // never fragmented into per-character keys.
+    client
+        .write_all(
+            &daemon_ipc::encode_frame(&AttachMessage::Paste("hi bob\nhow are you".to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    match next_input(&mut input_rx).await {
+        SessionInput::Key(crossterm::event::Event::Paste(text)) => {
+            assert_eq!(text, "hi bob\nhow are you");
+        }
+        other => panic!("expected a paste, got {other:?}"),
     }
 
     // A resize reaches it too - otherwise frames stay laid out for a

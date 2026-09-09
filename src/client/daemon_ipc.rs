@@ -206,6 +206,13 @@ pub enum AttachMessage {
         supports_key_release: bool,
     },
     Key(KeyWire),
+    /// One whole paste from the viewer's terminal (its bracketed-paste
+    /// `Event::Paste`, newlines and all), delivered as the single unit
+    /// `UiState::handle_paste` expects rather than fragmented into `Key`s -
+    /// the daemon has no terminal of its own, so this is the only way a
+    /// paste ever reaches it. Appended after `Resize` so every earlier
+    /// variant keeps its bincode tag.
+    Paste(String),
     Resize { cols: u16, rows: u16 },
     /// The viewer is leaving; the daemon keeps running. Sent on Ctrl+C in
     /// the attached terminal, which the client answers itself rather than
