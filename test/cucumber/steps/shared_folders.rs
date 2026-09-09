@@ -177,6 +177,7 @@ async fn peer_offers_requested_file(w: &mut AlooWorld, name: String, filename: S
         otp_contact_name: None,
         auto_dest: Some(std::path::PathBuf::from("/tmp/aloo-shared/beach.jpg")),
         shared_request_id: Some(1),
+        shared_attempt: None,
     });
     assert!(!shown, "a file this side asked for never becomes a popup");
 }

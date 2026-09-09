@@ -5626,6 +5626,7 @@ pub async fn on_file_offer(
         otp_contact_name: Some(contact_name),
         auto_dest: None,
         shared_request_id: None,
+        shared_attempt: None,
     };
     // Same as the plain path: a shared-folder download's offer is
     // accepted without the popup (§7.8), pad spend and all.

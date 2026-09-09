@@ -137,6 +137,14 @@ pub struct SharedListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedDownloadRequest {
     pub request_id: u64,
+    /// Which ask for this request this is. A resume re-uses the request
+    /// id, so the id alone cannot tell one round of it from the next -
+    /// and every one of these messages can arrive after the round it
+    /// belongs to is over, since a folder walk, a file in flight and a
+    /// cancel all take time. Both sides drop anything not stamped with
+    /// the attempt they are on, which is what stops a late message from
+    /// a finished round acting on the current one.
+    pub attempt: u32,
     pub share: String,
     pub rel_path: String,
 }
@@ -149,6 +157,8 @@ pub struct SharedDownloadRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedFileTag {
     pub request_id: u64,
+    /// The attempt this file belongs to (`SharedDownloadRequest::attempt`).
+    pub attempt: u32,
     pub stream_id: u64,
     pub rel_path: String,
 }
@@ -160,6 +170,8 @@ pub struct SharedFileTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedDownloadPlan {
     pub request_id: u64,
+    /// The attempt this plan is for (`SharedDownloadRequest::attempt`).
+    pub attempt: u32,
     pub files: u32,
     pub bytes: u64,
 }
@@ -172,6 +184,8 @@ pub struct SharedDownloadPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedDownloadCancel {
     pub request_id: u64,
+    /// The attempt being cancelled (`SharedDownloadRequest::attempt`).
+    pub attempt: u32,
 }
 
 /// `Content::SharedDownloadDone`: the owner has offered every file the
@@ -179,6 +193,10 @@ pub struct SharedDownloadCancel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedDownloadDone {
     pub request_id: u64,
+    /// The attempt being closed (`SharedDownloadRequest::attempt`). A
+    /// requester that has since asked again ignores this, so the answer
+    /// to a cancel cannot close the round that replaced it.
+    pub attempt: u32,
     pub files: u32,
     pub error: Option<SharedError>,
 }
@@ -506,9 +524,22 @@ pub fn share_root_problem(folder: &SharedFolder) -> Option<String> {
 /// `file_transfer::default_download_dir()` so a browsed download and a
 /// file someone sent with `/file` never land in the same heap.
 pub fn fileshare_download_dir(owner_nickname: &str) -> PathBuf {
-    crate::client::file_transfer::default_download_dir()
-        .join("fileshare")
-        .join(crate::client::file_transfer::safe_filename(owner_nickname))
+    fileshare_root().join(crate::client::file_transfer::safe_filename(owner_nickname))
+}
+
+/// `<aloo home>/downloads/fileshare` - everything pulled from someone
+/// else's shared folders lives under here, one directory per owner
+/// beneath it, kept apart from what people have *sent* this client with
+/// `/file`.
+///
+/// This is the root `SessionState::shared_download_dir` is set to, and so
+/// the one `download_dest` builds every destination from. It has to be:
+/// the destination a download is written to, the destination a finished
+/// file is renamed to, and the destination the next round tests with
+/// `already_have` are all this same computation, so a resume moves only
+/// what is missing exactly as long as they agree.
+pub fn fileshare_root() -> PathBuf {
+    crate::client::file_transfer::default_download_dir().join("fileshare")
 }
 
 /// `<fileshare dir>/<share>/<rel_path>` - the folder layout as the owner

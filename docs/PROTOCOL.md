@@ -256,7 +256,7 @@ the payload carried inside a reliable or unreliable one.
 | `OtpPadCommit` / `OtpPadCommitAck` | reliably | Both sides' digests matched: the sender has installed, the receiver may too, and confirms it has (§16.1) |
 | `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
 | `ChannelPresence` | reliably | This side's joined channels, sealed - what turns a serverless punched path into a peer in shared channels (§7.1.5) |
-| `KeyRotation` | reliably | A signed encryption-key rotation, carried on the link instead of relayed - what keeps forward secrecy working with no server in reach (§13.10, §7.1.5) |
+| `KeyRotation` | reliably | A signed encryption-key rotation, carried on the link whenever there is one - in order with the sends around it - and relayed only for a peer with no live link (§13.10, §7.1.5) |
 | `CallInvite` | reliably | Proposes a live voice call (§7.7) |
 | `CallAccept` | reliably | Joins a call, or replies to a newly-discovered participant - the mesh's only signal (§7.7) |
 | `CallReject` | reliably | Declines an invite, sent only to whoever sent it (§7.7) |
@@ -2959,6 +2959,15 @@ can see, cancel and clear its half without the other being reachable.
 requester has given up on. The owner drops whatever is still queued for
 it; a file already in flight is left to finish or fail on its own, since
 the transport cannot unsend it and the requester discards it either way.
+Either side's cancel also **detaches** those in-flight files from the
+request - the owner's own cancel as much as the requester's. They must
+stop being credited to it, or they are credited to whatever job next
+carries that id, which is the resume of the same transfer, and drive it
+to "every file sent" while most of its own files are still queued; and
+they must stop counting against the parallel-send budget, or a cancel
+that leaves streams whose workers are already gone keeps the budget full
+for good, so nothing more is ever offered and the upload sits at
+"transferring" with nothing moving.
 On the requester's side every `.part` of that request is removed and
 every file already complete is kept - cancelling costs only what had not
 arrived. Resuming is the same request made again, **under the same request id**:
@@ -2969,7 +2978,90 @@ the size being offered is refused as it is offered, so only what is
 genuinely missing moves. The requester clears the cancelled mark as it
 asks again, or the files it brings would be refused as the abandoned
 request's. That same rule is what stops a folder being re-fetched
-whole when one file of it failed.
+whole when one file of it failed. Both the Downloads tab and the
+transfers popup say how many files were skipped, since a resumed row
+counts up from zero again and would otherwise read as starting over. A
+refusal is counted against the *sender's* row as skipped too, rather than
+as bytes it put on the wire, so both ends agree on what actually moved.
+
+Once a request is declared finished the owner drops anything of it still
+queued rather than going on offering files under it. The requester
+forgets a request on hearing `SharedDownloadDone`, and an offer whose tag
+names a request nobody remembers is indistinguishable from an ordinary
+`/file` send - so it would be put to the user to accept, for a file they
+went and fetched themselves.
+
+**Both clients must be the same build.** These payloads are bincode
+structs - positional, with no field names - so a field added to one of
+them makes every message of that kind unreadable to a peer built before
+it. There is no version negotiation to catch that, so every decode
+failure here is logged with the payload's name and the peer's: dropped
+silently it is indistinguishable from the feature not working, since the
+other side simply never reacts.
+
+**Every ask is numbered.** A resume re-uses the request id, so the id
+alone cannot tell one round of a download from the next - and each of
+these messages can outlive the round it belongs to, because a folder
+walk, a file in flight and a cancel all take time. `SharedDownloadRequest`
+therefore carries an `attempt`, one for the first ask and one more for
+each resume, and `SharedDownloadPlan`, `SharedFileTag`,
+`SharedDownloadCancel` and `SharedDownloadDone` all echo it. Each side
+drops whatever is not stamped with the attempt it is on. Without that
+the answer to a cancel - the message most likely to be late, since a
+cancel is re-asked until it is answered - closed the round that had
+already replaced it.
+
+The number is used to set a message aside, never to refuse a cancel.
+Only a cancel naming an attempt **older** than the live round is set
+aside - and it is still answered, so the requester stops asking. A cancel
+at or ahead of what the owner knows always stops the request: the
+requester is the only judge of whether it still wants the download, and
+it only ever cancels the attempt it is on, while the owner's view can be
+behind, since its record of the round goes with the link and the ask that
+would have advanced it can itself go missing. Requiring the two to agree
+exactly made that disagreement permanent - with nothing remembered the
+owner reads attempt 1, so the first cancel of a download matched and
+worked while every later one was acknowledged and ignored.
+
+A `SharedFileTag` is honoured whatever attempt it names, so long as it
+names a download this side asked that peer for. A file of a round the
+requester has moved past is then **refused** as it is offered, exactly
+like a cancelled request's. Dropping the tag instead would leave the
+offer behind it looking like something nobody asked for, and the Accept
+popup would go up for a file the user did ask for.
+
+**The cancel path narrates itself.** Every step of a cancel is written
+to the session log on both sides - sent or could not be sealed, received
+with the attempt it names against the one the owner is on, whether the
+owner's row was found and marked, the answer accepted or ignored, and
+each retry - and a shared-folder message dropped before it is acted on
+(sender unknown, envelope that will not open) is logged with its kind.
+Two clients disagreeing about a transfer is otherwise indistinguishable
+from the feature being broken, and the log is what tells the two apart.
+
+**A cancel is asked again until it is answered.** It used to go out once,
+with its result discarded, so a single failure to seal or deliver it -
+the peer momentarily unknown, no key to seal to, a link that dropped as
+it went - left the requester showing "cancelled" and the owner still
+showing the upload, with nothing that would ever bring the two back
+together: cancelling again did nothing, because from the requester's own
+point of view it already had. The owner answers every
+`SharedDownloadCancel` with `SharedDownloadDone` carrying
+`SharedError::Cancelled`, including for a request it has already stopped,
+forgotten, or never had, and that answer is what ends the retries. A
+cancel naming an attempt the owner has moved past is answered and
+otherwise ignored, so the reply cannot disturb the round that replaced
+it.
+
+A cancel can arrive while the owner is still **walking** the folder,
+which it does off its event loop (§7.8 "Downloading"). Each ask opens a
+round of that request id - a resume re-uses the id, so it counts as one -
+and either side's cancel retires it; a walk carries the round it was
+started for, and one that comes back under a retired round is dropped
+rather than allowed to start sending. Without that a cancel landing
+mid-walk cancelled nothing at all: the walk began a full round a moment
+later, the requester's row already said cancelled so nothing on that side
+would ever stop it, and the owner showed the upload as running for good.
 
 **A link lost** drops everything both sides held for that peer - queued
 files, offers in flight, outstanding requests and tags, and the
@@ -2977,6 +3069,16 @@ announced share list - rather than waiting on a link that may never
 return under the same id; the announce is repeated when it does. The
 requester's own downloads for that peer end the same way a cancel does:
 partial files removed, completed ones kept.
+
+The transfer's row closes on **both** sides, saying the link went away.
+Dropping the owner's job is exactly what stops anything ever closing its
+record, so a job dropped without closing its row left that row at
+"transferring" for the rest of the session with nothing in flight behind
+it - and no later cancel could reach it either, because the requester's
+own state for that transfer went with the same link, so its cancel was
+never sent. Once the peer is back the download resumes from where it got
+to: what arrived is kept and refused as it is offered again, so only the
+rest moves.
 
 ## 8. Encryption model
 
@@ -4205,8 +4307,10 @@ forward-secret**. This is stated plainly rather than glossed: forward
 secrecy begins at the first rotation, which is triggered by that very
 first message.
 
-**Rotating and offering.** A rotation is carried by the existing
-`RotateKey`/`KeyRotated` relay (§7.5), whose opaque fields carry:
+**Rotating and offering.** A rotation is carried on the direct link as
+`KeyRotation` whenever the peer has a live one, queued the moment it is
+made so it stays in order with the sends around it, and otherwise by the
+`RotateKey`/`KeyRotated` relay (§7.5). Either way the opaque fields carry:
 
 ```
 PqRotation { encap: PqEncapKeys, generation: u64 }
@@ -4243,6 +4347,23 @@ one key, or a message already in flight when we rotate, still opens.
 Beyond that they are dropped, and **the bound is the guarantee**: a key
 that falls out of the window is gone, so nothing that survives can reopen
 what it protected.
+
+**A sender never rotates out from under its peer.** The peer seals to the
+newest key of ours they have *heard of*, and mid-burst that is however
+many rotations behind the burst is long: a folder download offers
+several files at once and rotates after each, so a cancel sealed in
+between arrived nine generations behind the eight-key window -
+unopenable, silently, and every retry the same. Two things keep that from
+happening. A rotation goes onto the link the moment it is made, in order
+with the sends around it, so a peer with a live link is never more than
+one behind. And each side tracks which of its keys the peer was last seen
+sealing to (the open reports which key opened it) and **does not rotate
+again once it is `PQ_KEY_RETENTION - 1` generations ahead of that**: our
+decryption key protects what the peer sends *to us*, so until they have
+used the current one another rotation buys nothing and only moves the
+window away from them. The bound on retained keys is untouched; this is
+the sender pacing itself to it. Forward secrecy for the peer's messages
+resumes with their very next one, which advances what they are seen using.
 
 When a peer's connection ends, everything remembered for them - their
 current keys, ours for them, their replay counter - is discarded. A later

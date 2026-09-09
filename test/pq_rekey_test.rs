@@ -362,3 +362,32 @@ fn every_rotation_produces_new_keys_with_no_machinery_behind_it() {
     }
     assert_eq!(own.generation_for(ALICE), 5);
 }
+
+/// The store knows which of its keys a peer last sealed to, and how far
+/// ahead of that this side has rotated - what the session paces its
+/// rotations against (`request_rotation_if_pq_hybrid`).
+/// @requirement TB-164
+#[test]
+fn the_store_knows_how_far_ahead_of_the_peer_it_has_rotated() {
+    let (_bob_public, bob_private) = bundle();
+    let mut bob_own = PqOwnKeys::new(bob_private.bootstrap_decap().clone());
+    assert_eq!(bob_own.rotations_ahead_of_peer(ALICE), 0);
+
+    for _ in 0..5 {
+        bob_own.rotate_for(ALICE);
+    }
+    assert_eq!(bob_own.rotations_ahead_of_peer(ALICE), 5, "five rotations, none seen used");
+
+    // Alice seals to generation 3: index 0 is the current (5), then the
+    // retained 4 and 3 - so index 2.
+    bob_own.note_peer_used(ALICE, 2);
+    assert_eq!(bob_own.rotations_ahead_of_peer(ALICE), 2);
+
+    // An older use never moves her backwards.
+    bob_own.note_peer_used(ALICE, 4);
+    assert_eq!(bob_own.rotations_ahead_of_peer(ALICE), 2);
+
+    // The current key is index 0.
+    bob_own.note_peer_used(ALICE, 0);
+    assert_eq!(bob_own.rotations_ahead_of_peer(ALICE), 0);
+}

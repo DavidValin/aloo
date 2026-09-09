@@ -32,6 +32,9 @@ const POPUP_HEIGHT: u16 = 28;
 /// preposition and peer, the state and the counts. What is left is the
 /// path's (`elide_start`).
 const ROW_FURNITURE: usize = 46;
+/// What the ", N already had" note adds to a row when any download has
+/// skipped something.
+const SKIPPED_FURNITURE: usize = 18;
 
 /// Which rows are on screen. Everything, or one direction of it - a
 /// person sharing a lot of folders wants to see what is going out
@@ -271,7 +274,14 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
         return;
     }
 
-    let path_width = (inner.width as usize).saturating_sub(ROW_FURNITURE).max(12);
+    // The "already had" note only appears once something has been
+    // skipped, so the paths keep their full width until it does.
+    let furniture = if rows.iter().any(|r| r.files_skipped > 0) {
+        ROW_FURNITURE + SKIPPED_FURNITURE
+    } else {
+        ROW_FURNITURE
+    };
+    let path_width = (inner.width as usize).saturating_sub(furniture).max(12);
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in rows.iter().enumerate() {
         let marker = if i == popup_state.selected { "\u{25b8} " } else { "  " };
@@ -291,6 +301,17 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
             Some(total) => format!("{}/{total} files", item.files_done),
             None => format!("{} files", item.files_done),
         };
+        // A resumed download offers the whole folder again and refuses
+        // what is already on disk, so its count climbs straight back up
+        // without a byte moving. Saying how many were skipped is what
+        // makes that read as resuming rather than starting over - the
+        // browser's own Downloads tab has said so all along, and this
+        // popup is where the user actually watches a transfer.
+        let skipped = if item.files_skipped > 0 {
+            format!(", {} already had", item.files_skipped)
+        } else {
+            String::new()
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{marker}{} ", item.direction.marker()),
@@ -309,7 +330,7 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
             ),
             Span::raw("  "),
             Span::styled(status, Style::default().fg(color)),
-            Span::styled(format!("  {counted}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {counted}{skipped}"), Style::default().fg(Color::DarkGray)),
         ]));
         let suffix = match item.fraction() {
             Some(f) => format!("  {}%  {}", percent_of(f), format_size(item.bytes_done)),

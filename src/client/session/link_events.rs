@@ -341,7 +341,11 @@ pub(super) async fn handle_p2p_event(
             session.own_file_targets.remove(&stream_id);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
-            shared::on_shared_stream_finished(wr, ui_state, session, stream_id).await?;
+            // Refused rather than sent - on a shared download that means
+            // they already had it (`shared::already_have`), so it counts
+            // as one of the request's files without being claimed as
+            // bytes this side put on the wire.
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id, false).await?;
         }
         P2pEvent::FileChunk {
             from,

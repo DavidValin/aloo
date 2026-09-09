@@ -167,7 +167,19 @@ impl UiState {
 
     /// One file of an upload has gone out - the sender's own progress,
     /// counted in bytes so its bar reads like the receiver's.
-    pub fn on_upload_file_done(&mut self, peer_name: &str, request_id: u64, size: u64) {
+    ///
+    /// `skipped` is one the requester refused because it already had it,
+    /// which is what a resume is mostly made of: it still counts as one
+    /// of the request's files and still fills the bar, but saying so is
+    /// what stops the sender's row claiming to have sent bytes it never
+    /// put on the wire.
+    pub fn on_upload_file_done(
+        &mut self,
+        peer_name: &str,
+        request_id: u64,
+        size: u64,
+        skipped: bool,
+    ) {
         if let Some(item) = self
             .transfers
             .get_mut(TransferDirection::Upload, peer_name, request_id)
@@ -178,6 +190,9 @@ impl UiState {
         {
             item.files_done += 1;
             item.bytes_done = item.bytes_done.saturating_add(size);
+            if skipped {
+                item.files_skipped += 1;
+            }
             if item.status == SharedDownloadStatus::Asking {
                 item.status = SharedDownloadStatus::Running;
             }

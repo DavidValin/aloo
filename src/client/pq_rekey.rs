@@ -31,8 +31,13 @@ pub const PQ_KEY_RETENTION: usize = 8;
 
 struct PeerKeys {
     current: PqDecapKeys,
-    retained: VecDeque<PqDecapKeys>,
+    /// Superseded keys, newest first, each with the generation it was.
+    retained: VecDeque<(u64, PqDecapKeys)>,
     generation: u64,
+    /// The newest generation of ours this peer has been seen sealing to
+    /// (`note_peer_used`). What they have *not* yet been seen using is
+    /// what bounds how far ahead of them this side may rotate.
+    peer_seen: u64,
 }
 
 /// Our own encryption keys: one rotating set per peer, plus the bootstrap
@@ -60,9 +65,10 @@ impl PqOwnKeys {
             current: self.bootstrap.clone(),
             retained: VecDeque::new(),
             generation: 0,
+            peer_seen: 0,
         });
         let superseded = std::mem::replace(&mut entry.current, decap);
-        entry.retained.push_front(superseded);
+        entry.retained.push_front((entry.generation, superseded));
         while entry.retained.len() > PQ_KEY_RETENTION {
             entry.retained.pop_back();
         }
@@ -84,10 +90,41 @@ impl PqOwnKeys {
         let mut out = Vec::new();
         if let Some(entry) = self.per_peer.get(&peer) {
             out.push(entry.current.clone());
-            out.extend(entry.retained.iter().cloned());
+            out.extend(entry.retained.iter().map(|(_, key)| key.clone()));
         }
         out.push(self.bootstrap.clone());
         out
+    }
+
+    /// Records that `peer` sealed something to the key at `index` of
+    /// `candidates_for(peer)` - the index an `open_*_indexed` returned.
+    /// The bootstrap key is generation 0; the current key is the latest.
+    pub fn note_peer_used(&mut self, peer: UserId, index: usize) {
+        let Some(entry) = self.per_peer.get_mut(&peer) else {
+            return;
+        };
+        let generation = if index == 0 {
+            entry.generation
+        } else {
+            entry
+                .retained
+                .get(index - 1)
+                .map(|(generation, _)| *generation)
+                .unwrap_or(0)
+        };
+        entry.peer_seen = entry.peer_seen.max(generation);
+    }
+
+    /// How many generations ahead of the newest key `peer` has been seen
+    /// using this side has rotated. Every rotation retires the oldest
+    /// retained key once more than `PQ_KEY_RETENTION` are held, so a peer
+    /// left this far behind is about to be sealing to a key that is
+    /// gone; `request_rotation_if_pq_hybrid` stops short of that.
+    pub fn rotations_ahead_of_peer(&self, peer: UserId) -> u64 {
+        self.per_peer
+            .get(&peer)
+            .map(|entry| entry.generation.saturating_sub(entry.peer_seen))
+            .unwrap_or(0)
     }
 
     /// Drops everything remembered for `peer` - called when their

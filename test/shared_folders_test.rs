@@ -337,6 +337,17 @@ fn a_partial_download_is_never_written_under_the_real_name() {
 fn fileshare_downloads_have_their_own_directory_per_person() {
     let dir = shared_folders::fileshare_download_dir("alice");
     assert!(dir.ends_with("downloads/fileshare/alice"), "{}", dir.display());
+    // The helper existing was never the point - what matters is that a
+    // download is actually built from it. It was not: the session used
+    // the plain downloads directory, so files landed a level up from
+    // everywhere the docs said to look for them.
+    let root = shared_folders::fileshare_root();
+    assert!(root.ends_with("downloads/fileshare"), "{}", root.display());
+    assert_eq!(
+        shared_folders::download_dest(&root, "alice", "Photos", "trip/one.jpg"),
+        root.join("alice").join("Photos").join("trip").join("one.jpg"),
+        "the documented layout, from the documented root"
+    );
     // A file someone sends with `/file` still lands in the plain
     // downloads directory, not in here.
     assert_ne!(dir, aloo::client::file_transfer::default_download_dir());
@@ -951,6 +962,7 @@ fn payloads_round_trip_through_proto_encode() {
 
     let tag = SharedFileTag {
         request_id: 7,
+        attempt: 1,
         stream_id: 3,
         rel_path: "trip/beach.jpg".into(),
     };

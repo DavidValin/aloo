@@ -669,6 +669,11 @@ pub struct PendingFileOffer {
     /// `auto_dest`, and what ties the file's progress back to its row in
     /// the Downloads tab.
     pub shared_request_id: Option<u64>,
+    /// Which ask for that download this file belongs to. An offer from a
+    /// round the requester has since asked again past is refused rather
+    /// than written, and recognising it at all is what keeps it off the
+    /// Accept popup (§7.8).
+    pub shared_attempt: Option<u32>,
 }
 
 

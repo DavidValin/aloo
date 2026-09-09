@@ -237,6 +237,37 @@ fn share(dir: &Path, access: &str) -> SharedFolder {
 // Announcing
 // ---------------------------------------------------------------------
 
+/// A payload that will not decode is reported rather than dropped in
+/// silence. These are bincode structs - positional, with no field names -
+/// so a field added on one side makes every message of that kind
+/// unreadable on the other, and two clients built from different commits
+/// simply stop reacting to each other. Chasing that as a bug in the
+/// feature cost days; it has to be visible.
+/// @requirement TB-303
+#[tokio::test]
+async fn a_payload_that_will_not_decode_is_reported() {
+    let mut w = world("decode-warning").await;
+    w.open_link(ALICE).await;
+    aloo::log::silence();
+    let _ = aloo::log::take_collected();
+
+    // Too few bytes to be a cancel - what a build whose idea of the
+    // struct is smaller than this one's produces.
+    let envelope = w.sealed_from(&w.alice, 7, Content::SharedDownloadCancel, &[]);
+    shared::on_shared_folder_message(&mut w.ui, &mut w.session, ALICE, envelope)
+        .await
+        .unwrap();
+
+    let lines = aloo::log::take_collected();
+    aloo::log::unsilence();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("SharedDownloadCancel") && line.contains("same build")),
+        "the unreadable payload is named in the log: {lines:?}"
+    );
+}
+
 /// @requirement AC-450
 #[tokio::test]
 async fn a_link_coming_up_announces_only_what_the_peer_may_see() {
@@ -428,6 +459,7 @@ async fn a_folder_download_is_offered_up_to_the_parallel_budget() {
 
     let request = SharedDownloadRequest {
         request_id: 4,
+        attempt: 1,
         share: "Photos".into(),
         rel_path: String::new(),
     };
@@ -501,7 +533,13 @@ async fn a_folder_download_is_offered_up_to_the_parallel_budget() {
     assert!(!logged, "a shared send is not a message in the chat");
 
     // Finishing one releases exactly one more.
-    shared::on_shared_stream_finished(&mut NullSink, &mut w.ui, &mut w.session, offer_streams[0])
+    shared::on_shared_stream_finished(
+        &mut NullSink,
+        &mut w.ui,
+        &mut w.session,
+        offer_streams[0],
+        true,
+    )
         .await
         .unwrap();
     assert_eq!(
@@ -528,7 +566,13 @@ async fn a_folder_download_is_offered_up_to_the_parallel_budget() {
         }
         for stream_id in next {
             done_streams.push(stream_id);
-            shared::on_shared_stream_finished(&mut NullSink, &mut w.ui, &mut w.session, stream_id)
+            shared::on_shared_stream_finished(
+                &mut NullSink,
+                &mut w.ui,
+                &mut w.session,
+                stream_id,
+                true,
+            )
                 .await
                 .unwrap();
         }
@@ -552,6 +596,7 @@ async fn a_download_of_something_not_shared_is_answered_with_the_reason() {
 
     let request = SharedDownloadRequest {
         request_id: 5,
+        attempt: 1,
         share: "Photos".into(),
         rel_path: String::new(),
     };
@@ -605,6 +650,7 @@ async fn ask_and_tag(w: &mut World, tag_stream: u64, tag_request_id: Option<u64>
 
     let tag = SharedFileTag {
         request_id: tag_request_id.unwrap_or(request_id),
+        attempt: 1,
         stream_id: tag_stream,
         rel_path: "trip/beach.jpg".into(),
     };
@@ -887,6 +933,7 @@ async fn an_owner_told_to_stop_drops_the_rest_of_that_request() {
 
     let request = SharedDownloadRequest {
         request_id: 12,
+        attempt: 1,
         share: "Photos".into(),
         rel_path: String::new(),
     };
@@ -907,7 +954,7 @@ async fn an_owner_told_to_stop_drops_the_rest_of_that_request() {
     let (queued_before, _) = shared::queued_for(&w.session, ALICE);
     assert!(queued_before > 0, "some are still waiting their turn");
 
-    let cancel = aloo::client::shared_folders::SharedDownloadCancel { request_id: 12 };
+    let cancel = aloo::client::shared_folders::SharedDownloadCancel { request_id: 12, attempt: 1 };
     let envelope = w.sealed_from(
         &w.alice,
         2,
@@ -940,6 +987,7 @@ async fn revoking_access_mid_download_stops_the_files_still_queued() {
 
     let request = SharedDownloadRequest {
         request_id: 21,
+        attempt: 1,
         share: "Photos".into(),
         rel_path: String::new(),
     };
@@ -975,7 +1023,13 @@ async fn revoking_access_mid_download_stops_the_files_still_queued() {
         })
         .collect();
     for stream_id in streams {
-        shared::on_shared_stream_finished(&mut NullSink, &mut w.ui, &mut w.session, stream_id)
+        shared::on_shared_stream_finished(
+                &mut NullSink,
+                &mut w.ui,
+                &mut w.session,
+                stream_id,
+                true,
+            )
             .await
             .unwrap();
     }
@@ -1011,6 +1065,7 @@ async fn a_narrower_share_added_mid_download_hides_what_it_covers() {
 
     let request = SharedDownloadRequest {
         request_id: 22,
+        attempt: 1,
         share: "work".into(),
         rel_path: String::new(),
     };
@@ -1051,7 +1106,13 @@ async fn a_narrower_share_added_mid_download_hides_what_it_covers() {
         })
         .collect();
     for stream_id in streams {
-        shared::on_shared_stream_finished(&mut NullSink, &mut w.ui, &mut w.session, stream_id)
+        shared::on_shared_stream_finished(
+                &mut NullSink,
+                &mut w.ui,
+                &mut w.session,
+                stream_id,
+                true,
+            )
             .await
             .unwrap();
     }
@@ -1156,6 +1217,7 @@ async fn an_injected_path_lists_nothing_and_downloads_nothing() {
         send_id += 1;
         let req = SharedDownloadRequest {
             request_id: send_id,
+            attempt: 1,
             share: (*share_name).to_string(),
             rel_path: (*rel_path).to_string(),
         };
@@ -1257,6 +1319,7 @@ async fn offers_still_arriving_after_a_cancel_are_refused_not_offered() {
     let stream_id = 88;
     let tag = SharedFileTag {
         request_id,
+        attempt: 1,
         stream_id,
         rel_path: "late.jpg".into(),
     };
@@ -1371,9 +1434,13 @@ async fn resuming_reuses_the_same_transfer_rather_than_starting_another() {
         "waiting on the owner again"
     );
 
-    // The owner answers with what it covers, and the row moves on.
+    // The owner answers with what it covers, and the row moves on. The
+    // answer names the ask it is for: a resume asks afresh, so an answer
+    // still carrying the previous ask's number belongs to a round this
+    // side has left behind and is ignored.
     let plan = aloo::client::shared_folders::SharedDownloadPlan {
         request_id,
+        attempt: shared::attempt_for(&w.session, request_id),
         files: 3,
         bytes: 3_000,
     };
@@ -1397,6 +1464,7 @@ async fn resuming_reuses_the_same_transfer_rather_than_starting_another() {
     let stream_id = 91;
     let tag = SharedFileTag {
         request_id,
+        attempt: shared::attempt_for(&w.session, request_id),
         stream_id,
         rel_path: "a.txt".into(),
     };
@@ -1452,6 +1520,7 @@ async fn a_lost_link_drops_what_was_queued_for_that_peer() {
 
     let request = SharedDownloadRequest {
         request_id: 6,
+        attempt: 1,
         share: "Photos".into(),
         rel_path: String::new(),
     };

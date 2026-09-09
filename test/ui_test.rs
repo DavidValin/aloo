@@ -4195,6 +4195,7 @@ fn no_popup_shows_the_view_behind_it() {
         otp_contact_name: None,
         auto_dest: None,
         shared_request_id: None,
+        shared_attempt: None,
     };
 
     /// One popup under test: the title its border carries, and what opens

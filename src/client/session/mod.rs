@@ -258,6 +258,18 @@ pub struct SessionState {
     /// Owner side: each download request's progress, keyed by
     /// `(requester, request_id)`.
     pub(crate) shared_jobs: HashMap<(UserId, u64), shared::SharedJob>,
+    /// Owner side: which round of `(requester, request_id)` is the live
+    /// one. The folder walk a download needs happens off this loop, so a
+    /// cancel can arrive while it is still running; the walk carries the
+    /// round it was started for, and one that comes back under an old
+    /// round is dropped rather than allowed to start sending. Bumped by
+    /// every fresh ask for that id (a resume re-uses it) and by every
+    /// cancel of it.
+    pub(crate) shared_request_round: HashMap<(UserId, u64), shared::SharedRound>,
+    /// Requester side: the last attempt number used for each request id,
+    /// so a resume asks under the next one even when the record for the
+    /// previous attempt has already been closed and dropped.
+    pub(crate) shared_attempts: HashMap<u64, u32>,
     /// Requester side: what this side has asked and not yet seen answered.
     pub(crate) shared_requests: HashMap<u64, shared::PendingSharedRequest>,
     /// Requester side: offers a `SharedFileTag` announced, keyed
@@ -827,12 +839,17 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         shared_receiving: HashMap::new(),
         shared_request_of_stream: HashMap::new(),
         shared_jobs: HashMap::new(),
+        shared_request_round: HashMap::new(),
+        shared_attempts: HashMap::new(),
         shared_requests: HashMap::new(),
         expected_shared_offers: HashMap::new(),
         next_shared_request_id: 1,
         shared_events_tx,
         test_shared_events: None,
-        shared_download_dir: file_transfer::default_download_dir(),
+        // The documented place, `<aloo home>/downloads/fileshare/...`
+        // (PROTOCOL.md 7.8, SPEC.md, README) - not the plain downloads
+        // directory, which is where files people *send* land.
+        shared_download_dir: crate::client::shared_folders::fileshare_root(),
         file_events_tx,
         record_out_tx,
         own_stream_done_tx,
@@ -1419,6 +1436,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // plenty for either.
                 if tick_count % 7 == 0 {
                     shared::pump_all_shared_sends(&mut wr, &mut ui_state, &mut session).await?;
+                    // A cancel the owner has not answered goes again, so
+                    // one that failed to seal or went out on a link that
+                    // was already gone cannot leave the two sides
+                    // disagreeing for good (§7.8).
+                    shared::retry_pending_cancels(&mut wr, &mut ui_state, &mut session).await?;
                 }
                 // Independent of any progress report: a spinner that only
                 // moved when bytes landed would stall exactly when the user
@@ -1871,13 +1893,52 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
     let Some(peer_fp) = session.pq_peer_keys.fingerprint_for(peer) else {
         return;
     };
+    // Never so far ahead of the peer that what they send next cannot be
+    // opened. Each rotation retires the oldest retained key once more
+    // than `PQ_KEY_RETENTION` are held, and the peer seals to the newest
+    // key of ours they have *heard of* - which, mid-burst, is however
+    // many rotations behind the burst is long. A folder download offers
+    // several files at once and rotates after each, and the peer's
+    // cancel, sealed in between, arrived nine generations behind an
+    // eight-key window: unopenable, silently, and every retry the same.
+    // Rotating our decryption key protects what the peer sends *to us*,
+    // so while they have not used the current one, rotating again buys
+    // nothing and only moves the window away from them. The bound on
+    // retained keys stays exactly as §13.10 states it; this is the
+    // sender pacing itself to it.
+    if session.own_pq_keys.rotations_ahead_of_peer(peer)
+        >= crate::client::pq_rekey::PQ_KEY_RETENTION as u64 - 1
+    {
+        return;
+    }
     let rotation = session.own_pq_keys.rotate_for(peer);
     let Ok((encoded, signature)) =
         crate::crypto::pq::sign_rotation(&session.own_pq_private, peer, &peer_fp, &rotation)
     else {
         return;
     };
-    // Handed to the main loop to write.
+    // Onto the link *now*, in order with the sends around it, whenever
+    // the link is the path those sends take. Rotations used to go by the
+    // main loop's `rotate_out_rx`, which drains only after the handler
+    // that requested them returns - so a burst of sealed sends (a folder
+    // download offers several files at once, each with its tag) reached
+    // the peer first and the rotations they triggered only afterwards.
+    // The peer, sealing a reply in between, was as many keys behind as
+    // the burst was long; past `PQ_KEY_RETENTION` this side could not
+    // open it, and a cancel lost that way was lost for good, since every
+    // retry sealed to the same stale key. With the rotation queued here,
+    // in wire order, the peer is never more than one behind (§13.10).
+    // A peer with no live link is relayed through the server as before.
+    if rotation_rides_the_link(session.server, peer) || session.peer_link.is_active(peer) {
+        session.peer_link.send_reliable_or_queue(
+            peer,
+            P2pPayload::KeyRotation {
+                rotation: encoded,
+                signature,
+            },
+        );
+        return;
+    }
     let _ = session.rotate_out_tx.send(ClientMessage::RotateKey {
         to: peer,
         new_public_key_der: encoded,
@@ -2630,6 +2691,8 @@ impl SessionState {
             shared_receiving: HashMap::new(),
             shared_request_of_stream: HashMap::new(),
             shared_jobs: HashMap::new(),
+            shared_request_round: HashMap::new(),
+            shared_attempts: HashMap::new(),
             shared_requests: HashMap::new(),
             expected_shared_offers: HashMap::new(),
             next_shared_request_id: 1,
@@ -2882,15 +2945,78 @@ pub(crate) fn decrypt_own_envelope(
     let candidates = session.own_pq_keys.candidates_for(from);
     let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
     let blob = envelope.blocks.first()?;
-    let (binding, plaintext) =
-        crypto::pq::open_send(&candidates, &session.own_pq_fp, &sender_public, blob)?;
+    let (index, binding, plaintext) =
+        crypto::pq::open_send_indexed(&candidates, &session.own_pq_fp, &sender_public, blob)?;
     if binding.channel.as_deref() != channel {
         return None;
     }
     if !session.replay.accept(from, binding.send_id) {
         return None;
     }
+    // Which of our keys they are on - what bounds how far ahead of them
+    // this side may rotate (`request_rotation_if_pq_hybrid`).
+    session.own_pq_keys.note_peer_used(from, index);
     Some(plaintext)
+}
+
+/// Why `decrypt_own_envelope` said no, in words - for the log line that
+/// reports a dropped envelope. Each check the open makes is repeated
+/// here on its own, so the line names the one that failed rather than
+/// leaving "could not open" to be guessed at: an envelope that fails to
+/// open is otherwise indistinguishable from a peer that never sent it.
+pub(crate) fn diagnose_unopenable(
+    envelope: &Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &SessionState,
+) -> String {
+    let Ok(sender_public) = proto::decode::<crypto::pq::PqPublicBundle>(&sender.public_key_der)
+    else {
+        return "the sender's own key bundle will not decode".to_string();
+    };
+    let Some(blob) = envelope.blocks.first() else {
+        return "the envelope carries no block".to_string();
+    };
+    let Ok(send) = proto::decode::<crypto::pq::HybridSend>(blob) else {
+        return "the block is not a hybrid send".to_string();
+    };
+    let binding = &send.setup.binding;
+    if binding.recipient_fp != session.own_pq_fp {
+        return "sealed to a different recipient identity".to_string();
+    }
+    let candidates = session.own_pq_keys.candidates_for(from);
+    let opening: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            crypto::pq::open_setup(
+                std::slice::from_ref(*c),
+                &session.own_pq_fp,
+                &sender_public,
+                &send.setup,
+            )
+            .is_some()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let highest = session.replay.highest(from);
+    format!(
+        "send id {} (highest seen {:?}); {} of this side's {} keys for them open it (generation {}, \
+         their key generation {:?}); {}",
+        binding.send_id,
+        highest,
+        opening.len(),
+        candidates.len(),
+        session.own_pq_keys.generation_for(from),
+        session.pq_peer_keys.generation_for(from),
+        if opening.is_empty() {
+            "so it was sealed to a key this side does not hold, or its signature does not verify"
+        } else if highest.is_some_and(|h| binding.send_id <= h) {
+            "so it is a repeat, or older than the replay window allows"
+        } else {
+            "so the setup opens but the body or channel binding does not"
+        }
+    )
 }
 
 /// `decrypt_own_envelope` for an OTP-layer envelope, whose seal names no
@@ -2908,11 +3034,16 @@ pub(crate) fn decrypt_own_blinded_envelope(
     let candidates = session.own_pq_keys.candidates_for(from);
     let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
     let blob = envelope.blocks.first()?;
-    let (send_id, plaintext) =
-        crypto::pq::open_send_blinded(&candidates, &session.own_pq_fp, &sender_public, blob)?;
+    let (index, send_id, plaintext) = crypto::pq::open_send_blinded_indexed(
+        &candidates,
+        &session.own_pq_fp,
+        &sender_public,
+        blob,
+    )?;
     if !session.replay.accept(from, send_id) {
         return None;
     }
+    session.own_pq_keys.note_peer_used(from, index);
     Some(plaintext)
 }
 
@@ -2953,6 +3084,7 @@ fn handle_incoming_file_offer(
         otp_contact_name: None,
         auto_dest: None,
         shared_request_id: None,
+        shared_attempt: None,
     };
     // An offer this side asked for (a shared-folder download, §7.8) is
     // given its destination here, which is what keeps it out of the popup.
@@ -3068,7 +3200,7 @@ async fn handle_file_event(
             ui_state.set_file_completed(me, stream_id);
             // A shared send finishing is what releases the next one
             // queued for that peer (§7.8).
-            shared::on_shared_stream_finished(wr, ui_state, session, stream_id).await?;
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id, true).await?;
         }
         file_transfer::FileEvent::SendFailed { stream_id } => {
             session.otp_sending_streams.remove(&stream_id);
@@ -3076,7 +3208,7 @@ async fn handle_file_event(
                 crate::client::otp::secure_remove_file(&temp);
             }
             ui_state.set_file_failed(me, stream_id);
-            shared::on_shared_stream_finished(wr, ui_state, session, stream_id).await?;
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id, false).await?;
         }
         file_transfer::FileEvent::ReceiveProgress {
             from,

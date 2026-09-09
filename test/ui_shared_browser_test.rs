@@ -495,6 +495,7 @@ fn offer_with_dest(dest: Option<std::path::PathBuf>) -> PendingFileOffer {
         channel: None,
         otp_contact_name: None,
         shared_request_id: dest.as_ref().map(|_| 7),
+        shared_attempt: None,
         auto_dest: dest,
     }
 }
