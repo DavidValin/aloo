@@ -395,6 +395,7 @@ async fn send_file(side: &mut Side, contact: &str, path: std::path::PathBuf, siz
         path,
         "notes.txt".to_string(),
         size,
+        aloo::client::direct_message::SendFileRow::Logged,
     )
     .await
     .expect("the file offer path should not fail");

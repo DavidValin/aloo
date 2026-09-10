@@ -1574,6 +1574,22 @@ pub(crate) fn render_user_info_popup(frame: &mut Frame, area: Rect, state: &UiSt
             Style::default().fg(Color::Green),
         )));
     }
+    // The popup's one button, present only when there is somewhere for it
+    // to go: a peer who has shared folders with us (`docs/SPEC.md` "Shared
+    // folders"). Enter presses it (`handle_key`'s user-info tier).
+    if state.peer_shares.get(&info.peer).is_some_and(|s| !s.is_empty()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Browse shared files ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
 
     let height = (lines.len() as u16 + 2).max(7).min(area.height.saturating_sub(2));
     let popup = centered_rect(64, height, area);

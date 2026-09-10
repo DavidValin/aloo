@@ -108,6 +108,14 @@ impl RemoteKeys {
         self.peers.contains_key(&peer)
     }
 
+    /// `try_use` without the consumption: whether a `try_use` right now
+    /// would succeed. For a caller that must not start something it
+    /// cannot finish - a queued shared-folder send waits on this rather
+    /// than spending the permit on a send it then has to abandon.
+    pub fn can_use(&self, peer: UserId) -> bool {
+        self.peers.get(&peer).is_none_or(|state| state.fresh)
+    }
+
     /// Whether it's OK to encrypt-and-send to `peer` right now. An
     /// untracked (static-key) peer is always OK. A tracked peer with a
     /// fresh key is OK too - and this call consumes that freshness, so a

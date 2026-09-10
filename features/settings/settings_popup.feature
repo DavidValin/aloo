@@ -5,7 +5,7 @@ Feature: Changing settings without leaving the app
   I want to edit ~/.aloo/settings from inside aloo, grouped and explained
   So that I do not have to quit, find a file, and start again to change my mind
 
-  Control+S opens the same file the app reads at startup, in three tabs.
+  Control+S opens the same file the app reads at startup, in four tabs.
   Every change is written the moment it is made - there is no Save button,
   so nothing can be typed and then lost on Escape. See docs/SPEC.md
   "Settings".
@@ -43,13 +43,15 @@ Feature: Changing settings without leaving the app
     Then the saved punch names host "bobhost.example" on port 19000
 
   @AC-397
-  Scenario: Tab walks the three tabs and comes back round
+  Scenario: Tab walks the four tabs and comes back round
     Given I am connected and viewing a channel
     And I press Ctrl+S
     When I press Tab
     Then the settings popup is open on the "Direct Punch" tab
     When I press Tab
     Then the settings popup is open on the "OTP" tab
+    When I press Tab
+    Then the settings popup is open on the "File Sharing" tab
     When I press Tab
     Then the settings popup is open on the "General" tab
 

@@ -313,6 +313,9 @@ pub(super) async fn handle_p2p_event(
                 // a separate answer, sent from `ReceiveDone` below.
                 send_delivery_receipt(session, from, msg_id, ReceiptStage::Decrypted);
             }
+            // A shared-folder download's offer needs no answer from the
+            // user (§7.8).
+            shared::drain_auto_accepts(wr, ui_state, session).await?;
         }
         P2pEvent::FileAccepted { stream_id } => {
             // `target` stays in `own_file_targets` here -
@@ -338,6 +341,11 @@ pub(super) async fn handle_p2p_event(
             session.own_file_targets.remove(&stream_id);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
+            // Refused rather than sent - on a shared download that means
+            // they already had it (`shared::already_have`), so it counts
+            // as one of the request's files without being claimed as
+            // bytes this side put on the wire.
+            shared::on_shared_stream_finished(wr, ui_state, session, stream_id, false).await?;
         }
         P2pEvent::FileChunk {
             from,
@@ -508,6 +516,13 @@ pub(super) async fn handle_p2p_event(
                     // say it - and this envelope is also the thing that
                     // authenticates us to them (§7.1.5).
                     send_channel_presence(session, ui_state, peer);
+                    // And what this side shares with them (§7.8) - only
+                    // once they can be named, which for a serverless peer
+                    // is after their `ChannelPresence` opens; the announce
+                    // is repeated from `apply_channel_presence_plaintext`
+                    // for that case.
+                    shared::send_shared_folders(session, ui_state, peer, false);
+                    shared::pump_shared_sends(wr, ui_state, session, peer).await?;
                     // A peer whose pin is not a readable keybundle gets no
                     // `ChannelPresence` (nothing can be sealed to them);
                     // an installed pad is what introduces them instead.
@@ -531,6 +546,7 @@ pub(super) async fn handle_p2p_event(
                     drain_otp_queue_for(wr, ui_state, session, peer).await;
                 }
                 p2p::LinkStatus::Lost => {
+                    shared::on_peer_link_lost(session, ui_state, peer);
                     // Bounded by `PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT` (`p2p.rs`'s
                     // `tick_at`), so a review withheld by
                     // `begin_identity_review` is never stuck open forever
@@ -557,6 +573,12 @@ pub(super) async fn handle_p2p_event(
             let (to_send, given_up) =
                 handle_pq_key_rotated(ui_state, session, from, rotation, signature);
             flush_queued_outbound(wr, ui_state, session, from, to_send, given_up).await?;
+            // A fresh key is what a queued shared send may have been
+            // waiting for (§7.8).
+            shared::pump_shared_sends(wr, ui_state, session, from).await?;
+        }
+        P2pEvent::SharedFolderMessage { from, envelope } => {
+            shared::on_shared_folder_message(ui_state, session, from, envelope).await?;
         }
         P2pEvent::ChannelPresence { from, envelope } => {
             // Registration can produce the daemon's own `--otp` proposal,
@@ -634,6 +656,7 @@ pub(super) async fn handle_p2p_event(
                 sender_device_id,
             )
             .await;
+            shared::drain_auto_accepts(wr, ui_state, session).await?;
         }
         P2pEvent::OtpDeliveryAck { from, seq, proof } => {
             crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq, proof).await?;
@@ -915,6 +938,11 @@ pub(super) fn apply_channel_presence_plaintext(
             action = on_daemon_peer_appeared(ui_state, session, from, nickname, None);
         }
     }
+    // Last, and deliberately: what this side shares with them (§7.8) is
+    // sealed to their `known_users` entry, which only exists once the
+    // registration above has run - the link-up announce found nothing to
+    // seal to and sent nothing.
+    shared::send_shared_folders(session, ui_state, from, false);
     action
 }
 

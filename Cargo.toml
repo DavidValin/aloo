@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.5.0-beta.2"
+version = "0.5.0-beta.3"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -148,6 +148,30 @@ path = "test/server_channels_registry_test.rs"
 [[test]]
 name = "docs_test"
 path = "test/docs_test.rs"
+
+[[test]]
+name = "ui_transfers_popup_test"
+path = "test/ui_transfers_popup_test.rs"
+
+[[test]]
+name = "transfer_log_test"
+path = "test/transfer_log_test.rs"
+
+[[test]]
+name = "shared_folders_test"
+path = "test/shared_folders_test.rs"
+
+[[test]]
+name = "shared_two_sides_test"
+path = "test/shared_two_sides_test.rs"
+
+[[test]]
+name = "shared_session_test"
+path = "test/shared_session_test.rs"
+
+[[test]]
+name = "ui_shared_browser_test"
+path = "test/ui_shared_browser_test.rs"
 
 [[test]]
 name = "vectors_test"

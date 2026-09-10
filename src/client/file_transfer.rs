@@ -349,6 +349,14 @@ pub(crate) struct OwnFileTarget {
     /// confirmed delivered (docs/PROTOCOL.md 16.2). `None` for an ordinary
     /// (non-OTP) transfer, unchanged from before this field existed.
     pub(crate) otp: Option<String>,
+    /// `Some` for a transfer answering a shared-folder download
+    /// (`docs/PROTOCOL.md` §7.8): the send worker debits every chunk
+    /// against it, which is what holds shared sends under
+    /// `file_sharing_max_pct`. `None` - an ordinary `/file` send - is
+    /// never paced. Set by `session::shared::pump_shared_sends` right
+    /// after the offer goes out, and read by whichever `FileAccepted`
+    /// path spawns the worker.
+    pub(crate) pacer: Option<std::sync::Arc<crate::client::shared_folders::SharePacer>>,
 }
 
 /// Bookkeeping for one currently-arriving incoming file transfer - mirrors
@@ -439,6 +447,11 @@ pub(crate) enum FileEvent {
 /// `P2pOutbound::FileChunk`, then a final `FileEnd`. `out_tx` is
 /// `SessionState::record_out_tx`, the same channel the voice recorder
 /// drains through, so sending needs no new select-loop arm.
+///
+/// `pacer`, when given, is debited one chunk's worth before each chunk
+/// is read off disk - a shared-folder send waits here for its share of
+/// the declared link speed (`shared_folders::SharePacer`); every other
+/// send passes `None`.
 pub(crate) fn spawn_send_file_worker(
     path: PathBuf,
     key: DirectStreamKey,
@@ -446,6 +459,7 @@ pub(crate) fn spawn_send_file_worker(
     stream_id: u64,
     out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     events_tx: tokio::sync::mpsc::UnboundedSender<FileEvent>,
+    pacer: Option<std::sync::Arc<crate::client::shared_folders::SharePacer>>,
 ) {
     std::thread::spawn(move || {
         let file = match File::open(&path) {
@@ -461,6 +475,9 @@ pub(crate) fn spawn_send_file_worker(
         let mut seq: u32 = 0;
         let mut sent: u64 = 0;
         loop {
+            if let Some(pacer) = &pacer {
+                pacer.acquire(FILE_CHUNK_BYTES as u64);
+            }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,

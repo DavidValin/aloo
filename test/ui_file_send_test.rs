@@ -405,6 +405,9 @@ fn incoming_offer(
         stream_id,
         channel: None,
         otp_contact_name: None,
+        auto_dest: None,
+        shared_request_id: None,
+        shared_attempt: None,
     }
 }
 

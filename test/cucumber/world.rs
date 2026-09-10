@@ -200,6 +200,15 @@ pub struct AlooWorld {
     /// session ended, keyed by whose session it was.
     pub ended_id_stores: HashMap<String, IdStore>,
 
+    // -- shared folders (US-066) ---------------------------------------
+    /// The folder a scenario has shared, for the rules that are about
+    /// the filesystem rather than the wire (layout, overlapping shares).
+    pub shared_tree: Option<aloo::settings::SharedFolder>,
+    /// Where a walked download's files would land.
+    pub collected: Vec<std::path::PathBuf>,
+    /// The roots the scenario's requester may not see.
+    pub forbidden: Vec<std::path::PathBuf>,
+
     // -- encryption ----------------------------------------------------
     pub plaintext: Vec<u8>,
     pub blocks: Vec<Vec<u8>>,

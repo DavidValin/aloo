@@ -363,6 +363,9 @@ pub(super) async fn handle_server_message(
             let (to_send, given_up) =
                 handle_pq_key_rotated(ui_state, session, from, new_public_key_der, signature);
             flush_queued_outbound(wr, ui_state, session, from, to_send, given_up).await?;
+            // A fresh key is what a queued shared send may have been
+            // waiting for (§7.8).
+            shared::pump_shared_sends(wr, ui_state, session, from).await?;
         }
         ServerMessage::PeerCandidates {
             from,

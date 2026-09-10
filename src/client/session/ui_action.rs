@@ -133,6 +133,7 @@ pub(super) async fn handle_ui_action(
                 filename,
                 size,
                 recipient_pubkey_der,
+                crate::client::direct_message::SendFileRow::Logged,
             )
             .await?;
         }
@@ -238,6 +239,9 @@ pub(super) async fn handle_ui_action(
             if accept_identity_review(session, ui_state, peer).await {
                 voice_stream::play_bell_chime(session);
             }
+            // A shared-folder download's offer held behind the review is
+            // accepted now, still without a popup (§7.8).
+            shared::drain_auto_accepts(wr, ui_state, session).await?;
         }
         UiAction::RejectIdentity(peer) => {
             // No `id_store`/`rekey` writes at all - the previous pin (if
@@ -570,9 +574,55 @@ pub(super) async fn handle_ui_action(
                 crate::client::tui::settings_popup::SettingsDraft::from_settings(&settings),
             );
             ui_state.set_direct_punch_rows(settings.direct_punch_to);
+            ui_state.set_share_rows(settings.shares);
         }
         UiAction::SaveSettings(draft) => {
             save_settings_draft(session, ui_state, draft);
+        }
+        UiAction::SaveShares(shares) => {
+            let path = crate::settings::default_path();
+            // The same merging write `SaveDirectPunchTargets` uses.
+            if let Err(e) = crate::settings::Settings::update(&path, |s| {
+                s.shares = shares.clone();
+            }) {
+                crate::log_warn!("could not save ~/.aloo/settings ({e})");
+            }
+            // Applied and announced this same tick (§7.8).
+            shared::apply_share_settings(session, ui_state, shares.clone());
+            ui_state.set_share_rows(shares);
+            ui_state.push_status_notice("shared folders saved".to_string(), true);
+        }
+        UiAction::RequestSharedListing {
+            peer,
+            share,
+            rel_path,
+        } => {
+            shared::request_shared_listing(wr, ui_state, session, peer, share, rel_path).await?;
+        }
+        UiAction::DownloadShared {
+            peer,
+            share,
+            rel_path,
+        } => {
+            shared::request_shared_download(wr, ui_state, session, peer, share, rel_path).await?;
+        }
+        UiAction::CancelSharedDownload { request_id } => {
+            shared::cancel_shared_download(wr, ui_state, session, request_id).await?;
+            ui_state.transfers.save_or_warn();
+        }
+        UiAction::ResumeSharedDownload { request_id } => {
+            shared::resume_shared_download(wr, ui_state, session, request_id).await?;
+            ui_state.transfers.save_or_warn();
+        }
+        UiAction::CancelSharedUpload {
+            peer_name,
+            request_id,
+        } => {
+            shared::cancel_upload(wr, ui_state, session, peer_name, request_id).await?;
+            ui_state.transfers.save_or_warn();
+        }
+        UiAction::SaveTransferHistory => {
+            ui_state.transfers.save_or_warn();
         }
         UiAction::ExportSelected { prefix, channels, dms } => {
             for channel in &channels {
@@ -783,6 +833,16 @@ fn save_settings_draft(
         targets,
         crate::client::p2p::utc_second_of_hour(),
     );
+    // The upload budget applies to every shared send already running, not
+    // only the next one (`shared_folders::SharePacer::set_rate`).
+    if let Some(rate) = draft.file_sharing_rate() {
+        session.share_pacer.set_rate(rate);
+    }
+    // An in-app key needs nothing registering, so it takes effect on the
+    // next keystroke rather than at the next start.
+    if let Some(chord) = crate::settings::KeyChord::parse(&draft.transfers_shortcut) {
+        ui_state.transfers_shortcut = chord;
+    }
     let path = crate::settings::default_path();
     match crate::settings::Settings::update(&path, |s| draft.apply_to(s)) {
         // The file is the source of truth for the two settings that are
@@ -875,9 +935,18 @@ pub(super) async fn accept_file_offer(
     // successfully decrypting to `final_path` at all (`ack_proof_for_file`
     // reads it back), a materially different, proof-based mechanism this
     // item does not touch.
-    let is_staged_preview =
-        offer.otp_contact_name.is_none() && crate::client::file_transfer::is_txt_filename(&dest_name);
-    let final_path = if is_staged_preview {
+    // A shared-folder download (§7.8) goes where its tag said - under
+    // `<downloads>/<owner>/<share>/...` - and is never staged for preview:
+    // the user asked for the file, not a look at it.
+    let is_staged_preview = offer.auto_dest.is_none()
+        && offer.otp_contact_name.is_none()
+        && crate::client::file_transfer::is_txt_filename(&dest_name);
+    let final_path = if let Some(dest) = &offer.auto_dest {
+        // Written under `<dest>.part` while it arrives, so nothing on
+        // disk ever looks like the finished file until it is one
+        // (`shared::finish_shared_receive` does the move, §7.8).
+        crate::client::shared_folders::partial_path(dest)
+    } else if is_staged_preview {
         crate::client::file_transfer::incoming_preview_dir().join(&dest_name)
     } else {
         crate::client::file_transfer::default_download_dir().join(&dest_name)
@@ -926,6 +995,16 @@ pub(super) async fn accept_file_offer(
             last_seen: Instant::now(),
         },
     );
+    // A shared download is not a message either side sent, so it makes no
+    // row in the conversation - its progress lives on the Downloads tab
+    // (§7.8).
+    if offer.auto_dest.is_some() {
+        session.peer_link.ensure_link(wr, from).await;
+        session
+            .peer_link
+            .send_reliable_or_queue(from, P2pPayload::FileAccept { stream_id });
+        return Ok(());
+    }
     match &offer.channel {
         Some(channel) => {
             ui_state.on_channel_file_offer_accepted(

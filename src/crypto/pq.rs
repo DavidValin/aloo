@@ -334,10 +334,24 @@ pub fn open_setup(
     sender_public: &PqPublicBundle,
     setup: &SendSetup,
 ) -> Option<[u8; 32]> {
+    open_setup_indexed(my_decaps, my_fp, sender_public, setup).map(|(_, k)| k)
+}
+
+/// `open_setup`, also saying *which* of `my_decaps` opened it - its
+/// index. That is how the caller learns which generation of its own key
+/// the sender is sealing to, which in turn is what keeps this side from
+/// rotating so far ahead of the sender that nothing they send can be
+/// opened (`client::pq_rekey::PqOwnKeys::note_peer_used`).
+pub fn open_setup_indexed(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    setup: &SendSetup,
+) -> Option<(usize, [u8; 32])> {
     if &setup.binding.recipient_fp != my_fp {
         return None;
     }
-    let k_data = my_decaps.iter().find_map(|decap| {
+    let (index, k_data) = my_decaps.iter().enumerate().find_map(|(index, decap)| {
         unwrap_key(
             decap,
             &setup.kem_ciphertext,
@@ -352,13 +366,14 @@ pub fn open_setup(
                 .ok()
                 .is_some_and(|c| verify_both(sender_public, &c, setup))
         })
+        .map(|k| (index, k))
     })?;
     let commitment = send_commitment(&setup.binding, &k_data).ok()?;
 
     if !verify_both(sender_public, &commitment, setup) {
         return None;
     }
-    Some(k_data)
+    Some((index, k_data))
 }
 
 /// Verifies **both** of a setup's signatures over `commitment`. A break of
@@ -995,15 +1010,26 @@ pub fn open_send_blinded(
     sender_public: &PqPublicBundle,
     blob: &[u8],
 ) -> Option<(u64, Vec<u8>)> {
+    open_send_blinded_indexed(my_decaps, my_fp, sender_public, blob).map(|(_, id, pt)| (id, pt))
+}
+
+/// `open_send_blinded`, also returning the index of the key that opened
+/// it (see `open_setup_indexed`).
+pub fn open_send_blinded_indexed(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<(usize, u64, Vec<u8>)> {
     let mut send: HybridSend = bincode_decode(blob).ok()?;
     if send.setup.binding.recipient_fp != [0u8; 32] || send.setup.binding.channel.is_some() {
         return None;
     }
     // The guess the signatures are about to test.
     send.setup.binding.recipient_fp = *my_fp;
-    let k_data = open_setup(my_decaps, my_fp, sender_public, &send.setup)?;
+    let (index, k_data) = open_setup_indexed(my_decaps, my_fp, sender_public, &send.setup)?;
     let plaintext = open_chunk(&k_data, send.setup.binding.send_id, 0, &send.ciphertext)?;
-    Some((send.setup.binding.send_id, plaintext))
+    Some((index, send.setup.binding.send_id, plaintext))
 }
 
 /// Opens a whole one-chunk send, returning what it was bound to alongside
@@ -1016,10 +1042,21 @@ pub fn open_send(
     sender_public: &PqPublicBundle,
     blob: &[u8],
 ) -> Option<(SendBinding, Vec<u8>)> {
+    open_send_indexed(my_decaps, my_fp, sender_public, blob).map(|(_, b, pt)| (b, pt))
+}
+
+/// `open_send`, also returning the index of the key that opened it (see
+/// `open_setup_indexed`).
+pub fn open_send_indexed(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<(usize, SendBinding, Vec<u8>)> {
     let send: HybridSend = bincode_decode(blob).ok()?;
-    let k_data = open_setup(my_decaps, my_fp, sender_public, &send.setup)?;
+    let (index, k_data) = open_setup_indexed(my_decaps, my_fp, sender_public, &send.setup)?;
     let plaintext = open_chunk(&k_data, send.setup.binding.send_id, 0, &send.ciphertext)?;
-    Some((send.setup.binding, plaintext))
+    Some((index, send.setup.binding, plaintext))
 }
 
 /// Recovers `K_data` from a recipient-specific key-wrap using this client's

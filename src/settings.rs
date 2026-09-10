@@ -199,6 +199,12 @@ pub const DEFAULT_OTP_LOW_KEY_WARN_PCT: u8 = 10;
 /// many OTP send/receive operations, rather than on every single one.
 pub const DEFAULT_OTP_STATUS_POLL_INTERVAL: u32 = 20;
 
+/// `file_sharing_max_pct`'s default: half of the declared link speed
+/// (`file_sharing_link_speed_kbps`) may go to shared-folder downloads
+/// (`client::shared_folders::SharePacer`). Only meaningful once a link
+/// speed is declared at all - `0` kbps, the default, means no cap.
+pub const DEFAULT_FILE_SHARING_MAX_PCT: u8 = 50;
+
 /// The UDP port the direct-punch listener binds when `direct_punch=on`.
 ///
 /// Server-coordinated punching (`docs/PROTOCOL.md` §7.1) can use an
@@ -508,6 +514,244 @@ impl DirectPunchTarget {
     }
 }
 
+/// The default for `transfers_shortcut` - the key that opens the global
+/// transfers popup (`client::tui::transfers_popup`).
+pub const DEFAULT_TRANSFERS_SHORTCUT: &str = "ctrl+d";
+
+/// One in-app key combination, as a settings line spells it:
+/// `ctrl+d`, `alt+t`, `f5`. Distinct from `global_ptt_shortcut`,
+/// which names an *OS-level* hotkey the window manager grabs - this one
+/// is an ordinary key this app matches while it has focus, so it is
+/// parsed here rather than handed to `global-hotkey`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChord {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// The key itself, lowercased for a letter so matching never depends
+    /// on whether shift happened to be down.
+    pub key: KeyChordKey,
+}
+
+/// The non-modifier half of a `KeyChord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyChordKey {
+    Char(char),
+    /// `f1`..`f12`.
+    Function(u8),
+}
+
+impl Default for KeyChord {
+    fn default() -> Self {
+        Self::parse(DEFAULT_TRANSFERS_SHORTCUT).expect("the built-in default parses")
+    }
+}
+
+impl KeyChord {
+    /// Parses `ctrl+d`-style text, in any order and any case, with
+    /// `control` and `option` accepted as the names some keyboards use.
+    /// `None` for anything that names no key, an unknown modifier, or
+    /// more than one key.
+    ///
+    /// A plain character with no modifier at all is refused too: this
+    /// app has a compose bar, so a bare letter as an app-wide shortcut
+    /// would swallow the letter rather than open anything. A function
+    /// key needs no modifier, having nothing to collide with.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut chord = Self {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            key: KeyChordKey::Char(' '),
+        };
+        let mut key = None;
+        for part in value.split('+') {
+            let part = part.trim().to_ascii_lowercase();
+            match part.as_str() {
+                "" => return None,
+                "ctrl" | "control" => chord.ctrl = true,
+                "alt" | "option" | "meta" => chord.alt = true,
+                "shift" => chord.shift = true,
+                other => {
+                    if key.is_some() {
+                        return None;
+                    }
+                    key = Some(match other.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                        Some(n) if (1..=12).contains(&n) => KeyChordKey::Function(n),
+                        _ => {
+                            let mut chars = other.chars();
+                            let c = chars.next()?;
+                            if chars.next().is_some() {
+                                return None;
+                            }
+                            KeyChordKey::Char(c)
+                        }
+                    });
+                }
+            }
+        }
+        chord.key = key?;
+        if matches!(chord.key, KeyChordKey::Char(_)) && !(chord.ctrl || chord.alt || chord.shift) {
+            return None;
+        }
+        Some(chord)
+    }
+
+    /// The exact spelling `parse` accepts, so a round trip is lossless.
+    pub fn to_setting_value(&self) -> String {
+        let mut out = String::new();
+        if self.ctrl {
+            out.push_str("ctrl+");
+        }
+        if self.alt {
+            out.push_str("alt+");
+        }
+        if self.shift {
+            out.push_str("shift+");
+        }
+        match &self.key {
+            KeyChordKey::Char(c) => out.push(*c),
+            KeyChordKey::Function(n) => out.push_str(&format!("f{n}")),
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for KeyChord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_setting_value())
+    }
+}
+
+/// Who may see one shared folder (`docs/PROTOCOL.md` §7.8): everyone this
+/// client is linked to, or only the nicknames listed. Keyed by nickname -
+/// the identity a pin (`client::idstore`) and a `direct_punch_to` line
+/// name - never by `UserId`, which is per-connection and never survives a
+/// reconnect (§3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareAccess {
+    All,
+    Users(BTreeSet<String>),
+}
+
+impl ShareAccess {
+    /// Whether `nickname` may see (and list, and download from) a folder
+    /// with this access.
+    pub fn allows(&self, nickname: &str) -> bool {
+        match self {
+            ShareAccess::All => true,
+            ShareAccess::Users(users) => users.contains(nickname),
+        }
+    }
+}
+
+/// One `share=<path>,all` or `share=<path>,<nickname>[,<nickname>...]`
+/// line: a local folder made browsable and downloadable by peers
+/// (`docs/PROTOCOL.md` §7.8, `client::shared_folders`). The folder's
+/// wire-visible name is its final path component (`name`), so a peer
+/// only ever learns `Photos`, never `/home/me/Photos`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedFolder {
+    /// As written in the file, `~` and all - expanded only when the
+    /// folder is actually read (`root`), the same way every other path in
+    /// this file is kept.
+    pub path: String,
+    pub access: ShareAccess,
+}
+
+impl SharedFolder {
+    /// Parses one settings value. The first comma-separated field is the
+    /// path and every later one is a nickname (or the single word
+    /// `all`), so a path containing a comma cannot be written here at
+    /// all: the comma is the separator, and nothing downstream could
+    /// tell such a path from a shorter one shared with someone whose
+    /// nickname happens to follow. Folders whose path holds a comma
+    /// therefore cannot be shared - the `name()` check below is what
+    /// stops the most misleading spellings, and the popup shows the
+    /// parsed result back so a misread line is visible rather than
+    /// silent.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let mut parts = value.split(',').map(str::trim);
+        let path = parts.next().unwrap_or("").to_string();
+        if path.is_empty() {
+            return Err(format!("expected <path>,all or <path>,<nickname>[,...], got {value:?}"));
+        }
+        let access: Vec<&str> = parts.collect();
+        if access.is_empty() {
+            return Err(format!("{path:?} names nobody who may see it - add `,all` or nicknames"));
+        }
+        let folder = Self { path, access: ShareAccess::All };
+        if folder.name().is_empty() {
+            return Err(format!("{:?} has no folder name to share under", folder.path));
+        }
+        if access == ["all"] {
+            return Ok(folder);
+        }
+        let mut users = BTreeSet::new();
+        for nickname in access {
+            if nickname.eq_ignore_ascii_case("all")
+                || !crate::validation::nickname_is_registrable(nickname)
+            {
+                return Err(format!("not a valid nickname: {nickname:?}"));
+            }
+            users.insert(nickname.to_string());
+        }
+        Ok(Self {
+            access: ShareAccess::Users(users),
+            ..folder
+        })
+    }
+
+    /// `<path>,all` or `<path>,<nickname>,...` - the exact spelling
+    /// `parse` accepts, so a load/save round trip is lossless.
+    pub fn to_setting_value(&self) -> String {
+        match &self.access {
+            ShareAccess::All => format!("{},all", self.path),
+            ShareAccess::Users(users) => {
+                let mut line = self.path.clone();
+                for user in users {
+                    line.push(',');
+                    line.push_str(user);
+                }
+                line
+            }
+        }
+    }
+
+    /// The name peers see this folder under: the path's final component,
+    /// with a trailing separator ignored (`/home/me/Photos/` is still
+    /// `Photos`). Empty for a path with no such component (`/`, `~`
+    /// alone), which `parse` refuses.
+    ///
+    /// What counts as a separator is this machine's own rule
+    /// (`std::path::is_separator`: `/` everywhere, `\` on Windows too) -
+    /// a backslash is an ordinary character in a Linux or macOS folder
+    /// name, so trimming one there would announce a name the owner's own
+    /// filesystem does not use.
+    pub fn name(&self) -> String {
+        let trimmed = self.path.trim_end_matches(std::path::is_separator);
+        std::path::Path::new(trimmed)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| n != "~" && n != "." && n != "..")
+            .unwrap_or_default()
+    }
+
+    /// The directory actually read - `path` with `~` expanded.
+    pub fn root(&self) -> PathBuf {
+        crate::platform::expand_tilde(&self.path)
+    }
+
+    /// The access list as the settings popup edits it: `all`, or the
+    /// nicknames comma-joined.
+    pub fn access_text(&self) -> String {
+        match &self.access {
+            ShareAccess::All => "all".to_string(),
+            ShareAccess::Users(users) => users.iter().cloned().collect::<Vec<_>>().join(", "),
+        }
+    }
+}
+
 /// Splits `host`, `host:port`, `[v6]` or `[v6]:port` into its two
 /// pieces, defaulting to `DEFAULT_DIRECT_PUNCH_PORT` when no port is
 /// named, and rejects a host that is neither an IP literal nor a
@@ -801,6 +1045,28 @@ pub struct Settings {
     /// updater simply never fires (`client::noip::NoipConfig::from_settings`).
     pub noip_hostname: String,
     pub noip_username: String,
+    /// This machine's upload speed in kilobits per second, as the user
+    /// declares it - aloo has no way to measure the internet speed itself.
+    /// `0` (the default) means unknown, and no cap on shared-folder sends
+    /// at all. Only shared-folder transfers (`docs/PROTOCOL.md` §7.8) are
+    /// paced by it; an ordinary `/file` send is not.
+    pub file_sharing_link_speed_kbps: u32,
+    /// What share of that speed shared-folder sends may use, `1..=100` -
+    /// the cap is `file_sharing_link_speed_kbps * file_sharing_max_pct / 100`,
+    /// applied across every shared send in flight at once
+    /// (`client::shared_folders::SharePacer`).
+    pub file_sharing_max_pct: u8,
+    /// The key that opens the global transfers popup
+    /// (`client::tui::transfers_popup`, `docs/PROTOCOL.md` §7.8) -
+    /// `ctrl+d` unless the file says otherwise. An in-app key, not an
+    /// OS-level one, so unlike `global_ptt_shortcut` it needs nothing
+    /// registering and takes effect the moment it is changed.
+    pub transfers_shortcut: KeyChord,
+    /// Every `share` line, in file order - one accumulating key per
+    /// folder, like `direct_punch_to`. Two lines whose folders have the
+    /// same final component cannot both be shared: peers address a folder
+    /// by that name alone, so the second is refused into `shares_invalid`.
+    pub shares: Vec<SharedFolder>,
     pub noip_password: String,
     // -----------------------------------------------------------------
     // The last connection made from the connect popup
@@ -843,6 +1109,10 @@ pub struct Settings {
     /// the caller that starts the scheduler reports these once. Never
     /// written back by `save`.
     pub direct_punch_invalid: Vec<(String, String)>,
+    /// `share` lines that would not parse (or name a folder already
+    /// shared), kept verbatim with the reason - `direct_punch_invalid`'s
+    /// counterpart, reported once at session start. Never written back.
+    pub shares_invalid: Vec<(String, String)>,
 }
 
 impl Default for Settings {
@@ -894,12 +1164,17 @@ impl Default for Settings {
             noip_hostname: String::new(),
             noip_username: String::new(),
             noip_password: String::new(),
+            transfers_shortcut: KeyChord::default(),
+            file_sharing_link_speed_kbps: 0,
+            file_sharing_max_pct: DEFAULT_FILE_SHARING_MAX_PCT,
+            shares: Vec::new(),
             connect_host: None,
             connect_port: None,
             connect_nickname: None,
             connect_using_ssl: false,
             connect_ssl_ca: None,
             direct_punch_invalid: Vec::new(),
+            shares_invalid: Vec::new(),
         }
     }
 }
@@ -963,6 +1238,11 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         Literal("# direct_punch_to=bob,bobhost.com:19000,every_1m"),
         Literal("# direct_punch_to=carol,realm://public@realm.hy2.io/<long-random-realm-name>,every_1m"),
         Literal("# direct_punch_channel=direct-punches,the-hall"),
+        Key("transfers_shortcut"),
+        Key("file_sharing_link_speed_kbps"),
+        Key("file_sharing_max_pct"),
+        Literal("# share=~/Public,all"),
+        Literal("# share=~/Photos,alice,bob"),
         Key("noip_when_no_server_and_direct_punch_is_active"),
         Key("noip_hostname"),
         Key("noip_username"),
@@ -1239,6 +1519,35 @@ impl Settings {
                         .direct_punch_invalid
                         .push((value.to_string(), reason)),
                 },
+                // Left at the default if it names no key - a shortcut
+                // that cannot be pressed is not one to save.
+                "transfers_shortcut" => {
+                    if let Some(chord) = KeyChord::parse(value) {
+                        settings.transfers_shortcut = chord;
+                    }
+                }
+                "file_sharing_link_speed_kbps" => {
+                    set_parsed(&mut settings.file_sharing_link_speed_kbps, value)
+                }
+                // A percentage outside `1..=100` is not a cap anyone
+                // meant; like every other numeric key, the default stays.
+                "file_sharing_max_pct" => {
+                    if let Ok(pct) = value.parse::<u8>()
+                        && (1..=100).contains(&pct)
+                    {
+                        settings.file_sharing_max_pct = pct;
+                    }
+                }
+                "share" => match SharedFolder::parse(value) {
+                    Ok(folder) if settings.shares.iter().any(|f| f.name() == folder.name()) => {
+                        settings.shares_invalid.push((
+                            value.to_string(),
+                            format!("a folder named {:?} is already shared", folder.name()),
+                        ))
+                    }
+                    Ok(folder) => settings.shares.push(folder),
+                    Err(reason) => settings.shares_invalid.push((value.to_string(), reason)),
+                },
                 "noip_when_no_server_and_direct_punch_is_active" => {
                     settings.noip_when_no_server_and_direct_punch_is_active = parse_switch(value)
                 }
@@ -1334,6 +1643,9 @@ impl Settings {
             always("noip_hostname", &self.noip_hostname),
             always("noip_username", &self.noip_username),
             always("noip_password", &self.noip_password),
+            always("transfers_shortcut", &self.transfers_shortcut),
+            always("file_sharing_link_speed_kbps", self.file_sharing_link_speed_kbps),
+            always("file_sharing_max_pct", self.file_sharing_max_pct),
             always_switch("connect_using_ssl", self.connect_using_ssl),
             // Optional - only ever added to the file once actually set.
             optional_text("otp_binary_path", &self.otp_binary_path),
@@ -1418,6 +1730,10 @@ impl Settings {
                 } else {
                     vec![self.direct_punch_channels.join(",")]
                 },
+            ),
+            (
+                "share",
+                self.shares.iter().map(SharedFolder::to_setting_value).collect(),
             ),
         ]
     }

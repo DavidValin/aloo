@@ -339,7 +339,7 @@ async fn paste_two_lines(w: &mut AlooWorld, first: String, second: String) {
 
 #[when(expr = "I open a private room with {word}")]
 #[given(expr = "I have opened a private room with {word}")]
-async fn open_private_room(w: &mut AlooWorld, name: String) {
+pub async fn open_private_room(w: &mut AlooWorld, name: String) {
     let want = UserId(id_for(&name));
     let state = w.ui_mut();
     state.focus = Focus::Sidebar;

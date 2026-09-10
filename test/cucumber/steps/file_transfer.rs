@@ -171,6 +171,9 @@ async fn peer_offers_file_channel(w: &mut AlooWorld, name: String, filename: Str
         stream_id: STREAM_ID,
         channel: Some("general".into()),
         otp_contact_name: None,
+        auto_dest: None,
+        shared_request_id: None,
+        shared_attempt: None,
     };
     if w.ui_ref().is_trust_gated(id) {
         w.ui_mut().hold_file_offer(offer);

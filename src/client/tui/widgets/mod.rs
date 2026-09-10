@@ -9,3 +9,6 @@
 
 pub mod confirm_popup;
 pub mod field;
+pub mod progress_bar;
+pub mod text;
+pub mod transfer_row;

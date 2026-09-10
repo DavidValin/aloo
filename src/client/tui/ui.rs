@@ -616,6 +616,13 @@ pub enum Mode {
     /// `crate::client::tui::export_popup`. Data lives in
     /// `UiState::export_popup`, same split as `FileSend`/`file_send`.
     ExportPopup,
+    /// The "Browse shared files" popup is open - see
+    /// `crate::client::tui::shared_browser`. Data lives in
+    /// `UiState::shared_browser`, same split as `FileSend`/`file_send`.
+    SharedFiles,
+    /// The global transfers popup is open - see
+    /// `crate::client::tui::transfers_popup`.
+    Transfers,
 }
 
 /// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
@@ -652,6 +659,21 @@ pub struct PendingFileOffer {
     /// separately as `P2pEvent::OtpFileContentSeq` (docs/PROTOCOL.md
     /// 16.2). `None` here for an ordinary (non-OTP) offer.
     pub otp_contact_name: Option<String>,
+    /// `Some(path)` for an offer answering a shared-folder download this
+    /// side asked for (`docs/PROTOCOL.md` §7.8): it is accepted without
+    /// the popup, straight into `path` (`session::shared::drain_auto_accepts`
+    /// runs `accept_file_offer` for it). `None` - every other offer -
+    /// queues for the Accept/Reject popup as before.
+    pub auto_dest: Option<std::path::PathBuf>,
+    /// The shared download this offer belongs to (§7.8) - set with
+    /// `auto_dest`, and what ties the file's progress back to its row in
+    /// the Downloads tab.
+    pub shared_request_id: Option<u64>,
+    /// Which ask for that download this file belongs to. An offer from a
+    /// round the requester has since asked again past is refused rather
+    /// than written, and recognising it at all is what keeps it off the
+    /// Accept popup (§7.8).
+    pub shared_attempt: Option<u32>,
 }
 
 
@@ -1338,6 +1360,45 @@ pub struct UiState {
     /// `client::contacts::handle_request_user_info` has gathered it
     /// (`set_user_info`), same split `ContactsState::rows` uses.
     pub user_info: Option<super::contacts::UserInfoState>,
+    /// The share names each peer has announced to us
+    /// (`Content::SharedFolders`, `docs/PROTOCOL.md` §7.8) - what the
+    /// `/info` popup's "Browse shared files" button and the browser's top
+    /// level list. A peer sharing nothing has no entry.
+    pub peer_shares: HashMap<UserId, Vec<String>>,
+    /// Peers whose "has given you access to files" notice has been
+    /// printed in their DM already - once per room, and again only after
+    /// a later announce (`set_peer_shares`).
+    pub(crate) share_notice_shown: HashSet<UserId>,
+    /// The global transfers popup (`Ctrl+D`) - see
+    /// `super::transfers_popup`. An overlay over whatever is on screen,
+    /// like the user-info popup.
+    pub transfers_popup: Option<super::transfers_popup::TransfersPopupState>,
+    /// The key combination that opens it, from `~/.aloo/settings`.
+    pub transfers_shortcut: crate::settings::KeyChord,
+    /// The "Browse shared files" popup - see `super::shared_browser`.
+    pub shared_browser: Option<super::shared_browser::SharedBrowserState>,
+    /// Every shared-folder transfer this client has taken part in, both
+    /// directions, durable across restarts
+    /// (`client::transfer_log::TransferLog`) - the browser's Downloads
+    /// tab renders one peer's downloads out of it, and `Ctrl+D` the
+    /// whole thing. Deliberately not the message log: a transfer is
+    /// something one side fetched, not something either side said (§7.8).
+    pub transfers: crate::client::transfer_log::TransferLog,
+    /// The rolling byte windows behind the header's two speed figures.
+    pub(crate) download_speed: super::shared_downloads::DownloadSpeed,
+    pub(crate) upload_speed: super::shared_downloads::DownloadSpeed,
+    /// What that indicator currently shows, in kilobits per second -
+    /// `None` when nothing is arriving. Refreshed on the session's ticker
+    /// rather than computed at render time, so drawing a frame never
+    /// depends on the clock (the same split `direct_punch_status` uses).
+    pub fileshare_download_kbps: Option<u64>,
+    /// The same for what is going out of this client's shared folders.
+    pub fileshare_upload_kbps: Option<u64>,
+    /// Offers that arrived with an `auto_dest` (`PendingFileOffer`) and
+    /// are waiting for the session to accept them - `push_file_offer`
+    /// parks them here instead of the popup queue, and
+    /// `take_auto_accepts` hands them over.
+    pub(crate) auto_accept_offers: Vec<(UserId, u64)>,
     /// The superadmin `/users` popup - every registered user and the
     /// channels each administers. Opened empty (`open_users_admin`),
     /// filled in once `ServerMessage::UsersList` answers
@@ -1504,6 +1565,17 @@ impl UiState {
             next_msg_id: 0,
             message_info: None,
             user_info: None,
+            peer_shares: HashMap::new(),
+            share_notice_shown: HashSet::new(),
+            transfers_popup: None,
+            transfers_shortcut: crate::settings::KeyChord::default(),
+            shared_browser: None,
+            transfers: crate::client::transfer_log::TransferLog::default(),
+            download_speed: super::shared_downloads::DownloadSpeed::default(),
+            upload_speed: super::shared_downloads::DownloadSpeed::default(),
+            fileshare_download_kbps: None,
+            fileshare_upload_kbps: None,
+            auto_accept_offers: Vec::new(),
             users_admin: None,
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
@@ -2137,6 +2209,14 @@ impl UiState {
     /// decide whether to play the bell.
     pub fn push_file_offer(&mut self, offer: PendingFileOffer) -> bool {
         let key = (offer.from, offer.stream_id);
+        // An offer this side asked for (a shared-folder download) never
+        // reaches the popup: it is held for the session to accept, with
+        // no bell - the user already chose it.
+        if offer.auto_dest.is_some() {
+            self.file_offers.insert(key, offer);
+            self.auto_accept_offers.push(key);
+            return false;
+        }
         self.file_offers.insert(key, offer);
         self.file_offer_queue.push_back(key);
         let is_front = self.file_offer_queue.front() == Some(&key);
@@ -2144,6 +2224,19 @@ impl UiState {
             self.file_offer_focus = Confirm::Yes;
         }
         is_front
+    }
+
+    /// Every offer parked by `push_file_offer` for automatic acceptance,
+    /// handed over once - the session accepts each with
+    /// `accept_file_offer`.
+    pub fn take_auto_accepts(&mut self) -> Vec<(UserId, u64)> {
+        std::mem::take(&mut self.auto_accept_offers)
+    }
+
+    /// One queued offer by its own key - including one parked for
+    /// automatic acceptance, which never reaches the popup.
+    pub fn file_offer_for(&self, from: UserId, stream_id: u64) -> Option<&PendingFileOffer> {
+        self.file_offers.get(&(from, stream_id))
     }
 
     /// The offer currently shown in the popup, if any.

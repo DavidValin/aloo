@@ -35,6 +35,8 @@ pub mod reconnect;
 pub mod rekey;
 pub mod replay;
 pub mod session;
+pub mod shared_folders;
+pub mod transfer_log;
 pub mod sysstats;
 pub mod tui;
 pub mod voice;

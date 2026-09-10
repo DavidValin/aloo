@@ -1306,6 +1306,20 @@ fn status_line(state: &UiState) -> Line<'static> {
         ));
         spans.push(Span::raw("  "));
     }
+    // What is arriving from other people's shared folders right now
+    // (§7.8) - blinking, like the unread-mail marker above, because it is
+    // a thing in progress rather than a standing fact.
+    for (arrow, kbps) in [
+        ("\u{2193}", state.fileshare_download_kbps),
+        ("\u{2191}", state.fileshare_upload_kbps),
+    ] {
+        let Some(kbps) = kbps else { continue };
+        spans.push(Span::styled(
+            format!("{} {kbps} kbps", if state.blink_on { arrow } else { " " }),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw("  "));
+    }
     if let Some((active, total, next_in)) = state.direct_punch_status {
         let next = next_in
             .map(human_duration)

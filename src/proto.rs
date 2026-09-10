@@ -361,6 +361,45 @@ pub enum Content {
     /// initiator's own durably-retried notice (`OtpStore::pending_end_notices`)
     /// stops resending once this arrives.
     OtpEndSessionAck,
+    /// Carries a bincode-encoded `Vec` of
+    /// `client::shared_folders::SharedFolderSummary`: the folders the
+    /// sender shares with *this* recipient (`docs/PROTOCOL.md` §7.8),
+    /// sent once a link is up and again whenever that list changes - an
+    /// empty list withdraws everything. Sealed like `ChannelPresence`,
+    /// for the same reason: the names are private to the pair, and the
+    /// envelope opening under the pinned key is what makes the claim the
+    /// sender's own. Trailing and matched only via `!=`, so an old peer
+    /// simply never learns of any shares.
+    SharedFolders,
+    /// Carries a bincode-encoded `client::shared_folders::SharedListRequest`
+    /// - a requester asking what one shared folder holds (§7.8).
+    SharedListRequest,
+    /// Carries a bincode-encoded `client::shared_folders::SharedListResponse`
+    /// - the owner's answer to `SharedListRequest` (§7.8).
+    SharedListResponse,
+    /// Carries a bincode-encoded `client::shared_folders::SharedDownloadRequest`
+    /// - a requester asking for one shared file, or every file under one
+    /// shared folder (§7.8).
+    SharedDownloadRequest,
+    /// Carries a bincode-encoded `client::shared_folders::SharedFileTag` -
+    /// sent by the owner right before each `FileOffer`/`OtpFileOffer` a
+    /// download request produces, naming the request and the file's
+    /// place under it, which is what lets the requester accept that
+    /// offer with no popup (§7.8).
+    SharedFileTag,
+    /// Carries a bincode-encoded `client::shared_folders::SharedDownloadPlan`
+    /// - what a download request turned out to cover, sent before the
+    /// first file so the requester can show real progress from the start
+    /// rather than counting files as they arrive (§7.8).
+    SharedDownloadPlan,
+    /// Carries a bincode-encoded `client::shared_folders::SharedDownloadCancel`
+    /// - the requester has given up on a download, so the owner stops
+    /// offering the files still queued for it (§7.8).
+    SharedDownloadCancel,
+    /// Carries a bincode-encoded `client::shared_folders::SharedDownloadDone`
+    /// - the owner has offered every file a download request covered, or
+    /// says why it could not (§7.8).
+    SharedDownloadDone,
 }
 
 /// Messages the client sends to the server - pure signaling: auth,
