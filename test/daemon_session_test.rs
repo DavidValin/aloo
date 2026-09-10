@@ -426,12 +426,25 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
     let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
     assert_ne!(alice_port, bob_port);
 
-    // Each has met the other before, so each holds the other's key. That
-    // pin is the only thing that will let either believe a nickname.
+    // Each has met the other before, so each holds the other's key - under
+    // the *real* device id `run_daemon_session` will generate/persist for
+    // that nickname (`device_id::load_or_create`, same file both sessions
+    // share via `ALOO_HOME`), not a placeholder: `finalize_identity_pin`
+    // (session/identity.rs) gates an already-known key arriving from an
+    // unrecognised device behind a human Accept/Reject review, so a pin
+    // under any other device id would leave that review open forever and
+    // the message below stuck behind it.
+    let device_id_path = aloo::client::device_id::default_path();
+    let bob_device_id = aloo::client::device_id::load_or_create(&device_id_path, "bob")
+        .expect("resolving bob's device id");
+    let alice_device_id = aloo::client::device_id::load_or_create(&device_id_path, "alice")
+        .expect("resolving alice's device id");
+
+    // That pin is the only thing that will let either believe a nickname.
     let mut alice_store = aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice"));
-    alice_store.pin_new_device("bob", "test-device", &public_der(home, "bob"), aloo::client::idstore::Trust::Tofu);
+    alice_store.pin_new_device("bob", &bob_device_id, &public_der(home, "bob"), aloo::client::idstore::Trust::Tofu);
     let mut bob_store = aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob"));
-    bob_store.pin_new_device("alice", "test-device", &public_der(home, "alice"), aloo::client::idstore::Trust::Tofu);
+    bob_store.pin_new_device("alice", &alice_device_id, &public_der(home, "alice"), aloo::client::idstore::Trust::Tofu);
 
     // Both grids restart at the same o'clock, so both fire at the next
     // minute boundary. Started just before one, rather than waiting a whole
