@@ -81,6 +81,14 @@ Feature: Sending a voice message by holding a key
     When I press and hold anywhere on the screen
     Then the voice message is sent
 
+  @AC-471
+  Scenario: A terminal that only reports taps is told hold-to-talk cannot work there
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I tap the screen on a terminal that only reports taps
+    Then no recording starts
+    And a status notice says "reports taps only"
+
   @AC-035
   Scenario: An incoming voice message appears while it is still arriving
     Given I am connected and viewing a channel
@@ -96,6 +104,14 @@ Feature: Sending a voice message by holding a key
     When my own voice message starts streaming into the channel
     Then my own streaming placeholder appears immediately
     When my own voice message finishes after 900 milliseconds
+    Then it becomes a replayable voice message of 900 milliseconds, in place
+
+  @AC-470
+  Scenario: My own voice message still finishes after the server renamed me
+    Given I am connected and viewing a channel
+    When my own voice message starts streaming into the channel
+    And the server reconnects me under a new identity
+    And my own voice message finishes after 900 milliseconds
     Then it becomes a replayable voice message of 900 milliseconds, in place
 
   @AC-035

@@ -2428,3 +2428,49 @@ fn a_returning_peers_row_still_takes_their_acknowledgement() {
         "his acknowledgement must reach the row that was held for him"
     );
 }
+
+/// A private recording that started under one id and stopped under the
+/// next - the server renamed this client in between - still finds its
+/// row (AC-470).
+/// @requirement AC-470
+#[test]
+fn my_own_private_voice_row_finalizes_after_a_reconnect_handed_me_a_new_id() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+    state.log_own_voice_stream_start_dm(UserId(2), 7, None);
+    assert_eq!(
+        state.private_rooms[&UserId(2)].log[1].body,
+        MessageBody::VoiceStreaming { stream_id: 7 }
+    );
+    state.set_own_id(UserId(42));
+
+    state.on_own_direct_stream_finished(UserId(2), 7, 900, vec![9]);
+    assert_eq!(
+        state.private_rooms[&UserId(2)].log[1].body,
+        MessageBody::Voice {
+            duration_ms: 900,
+            pcm: vec![9]
+        }
+    );
+}
+
+/// Bob's stream 5 and my stream 5 are different streams even when, after
+/// a server restart, bob holds the id I was stamped with: his finish
+/// finalizes his placeholder and leaves mine recording.
+/// @requirement AC-470
+#[test]
+fn a_peers_private_finish_never_claims_my_own_placeholder_with_the_same_stream_id() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+    state.log_own_voice_stream_start_dm(UserId(2), 5, None); // stamped 1
+    state.set_own_id(UserId(42));
+    // The server restarted; bob reconnected as 1, and his room is the
+    // one his new id names.
+    state.on_direct_stream_start(UserId(1), UserId(1), "bob".into(), 5, false);
+    // My old room is still the one with my placeholder; a finish for
+    // bob's stream 5 arriving there must not touch it.
+    state.on_direct_stream_finished(UserId(2), UserId(1), 5, 1000, vec![1]);
+    assert_eq!(state.private_rooms[&UserId(2)].log[1].body, MessageBody::VoiceStreaming { stream_id: 5 });
+    state.on_direct_stream_finished(UserId(1), UserId(1), 5, 1000, vec![1]);
+    assert!(matches!(state.private_rooms[&UserId(1)].log[0].body, MessageBody::Voice { duration_ms: 1000, .. }));
+}

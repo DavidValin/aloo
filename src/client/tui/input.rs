@@ -1759,6 +1759,14 @@ impl UiState {
     /// running stops it too, rather than starting another: that is what a
     /// stuck recording looks like on a terminal that kept the release for
     /// its own long-press gesture, and a tap is the natural way out.
+    ///
+    /// A press and release arriving as one (`TAP_PAIR_WINDOW`) is the
+    /// signature of a terminal that never forwards a held finger at all -
+    /// Termux and most tablet terminal apps report a touch only as a
+    /// finished tap and keep a long press for their own text selection.
+    /// Holding can never record there, and the first such pair says so
+    /// once (`TAP_ONLY_TERMINAL_NOTICE`) instead of leaving a held finger
+    /// to fail silently. It stays the click it always was.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<UiAction> {
         self.handle_mouse_at(event, Instant::now())
     }
@@ -1769,8 +1777,17 @@ impl UiState {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {}
             MouseEventKind::Up(MouseButton::Left) => {
-                self.touch_press = None;
-                return self.touch_record_stop();
+                let pressed_at = self.touch_press.take();
+                if let Some(stop) = self.touch_record_stop() {
+                    return Some(stop);
+                }
+                let reported_pair =
+                    pressed_at.is_some_and(|at| now.duration_since(at) <= TAP_PAIR_WINDOW);
+                if reported_pair && !self.recording && !self.tap_only_terminal_noticed {
+                    self.tap_only_terminal_noticed = true;
+                    self.push_status_notice(TAP_ONLY_TERMINAL_NOTICE.to_string(), false);
+                }
+                return None;
             }
             _ => return None,
         }

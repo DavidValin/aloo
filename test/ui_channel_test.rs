@@ -883,7 +883,7 @@ fn log_own_voice_stream_start_channel_appears_immediately_and_finalizes() {
     );
     assert!(state.channels[0].log[0].outgoing);
 
-    state.on_channel_stream_finished("general", UserId(1), 7, 900, vec![9, 9]);
+    state.on_own_channel_stream_finished("general", 7, 900, vec![9, 9]);
     assert_eq!(
         state.channels[0].log[0].body,
         MessageBody::Voice {
@@ -999,7 +999,7 @@ fn an_outgoing_voice_row_never_shows_the_marker_even_if_listened_were_somehow_fa
     let mut state = joined_general_with(vec![]);
     state.log_own_voice_stream_start_channel("general", 7, None);
     state.channels[0].log[0].listened = false; // shouldn't happen in practice; belt-and-suspenders
-    state.on_channel_stream_finished("general", UserId(1), 7, 900, vec![9, 9]);
+    state.on_own_channel_stream_finished("general", 7, 900, vec![9, 9]);
 
     let rows = sidebar_rows(&state);
     assert!(!rows.iter().any(|r| r.contains("not listened")), "{rows:?}");
@@ -3170,7 +3170,7 @@ fn zz_scratch_voice() {
     state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
     println!("after start: {:?}", state.channels[0].log.last().map(|e| (&e.body, e.from)));
     println!("own_id: {:?}", state.own_id);
-    state.on_channel_stream_finished("general", UserId(1), 7, 1000, vec![0u8; 4]);
+    state.on_own_channel_stream_finished("general", 7, 1000, vec![0u8; 4]);
     println!("after finish: {:?}", state.channels[0].log.last().map(|e| &e.body));
 }
 
@@ -3944,4 +3944,82 @@ fn scrolling_to_the_top_loads_another_chunk() {
         "all 8 now loaded, still oldest-first"
     );
     assert!(!state.channels[0].history_cursor.as_ref().unwrap().has_more(), "nothing left on disk");
+}
+
+// ---------------------------------------------------------------------
+// Own rows survive the id the server hands out changing under them
+// (AC-470): a reconnect renames this client, and a row is found by what
+// it is, not by the id it was stamped with.
+// ---------------------------------------------------------------------
+
+/// The recording started under one id and stopped under the next.
+/// @requirement AC-470
+#[test]
+fn my_own_voice_row_finalizes_after_a_reconnect_handed_me_a_new_id() {
+    let mut state = joined_general_with(vec![]);
+    state.log_own_voice_stream_start_channel("general", 7, None);
+    state.set_own_id(UserId(42)); // the server came back and renamed me mid-recording
+
+    state.on_own_channel_stream_finished("general", 7, 900, vec![9, 9]);
+    assert_eq!(
+        state.channels[0].log[0].body,
+        MessageBody::Voice {
+            duration_ms: 900,
+            pcm: vec![9, 9]
+        },
+        "the row must not be left blinking 'streaming...'"
+    );
+}
+
+/// Every recording made after the reconnect - the id the session was
+/// opened as is gone for good, and none of them may depend on it.
+/// @requirement AC-470
+#[test]
+fn a_recording_made_after_a_reconnect_finalizes_too() {
+    let mut state = joined_general_with(vec![]);
+    state.set_own_id(UserId(42));
+    state.log_own_voice_stream_start_channel("general", 8, None);
+
+    state.on_own_channel_stream_finished("general", 8, 500, vec![1]);
+    assert!(
+        matches!(state.channels[0].log[0].body, MessageBody::Voice { duration_ms: 500, .. }),
+        "got {:?}",
+        state.channels[0].log[0].body
+    );
+}
+
+/// Stream ids are per sender, and a `UserId` is only ever the server's
+/// current word: after a server restart the id I was stamped with can be
+/// bob's now. His stream 7 and mine are still different streams, and each
+/// finish finds its own row.
+/// @requirement AC-470
+#[test]
+fn a_peers_finish_never_claims_my_own_placeholder_with_the_same_stream_id() {
+    let mut state = joined_general_with(vec![]);
+    state.log_own_voice_stream_start_channel("general", 7, None); // stamped 1
+    state.set_own_id(UserId(42)); // the server restarted: I am 42 now...
+    state.on_channel_stream_start("general", UserId(1), "bob".into(), 7, false); // ...and bob is 1
+
+    state.on_channel_stream_finished("general", UserId(1), 7, 1000, vec![1, 2]);
+    assert_eq!(
+        state.channels[0].log[0].body,
+        MessageBody::VoiceStreaming { stream_id: 7 },
+        "mine is still recording"
+    );
+    assert_eq!(
+        state.channels[0].log[1].body,
+        MessageBody::Voice {
+            duration_ms: 1000,
+            pcm: vec![1, 2]
+        }
+    );
+
+    state.on_own_channel_stream_finished("general", 7, 300, vec![3]);
+    assert_eq!(
+        state.channels[0].log[0].body,
+        MessageBody::Voice {
+            duration_ms: 300,
+            pcm: vec![3]
+        }
+    );
 }

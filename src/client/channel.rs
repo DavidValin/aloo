@@ -544,14 +544,13 @@ pub(crate) fn on_stream_start(
 pub(crate) fn on_own_stream_finished(
     ui_state: &mut UiState,
     session: &mut SessionState,
-    you: UserId,
     channel: String,
     recipients: Vec<UserId>,
     stream_id: u64,
     duration_ms: u32,
     pcm: Vec<u8>,
 ) {
-    ui_state.on_channel_stream_finished(&channel, you, stream_id, duration_ms, pcm);
+    ui_state.on_own_channel_stream_finished(&channel, stream_id, duration_ms, pcm);
     // one rotation per recipient this stream actually
     // reached, at the stream's natural end - not per
     // chunk (PROTOCOL.md §11.2).

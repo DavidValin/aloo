@@ -14,7 +14,8 @@ use crate::proto::{UserId, UserInfo};
 
 use super::ui::{
     FileTransferStatus, Focus, LogEntry, MessageBody, MessageCrypto, MessageDelivery, UiState,
-    Unread, finalize_held_stream, finalize_stream_entry, render_input_bar, render_messages,
+    Unread, finalize_held_stream, finalize_own_stream_entry, finalize_stream_entry, render_input_bar,
+    render_messages,
 };
 
 #[derive(Debug, Clone)]
@@ -334,6 +335,36 @@ impl UiState {
         }
         if let Some(held) = self.pending_messages.get_mut(&peer_id) {
             finalize_held_stream(held, from, stream_id, duration_ms, pcm);
+        }
+    }
+
+    /// `on_direct_stream_finished` for this client's own recording to
+    /// `peer_id`: swaps the outgoing `VoiceStreaming{stream_id}`
+    /// placeholder `log_own_voice_stream_start_dm` laid down for the
+    /// finished `Voice`, found by `stream_id` alone
+    /// (`finalize_own_stream_entry` - the id the row was stamped with is
+    /// not consulted, since a reconnect changes it). Nothing of ours is
+    /// ever held, so there is no held-buffer fallback.
+    pub fn on_own_direct_stream_finished(
+        &mut self,
+        peer_id: UserId,
+        stream_id: u64,
+        duration_ms: u32,
+        pcm: Vec<u8>,
+    ) {
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        let Some(room) = self.private_rooms.get_mut(&peer_id) else {
+            return;
+        };
+        let peer_name = room.peer.name.clone();
+        if let Some(entry) = finalize_own_stream_entry(&mut room.log, stream_id, duration_ms, pcm) {
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Dm(&peer_name),
+                    entry,
+                );
+            }
         }
     }
 

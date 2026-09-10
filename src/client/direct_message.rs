@@ -508,13 +508,12 @@ pub(crate) fn on_stream_start(
 pub(crate) fn on_own_stream_finished(
     ui_state: &mut UiState,
     session: &mut SessionState,
-    you: UserId,
     to: UserId,
     stream_id: u64,
     duration_ms: u32,
     pcm: Vec<u8>,
 ) {
-    ui_state.on_direct_stream_finished(to, you, stream_id, duration_ms, pcm);
+    ui_state.on_own_direct_stream_finished(to, stream_id, duration_ms, pcm);
     crate::client::session::request_rotation(session, to);
 }
 

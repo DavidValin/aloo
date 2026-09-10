@@ -201,7 +201,9 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
         text: "same, anywhere on the screen - for a tablet with no keyboard. Held a quarter \
                of a second it records, lifting stops; a tap still just clicks. If a \
                recording ever sticks (a terminal that keeps long presses for itself), \
-               tap once to end it. Turn it off under Ctrl+S (General): touch_ptt_enabled.",
+               tap once to end it. Needs a terminal that forwards a held finger - Termux \
+               and most tablet apps report taps only, and aloo says so on the first tap. \
+               Turn it off under Ctrl+S (General): touch_ptt_enabled.",
     },
     HelpLine::Item {
         keys: "Enter",

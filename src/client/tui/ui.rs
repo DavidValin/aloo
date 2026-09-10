@@ -91,6 +91,28 @@ pub const RECORD_HOLD_TIMEOUT: Duration = Duration::from_millis(900);
 /// speak, so neither is mistaken for the other.
 pub const TOUCH_HOLD_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// The longest gap between a press and its release that still reads as
+/// the two halves of one *reported* tap rather than a click
+/// (`UiState::handle_mouse_at`). A hold is not something every touch
+/// terminal can report: Termux, and most terminal apps on a tablet, send
+/// a finger only as a press and release *together*, the moment it lifts,
+/// and keep a long press for their own text selection - so on those a
+/// held finger never reaches the app, and hold-to-talk has nothing to
+/// work with. That pair arrives in one read, so its two halves are
+/// handled well inside this window; a mouse click, or a finger on a
+/// terminal that does report presses, keeps the button down for several
+/// times longer. A pair inside the window is how aloo tells such a
+/// terminal apart, and says so (`TAP_ONLY_TERMINAL_NOTICE`) rather than
+/// letting a held finger fail silently.
+pub const TAP_PAIR_WINDOW: Duration = Duration::from_millis(30);
+
+/// The status notice shown once per session on the first tap that
+/// arrives as one reported pair (`TAP_PAIR_WINDOW`) while
+/// `touch_ptt_enabled` is on: the terminal never forwards a held finger,
+/// so hold-to-talk cannot work in it, and the user should know why
+/// holding does nothing and what does work.
+pub const TAP_ONLY_TERMINAL_NOTICE: &str = "hold-to-talk needs a terminal that forwards a held finger - this one reports taps only (use Space, the global shortcut, or another terminal app)";
+
 /// How many entries `PageUp`/`PageDown` move the message-log selection by
 /// in one press, while focus is on the message log.
 pub const MESSAGE_PAGE_JUMP: usize = 10;
@@ -1239,6 +1261,9 @@ pub struct UiState {
     /// the threshold into a `RecordSource::Touch` recording. `None` while
     /// nothing is pressed, and while `touch_ptt_enabled` is off.
     pub(crate) touch_press: Option<Instant>,
+    /// Whether `TAP_ONLY_TERMINAL_NOTICE` has been shown this session -
+    /// once is information, every tap would be nagging.
+    pub(crate) tap_only_terminal_noticed: bool,
     /// `touch_ptt_enabled` from `~/.aloo/settings`: whether holding a
     /// finger or a mouse button anywhere on the screen records at all.
     /// On by default - it is the only way to talk from a tablet with no
@@ -1546,6 +1571,7 @@ impl UiState {
             recording_source: None,
             recording_last_seen: None,
             touch_press: None,
+            tap_only_terminal_noticed: false,
             touch_ptt_enabled: true,
             otp_mail: None,
             keyboard_release_reporting: false,
@@ -2478,14 +2504,24 @@ impl UiState {
     /// tab/room is checked; a no-op if the row isn't found (e.g. already
     /// scrolled out - it never actually leaves the log, just stops
     /// matching once found once).
+    ///
+    /// `from` equal to this client's *current* own id names an outgoing
+    /// row, matched by direction and `stream_id` alone rather than by the
+    /// id stamped on it: that stamp is whatever the server had handed out
+    /// when the send started, and a reconnect in the middle of a transfer
+    /// replaces it (`docs/PROTOCOL.md` §3) - the same rule
+    /// `finalize_own_stream_entry` applies to a voice row. Incoming rows
+    /// are matched on the sender as before; an own stream id can collide
+    /// with a peer's, so direction is checked for those too.
     fn update_file_entry(
         &mut self,
         from: UserId,
         stream_id: u64,
         f: impl FnOnce(&mut MessageBody),
     ) {
+        let own = self.own_id == Some(from);
         let matches = |e: &&mut LogEntry| {
-            e.from == from
+            (if own { e.outgoing } else { !e.outgoing && e.from == from })
                 && matches!(&e.body, MessageBody::File { stream_id: sid, .. } if *sid == stream_id)
         };
         for tab in &mut self.channels {
@@ -2980,15 +3016,20 @@ pub(crate) fn push_log_entry(
 }
 
 /// Shared by `channel::on_channel_stream_finished`/
-/// `direct_message::on_direct_stream_finished`: finds the `VoiceStreaming`
-/// placeholder matching both `from` and `stream_id` in `log` and swaps it
-/// for a finished `Voice` entry. Returns the finalized entry when a
-/// matching placeholder was found - callers that also maintain a
-/// held-message buffer (`finalize_held_stream`) use a `None` return to
-/// fall through to it when the placeholder isn't in the visible log; a
-/// `Some` return is also `client::export::autosave_entry`'s hook for a
-/// freshly-completed voice message (it has no audio to write before this
-/// point - see that function's doc).
+/// `direct_message::on_direct_stream_finished`: finds the *incoming*
+/// `VoiceStreaming` placeholder matching both `from` and `stream_id` in
+/// `log` and swaps it for a finished `Voice` entry. Returns the finalized
+/// entry when a matching placeholder was found - callers that also
+/// maintain a held-message buffer (`finalize_held_stream`) use a `None`
+/// return to fall through to it when the placeholder isn't in the visible
+/// log; a `Some` return is also `client::export::autosave_entry`'s hook
+/// for a freshly-completed voice message (it has no audio to write before
+/// this point - see that function's doc).
+///
+/// Never touches an outgoing row: this client's own stream ids are a
+/// counter of their own (`SessionState::next_stream_id`), independent of
+/// every peer's, so an own placeholder and a peer's can share a number -
+/// `finalize_own_stream_entry` is the own rows' counterpart.
 pub(crate) fn finalize_stream_entry(
     log: &mut [LogEntry],
     from: UserId,
@@ -2997,7 +3038,32 @@ pub(crate) fn finalize_stream_entry(
     pcm: Vec<u8>,
 ) -> Option<&LogEntry> {
     let entry = log.iter_mut().find(|e| {
-        e.from == from
+        !e.outgoing
+            && e.from == from
+            && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
+    })?;
+    entry.body = MessageBody::Voice { duration_ms, pcm };
+    Some(&*entry)
+}
+
+/// `finalize_stream_entry` for this client's own recording: the outgoing
+/// `VoiceStreaming` placeholder carrying `stream_id`, found by that alone.
+/// An own row is never looked up by the `UserId` it was stamped with,
+/// because that id is the server's to hand out and changes on every
+/// reconnect (`docs/PROTOCOL.md` §3): a recording that started under one
+/// id and stops under the next - or any recording made after a
+/// reconnect, when the id the session was opened with is long gone -
+/// must still find its row, or it blinks "streaming..." for the rest of
+/// the session. `stream_id` is unambiguous among outgoing rows, being one
+/// counter for the whole session.
+pub(crate) fn finalize_own_stream_entry(
+    log: &mut [LogEntry],
+    stream_id: u64,
+    duration_ms: u32,
+    pcm: Vec<u8>,
+) -> Option<&LogEntry> {
+    let entry = log.iter_mut().find(|e| {
+        e.outgoing
             && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
     })?;
     entry.body = MessageBody::Voice { duration_ms, pcm };

@@ -1,6 +1,6 @@
 //! Push-to-talk voice steps (US-007, client side).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use cucumber::{given, then, when};
@@ -63,16 +63,33 @@ async fn press_and_hold(w: &mut AlooWorld) {
     }
 }
 
-#[when("I tap the screen")]
-async fn tap(w: &mut AlooWorld) {
+/// A press and its release `gap` apart. Either half may be the one that
+/// acts: the press ends a stuck touch recording, and the release of a
+/// pair that arrived as one (`TAP_PAIR_WINDOW`) raises the tap-only
+/// terminal notice.
+fn press_and_release(w: &mut AlooWorld, gap: Duration) {
     let now = Instant::now();
     let ui = w.ui_mut();
-    ui.handle_mouse_at(touch(MouseEventKind::Down(MouseButton::Left)), now);
-    let action = ui.handle_mouse_at(touch(MouseEventKind::Up(MouseButton::Left)), now);
+    let action = ui
+        .handle_mouse_at(touch(MouseEventKind::Down(MouseButton::Left)), now)
+        .or(ui.handle_mouse_at(touch(MouseEventKind::Up(MouseButton::Left)), now + gap));
     w.action_was_none = action.is_none();
     if action.is_some() {
         w.last_action = action;
     }
+}
+
+#[when("I tap the screen")]
+async fn tap(w: &mut AlooWorld) {
+    // A finger on a terminal that reports presses for real: down, then
+    // up a human moment later.
+    press_and_release(w, Duration::from_millis(80));
+}
+
+#[when("I tap the screen on a terminal that only reports taps")]
+async fn reported_tap(w: &mut AlooWorld) {
+    // Down and up delivered together, the moment the finger lifts.
+    press_and_release(w, Duration::ZERO);
 }
 
 #[when("the press outlasts a tap")]
@@ -206,8 +223,17 @@ async fn own_stream_starts(w: &mut AlooWorld) {
 #[when(expr = "my own voice message finishes after {int} milliseconds")]
 async fn own_stream_finishes(w: &mut AlooWorld, duration: u32) {
     w.ui_mut()
-        .on_channel_stream_finished("general", UserId(1), 7, duration, vec![9, 9]);
+        .on_own_channel_stream_finished("general", 7, duration, vec![9, 9]);
 }
+
+#[when("the server reconnects me under a new identity")]
+async fn server_renames_me(w: &mut AlooWorld) {
+    // What `on_server_reconnected` does to the UI's idea of "me": the
+    // server hands out a brand-new UserId (docs/PROTOCOL.md 3).
+    w.ui_mut().set_own_id(UserId(99));
+}
+
+
 
 #[when(expr = "the recorder fails with {string}")]
 async fn recorder_fails(w: &mut AlooWorld, reason: String) {

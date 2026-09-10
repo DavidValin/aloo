@@ -32,6 +32,11 @@
 # Environment variables ALOO_VERSION, OTP_VERSION, INSTALL_DIR, INSTALL_MODE
 # (binary|source), ASSUME_YES and SKIP_EMOJI_FONTS can be used instead of the
 # flags above.
+#
+# On Windows (Git Bash / MSYS) the script never calls sudo - there is none.
+# It installs into $HOME/.local/bin, which needs no elevation, and any
+# protected location it is pointed at is written as the current user or
+# refused with the way around it (an elevated Git Bash, or a folder you own).
 
 set -eo pipefail
 
@@ -436,6 +441,10 @@ find_existing() {
 
 ensure_sudo() {
   [ "$SUDO_OK" = "1" ] && return 0
+  # Git Bash / MSYS have no sudo, and no way to ask for elevation from a
+  # running shell; every privileged step goes through run_elevated, which
+  # never gets here on Windows.
+  [ "$OS" = "windows" ] && err "internal: sudo requested on Windows (use run_elevated)"
   if [ "$(id -u 2>/dev/null || echo 1000)" = "0" ]; then
     SUDO_OK=1
     return 0
@@ -446,6 +455,23 @@ ensure_sudo() {
   info "Administrator privileges are required. You may be asked for your password."
   sudo -v || err "Failed to obtain sudo privileges."
   SUDO_OK=1
+}
+
+run_elevated() {
+  # run_elevated <cmd...> - runs a command that needs to write somewhere the
+  # current user cannot. Through sudo everywhere it exists; on Windows
+  # (Git Bash / MSYS, where it does not) the command runs as the current
+  # user - Windows ACLs may well allow it - and a refusal says how to get
+  # past it instead of asking for a sudo that will never be there.
+  if [ "$OS" = "windows" ]; then
+    if ! "$@"; then
+      err "Permission denied running: $*
+Git Bash has no sudo. Either re-run this script from a Git Bash window started as Administrator, or install somewhere you own: --install-dir <dir> (the default, $HOME/.local/bin, needs no elevation)."
+    fi
+    return 0
+  fi
+  ensure_sudo
+  sudo "$@"
 }
 
 is_writable_as_target() {
@@ -463,8 +489,7 @@ remove_paths() {
     if is_writable_as_target "$p"; then
       rm -f "$p"
     else
-      ensure_sudo
-      sudo rm -f "$p"
+      run_elevated rm -f "$p"
     fi
   done
 }
@@ -563,8 +588,7 @@ install_binary() {
     if [ -w "$(dirname "$INSTALL_DIR")" ] 2>/dev/null; then
       mkdir -p "$INSTALL_DIR"
     else
-      ensure_sudo
-      sudo mkdir -p "$INSTALL_DIR"
+      run_elevated mkdir -p "$INSTALL_DIR"
     fi
   fi
 
@@ -572,9 +596,8 @@ install_binary() {
   if is_writable_as_target "$dest"; then
     cp "$src" "$dest"
   else
-    ensure_sudo
-    sudo cp "$src" "$dest"
-    sudo chmod +x "$dest"
+    run_elevated cp "$src" "$dest"
+    run_elevated chmod +x "$dest"
   fi
   info "Installed $name -> $dest"
 }
@@ -600,8 +623,7 @@ install_man_page() {
     return 0
   fi
   if need_cmd sudo; then
-    ensure_sudo
-    if sudo mkdir -p "$man_dir" && sudo cp "$src_man" "$man_dir/otp.1"; then
+    if run_elevated mkdir -p "$man_dir" && run_elevated cp "$src_man" "$man_dir/otp.1"; then
       info "Man page installed to $man_dir/otp.1"
       return 0
     fi
@@ -765,37 +787,29 @@ ensure_emoji_font() {
   case "$OS" in
     linux)
       if need_cmd pacman; then
-        ensure_sudo
-        sudo pacman -Sy --needed --noconfirm noto-fonts-emoji && installed=1
+                run_elevated pacman -Sy --needed --noconfirm noto-fonts-emoji && installed=1
       elif need_cmd apt-get; then
-        ensure_sudo
-        sudo apt-get update && sudo apt-get install -y fonts-noto-color-emoji && installed=1
+                run_elevated apt-get update && run_elevated apt-get install -y fonts-noto-color-emoji && installed=1
       elif need_cmd dnf; then
-        ensure_sudo
-        sudo dnf install -y google-noto-emoji-color-fonts 2>/dev/null && installed=1
-        [ "$installed" = "1" ] || { sudo dnf install -y google-noto-emoji-fonts && installed=1; }
+                run_elevated dnf install -y google-noto-emoji-color-fonts 2>/dev/null && installed=1
+        [ "$installed" = "1" ] || { run_elevated dnf install -y google-noto-emoji-fonts && installed=1; }
       elif need_cmd yum; then
-        ensure_sudo
-        sudo yum install -y google-noto-emoji-color-fonts 2>/dev/null && installed=1
-        [ "$installed" = "1" ] || { sudo yum install -y google-noto-emoji-fonts && installed=1; }
+                run_elevated yum install -y google-noto-emoji-color-fonts 2>/dev/null && installed=1
+        [ "$installed" = "1" ] || { run_elevated yum install -y google-noto-emoji-fonts && installed=1; }
       elif need_cmd zypper; then
-        ensure_sudo
-        sudo zypper --non-interactive install noto-coloremoji-fonts && installed=1
+                run_elevated zypper --non-interactive install noto-coloremoji-fonts && installed=1
       elif need_cmd apk; then
-        ensure_sudo
-        sudo apk add font-noto-emoji && installed=1
+                run_elevated apk add font-noto-emoji && installed=1
       else
         warn "Unrecognized Linux package manager; install an emoji font manually (e.g. Noto Color Emoji)."
       fi
       ;;
     freebsd)
-      ensure_sudo
-      sudo pkg install -y noto-emoji && installed=1
+            run_elevated pkg install -y noto-emoji && installed=1
       ;;
     netbsd)
       if need_cmd pkgin; then
-        ensure_sudo
-        sudo pkgin -y install noto-emoji && installed=1
+                run_elevated pkgin -y install noto-emoji && installed=1
       else
         warn "pkgin not found; install an emoji font manually (e.g. noto-emoji from pkgsrc)."
       fi
@@ -804,8 +818,7 @@ ensure_emoji_font() {
       if need_cmd doas; then
         doas pkg_add noto-emoji && installed=1
       else
-        ensure_sudo
-        sudo pkg_add noto-emoji && installed=1
+                run_elevated pkg_add noto-emoji && installed=1
       fi
       ;;
   esac

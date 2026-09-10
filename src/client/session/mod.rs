@@ -1262,13 +1262,18 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
             }
             done = own_stream_done_rx.recv() => {
                 let Some((stream_id, duration_ms, pcm)) = done else { break };
+                // The row is found by `stream_id` alone, never by the id
+                // this session was opened as (`you`): that id is stale
+                // after the first reconnect (`on_server_reconnected`),
+                // and the row was stamped with whichever id was current
+                // when the recording started.
                 if let Some(target) = session.own_stream_targets.remove(&stream_id) {
                     match target {
                         voice_stream::OwnStreamTarget::Channel { channel, recipients } => {
-                            crate::client::channel::on_own_stream_finished(&mut ui_state, &mut session, you, channel, recipients, stream_id, duration_ms, pcm);
+                            crate::client::channel::on_own_stream_finished(&mut ui_state, &mut session, channel, recipients, stream_id, duration_ms, pcm);
                         }
                         voice_stream::OwnStreamTarget::Direct(to) => {
-                            crate::client::direct_message::on_own_stream_finished(&mut ui_state, &mut session, you, to, stream_id, duration_ms, pcm);
+                            crate::client::direct_message::on_own_stream_finished(&mut ui_state, &mut session, to, stream_id, duration_ms, pcm);
                         }
                         voice_stream::OwnStreamTarget::DirectOtp { to, contact_name, recipient_pubkey_der } => {
                             // Finalized locally the same way a live stream's
@@ -1277,7 +1282,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                             // same as an optimistically-logged text send) -
                             // `send_voice_offer` handles the actual OTP
                             // encrypt-and-send, notifying on failure.
-                            ui_state.on_direct_stream_finished(to, you, stream_id, duration_ms, pcm.clone());
+                            ui_state.on_own_direct_stream_finished(to, stream_id, duration_ms, pcm.clone());
                             crate::client::otp::send_voice_offer(
                                 &mut wr, &mut session, &mut ui_state, to, &contact_name, &recipient_pubkey_der, pcm, duration_ms,
                             ).await?;

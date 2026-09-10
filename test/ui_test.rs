@@ -3479,9 +3479,8 @@ fn a_voice_row_keeps_its_delivery_when_the_stream_finishes() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
     state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
-    let me = state.own_id.expect("own id");
 
-    state.on_channel_stream_finished("general", me, 7, 1200, vec![0; 8]);
+    state.on_own_channel_stream_finished("general", 7, 1200, vec![0; 8]);
     assert!(
         matches!(state.channels[0].log[0].body, MessageBody::Voice { .. }),
         "the placeholder was finalized in place"

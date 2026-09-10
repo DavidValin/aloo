@@ -775,3 +775,25 @@ fn the_preview_popup_absorbs_typing() {
     assert!(state.file_preview.is_some(), "still open - 'x' does nothing to it");
     assert!(state.input.is_empty(), "must not leak into the compose bar");
 }
+
+/// A send that outlives a server reconnect: the row was stamped with the
+/// id this client had when it started, every later event names the id it
+/// has now, and the row is found all the same (AC-470).
+/// @requirement AC-470
+#[test]
+fn my_own_file_row_keeps_updating_after_a_reconnect_handed_me_a_new_id() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (_msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", 1, "report.pdf".into(), 1000, Some(delivery));
+    state.register_file_row_stream(1, 1);
+    state.set_own_id(UserId(42));
+    let status = |state: &aloo::client::tui::ui::UiState| match &state.channels[0].log[0].body {
+        MessageBody::File { status, .. } => status.clone(),
+        other => panic!("expected a file entry, got {other:?}"),
+    };
+
+    state.set_file_progress(UserId(42), 1, 800);
+    assert_eq!(status(&state), FileTransferStatus::InProgress { bytes: 800 });
+    state.set_file_completed(UserId(42), 1);
+    assert_eq!(status(&state), FileTransferStatus::Completed);
+}

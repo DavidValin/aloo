@@ -52,6 +52,10 @@ wget -qO- https://raw.githubusercontent.com/DavidValin/aloo/refs/heads/main/inst
 ```
 ** this method works for server and client (aloo contains both modes in a single command)
 
+On Windows, run it from Git Bash. It installs into `~/.local/bin` and never
+calls `sudo` (Git Bash has none); if you point `--install-dir` at a folder
+you cannot write to, it says so and how to get around it instead.
+
 ### 2. Start (or join) a server
 
 If someone already runs a server for you, skip to step 3 — you just need their host and port.
@@ -162,9 +166,15 @@ The global shortcut is on by default — change the combo or turn it off with
 needs X11; it isn't available under Wayland.
 
 On a touch screen, hold a finger anywhere for a quarter of a second and
-talk; lift it to stop. If the recording ever sticks because your terminal
-app keeps long presses for itself, tap once to end it. `touch_ptt_enabled`
-turns the gesture off.
+talk; lift it to stop. Like every trigger it is push-to-talk: the mic is
+open only while the finger is down. That needs a terminal app that
+forwards a held finger, and most tablet ones (Termux included) do not —
+they report a finger only as a completed tap and keep a long press for
+their own text selection, so a hold never reaches aloo there. aloo notices
+the first such tap and says so in the status line; in those apps use Space
+on a keyboard, the global shortcut, or a different terminal app. If a
+recording ever sticks because the app kept the release for itself, tap
+once to end it. `touch_ptt_enabled` turns the gesture off.
 
 ### Muting someone's voice
 

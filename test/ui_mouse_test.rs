@@ -305,3 +305,88 @@ fn a_hold_arms_nothing_while_touch_ptt_is_off() {
     assert!(state.tick_touch_hold(t0 + Duration::from_secs(5)).is_none());
     assert!(!state.recording);
 }
+
+// ---------------------------------------------------------------------
+// A terminal that reports touches as finished taps only (AC-471): Termux
+// and most tablet terminal apps send the press and release together when
+// the finger lifts, and keep a long press for their own text selection,
+// so a held finger never reaches the app and hold-to-talk cannot work.
+// The first such pair says so, once; nothing else changes.
+// ---------------------------------------------------------------------
+
+use aloo::client::tui::ui::{TAP_ONLY_TERMINAL_NOTICE, TAP_PAIR_WINDOW};
+
+/// Down and up as one, the way a tap-only terminal delivers them.
+fn reported_tap(state: &mut UiState, x: u16, y: u16, t: Instant) -> Option<UiAction> {
+    assert!(state.handle_mouse_at(left_click(x, y), t).is_none(), "the press itself does nothing");
+    state.handle_mouse_at(left_release(x, y), t)
+}
+
+/// @requirement AC-471
+#[test]
+fn a_terminal_that_reports_taps_only_is_told_so_once_and_the_tap_still_clicks() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    let rows = rendered_rows(&state);
+    let (x, y) = find_text(&rows, "Message");
+    let t0 = Instant::now();
+
+    assert!(reported_tap(&mut state, x, y, t0).is_none());
+    assert!(!state.recording, "a tap never records: push-to-talk records only while held");
+    assert_eq!(state.focus, Focus::Input, "the tap is still the click it always was");
+    assert_eq!(
+        state.status_notice,
+        Some((TAP_ONLY_TERMINAL_NOTICE.to_string(), false)),
+        "the first reported pair explains why holding cannot work here"
+    );
+    assert!(state.tick_touch_hold(t0 + Duration::from_secs(5)).is_none(), "and armed no hold");
+
+    state.status_notice = None;
+    assert!(reported_tap(&mut state, 0, 0, t0 + Duration::from_secs(1)).is_none());
+    assert_eq!(state.status_notice, None, "said once per session, not on every tap");
+    assert!(!state.recording);
+
+    // Anything at the window's edge is still the pair; a hold is unaffected.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert!(state.handle_mouse_at(left_click(0, 0), t0).is_none());
+    assert!(state.handle_mouse_at(left_release(0, 0), t0 + TAP_PAIR_WINDOW).is_none());
+    assert!(state.status_notice.is_some());
+    assert!(matches!(hold_from(&mut state, t0 + Duration::from_secs(2)), Some(UiAction::VoiceRecordStart(_))));
+}
+
+/// A click with a human gap between press and release - a mouse, or a
+/// finger on a terminal that does report presses - says nothing: that
+/// terminal can hold.
+/// @requirement AC-471
+#[test]
+fn a_click_with_a_real_gap_raises_no_notice() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let t0 = Instant::now();
+    assert!(state.handle_mouse_at(left_click(0, 0), t0).is_none());
+    let late = t0 + TAP_PAIR_WINDOW + Duration::from_millis(1);
+    assert!(state.handle_mouse_at(left_release(0, 0), late).is_none());
+    assert_eq!(state.status_notice, None);
+    assert!(!state.recording);
+}
+
+/// Nothing to explain while the gesture is off, or while something is
+/// already recording.
+/// @requirement AC-471
+#[test]
+fn no_notice_while_touch_ptt_is_off_or_a_recording_is_running() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.touch_ptt_enabled = false;
+    let t0 = Instant::now();
+    assert!(reported_tap(&mut state, 0, 0, t0).is_none());
+    assert_eq!(state.status_notice, None);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Messages;
+    assert!(matches!(
+        state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press),
+        Some(UiAction::VoiceRecordStart(_))
+    ));
+    assert!(reported_tap(&mut state, 0, 0, t0).is_none());
+    assert_eq!(state.status_notice, None);
+    assert!(state.recording, "Space's recording is untouched");
+}

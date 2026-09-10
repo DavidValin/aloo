@@ -26,7 +26,7 @@ use super::ui::{
     DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody,
     MessageDelivery, Mode, OTP_TAG, OTP_TAG_COLOR, SelectorFocus, UNREAD_ENVELOPE, UiAction,
     UiState, Unread, VOICE_MUTED_MARKER, channel_label, display_width, finalize_held_stream,
-    finalize_stream_entry,
+    finalize_own_stream_entry, finalize_stream_entry,
     focus_border_style, local_time_short, render_input_bar, render_messages, unread_envelope,
 };
 
@@ -844,6 +844,35 @@ impl UiState {
         }
         if let Some(held) = self.pending_messages.get_mut(&from) {
             finalize_held_stream(held, from, stream_id, duration_ms, pcm);
+        }
+    }
+
+    /// `on_channel_stream_finished` for this client's own recording into
+    /// `channel`: swaps the outgoing `VoiceStreaming{stream_id}`
+    /// placeholder `log_own_voice_stream_start_channel` laid down for the
+    /// finished `Voice`, found by `stream_id` alone
+    /// (`finalize_own_stream_entry` - the id the row was stamped with is
+    /// not consulted, since a reconnect changes it). Nothing of ours is
+    /// ever held, so there is no held-buffer fallback.
+    pub fn on_own_channel_stream_finished(
+        &mut self,
+        channel: &str,
+        stream_id: u64,
+        duration_ms: u32,
+        pcm: Vec<u8>,
+    ) {
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        let Some(tab) = self.channel_tab_mut(channel) else {
+            return;
+        };
+        if let Some(entry) = finalize_own_stream_entry(&mut tab.log, stream_id, duration_ms, pcm) {
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    entry,
+                );
+            }
         }
     }
 
