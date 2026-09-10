@@ -1733,14 +1733,27 @@ impl UiState {
         // `autosave_messages`) can already be sitting at the tail of the
         // file - skipping `log.len()` regardless of that would, with
         // autosave off, silently drop that many genuine never-seen records
-        // instead of pre-existing live ones that were never mirrored.
+        // instead of pre-existing live ones that were never mirrored. And
+        // even with it on, a voice message still being recorded or
+        // received is not on disk yet (`export::autosave_entry` writes a
+        // row only once it is a finished `Voice`), so it is not counted
+        // either - counting it would skip one real record for every
+        // stream in flight at the moment the reader opens.
         let autosave_messages = self.autosave_messages;
+        let mirrored = |log: &[LogEntry]| {
+            if !autosave_messages {
+                return 0;
+            }
+            log.iter()
+                .filter(|e| !matches!(e.body, MessageBody::VoiceStreaming { .. }))
+                .count()
+        };
         match self.current_focus() {
             CurrentFocus::Channel(name) => {
                 let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) else {
                     return 0;
                 };
-                let already_loaded = if autosave_messages { tab.log.len() } else { 0 };
+                let already_loaded = mirrored(&tab.log);
                 let cursor = tab.history_cursor.get_or_insert_with(|| {
                     crate::client::export::LogHistoryCursor::open(
                         &server_label,
@@ -1760,7 +1773,7 @@ impl UiState {
                 let Some(room) = self.private_rooms.get_mut(&peer) else {
                     return 0;
                 };
-                let already_loaded = if autosave_messages { room.log.len() } else { 0 };
+                let already_loaded = mirrored(&room.log);
                 let peer_name = room.peer.name.clone();
                 let cursor = room.history_cursor.get_or_insert_with(|| {
                     crate::client::export::LogHistoryCursor::open(

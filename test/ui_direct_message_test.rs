@@ -2474,3 +2474,71 @@ fn a_peers_private_finish_never_claims_my_own_placeholder_with_the_same_stream_i
     state.on_direct_stream_finished(UserId(1), UserId(1), 5, 1000, vec![1]);
     assert!(matches!(state.private_rooms[&UserId(1)].log[0].body, MessageBody::Voice { duration_ms: 1000, .. }));
 }
+
+fn shared_aloo_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "aloo-ui-dm-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("ALOO_HOME", &dir) };
+        dir
+    })
+}
+
+/// The private-room twin of ui_channel_test's own-voice round trip: a
+/// voice message I sent to bob is autosaved under his DM log with its
+/// `.wav`, and a later session with `resume_from_log` on shows it as my
+/// outgoing on-disk row and replays it on Enter.
+/// @requirement AC-472
+#[test]
+fn my_own_private_voice_message_is_autosaved_and_comes_back_playable_from_the_log() {
+    let home = shared_aloo_home();
+    let server_label = "resume-own-dm-voice_1";
+    let samples = vec![-321i16; 32_000]; // exactly 2000ms at 16kHz
+    let pcm = aloo::client::voice::pcm_to_bytes(&samples);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.autosave_messages = true;
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens the DM with bob
+    state.log_own_voice_stream_start_dm(UserId(2), 7, None);
+    state.on_own_direct_stream_finished(UserId(2), 7, 2000, pcm.clone());
+
+    let log_path = home.join("exports").join(server_label).join("dms").join("bob.log");
+    let log = std::fs::read_to_string(&log_path).expect("the DM log exists");
+    let line = log.lines().last().unwrap();
+    assert!(line.contains("-> me: voice (2.0s) -> ") && line.ends_with(".wav"), "{line:?}");
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state
+        .last_messages_area_height
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens the DM with bob, seeding its history
+    let room = &state.private_rooms[&UserId(2)];
+    let entry = room
+        .log
+        .iter()
+        .find(|e| matches!(e.body, MessageBody::VoiceOnDisk { .. }))
+        .expect("the on-disk voice row was resumed");
+    assert!(entry.outgoing, "mine, so shown as mine: {entry:?}");
+    assert!(matches!(&entry.body, MessageBody::VoiceOnDisk { duration_ms: 2000, wav_path: Some(_) }));
+    let index = room.log.iter().position(|e| matches!(e.body, MessageBody::VoiceOnDisk { .. })).unwrap();
+
+    state.focus = Focus::Messages;
+    state.message_selected = index;
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::ReplayVoice { pcm: played, duration_ms, .. }) => {
+            assert_eq!(duration_ms, 2000);
+            assert_eq!(played, pcm, "what plays is what was recorded");
+        }
+        other => panic!("expected the row to replay, got {other:?}"),
+    }
+}

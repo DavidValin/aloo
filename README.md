@@ -323,15 +323,17 @@ is the host and port you're connected to, or `DIRECT` with `--no-server`):
   with a fresh short id so they never collide with the autosave log beside
   them. Works whether or not `autosave_messages` is on.
 
-Either way, a voice message also gets a `.wav` file next to its `.log`,
-named `<UTC time>_<nickname>.wav` and referenced from the log line by name.
+Either way, a voice message — sent or received — also gets a `.wav` file
+next to its `.log`, named `<UTC time>_<nickname>.wav` and referenced from
+the log line by name.
 
 **Reading it back:** set `resume_from_log=on` and a channel/DM pulls its own
 history back in from that `.log` file (whichever session wrote it) instead
 of starting empty — a screen's worth loads the moment you open it, and
 scrolling `Up`/`PageUp`/`Home` past the top loads another screen's worth at
-a time. Voice audio isn't decoded until you actually replay a row (`Enter`)
-— until then it just shows as an unloaded reference. Off by default, and
+a time. Voice audio — your own sent messages included — isn't decoded until
+you actually replay a row (`Enter`); until then it just shows as an unloaded
+reference. Off by default, and
 independent of `autosave_messages` — it only ever reads what's already
 there.
 

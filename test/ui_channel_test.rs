@@ -3823,6 +3823,100 @@ fn resume_from_log_seeds_the_initial_chunk_on_first_view() {
     assert!(!state.channels[0].history_cursor.as_ref().unwrap().has_more());
 }
 
+/// A row still streaming when the reader opens is not on disk yet, so it
+/// must not be counted against the file's tail: with three records on
+/// disk and one in-flight recording in the live log, all three records
+/// still load. Counting the placeholder would drop the oldest.
+/// @requirement AC-364
+#[test]
+fn a_still_streaming_row_is_not_counted_as_already_on_disk() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-streaming-not-counted_1";
+    autosave_texts(server_label, &["msg0", "msg1", "msg2"]);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state.autosave_messages = true;
+    state
+        .last_messages_area_height
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    state.log_own_voice_stream_start_channel("general", 7, None);
+
+    state.select_channel_at(0);
+
+    let bodies: Vec<&MessageBody> = state.channels[0].log.iter().map(|e| &e.body).collect();
+    assert_eq!(
+        bodies,
+        vec![
+            &MessageBody::Text("msg0".to_string()),
+            &MessageBody::Text("msg1".to_string()),
+            &MessageBody::Text("msg2".to_string()),
+            &MessageBody::VoiceStreaming { stream_id: 7 },
+        ],
+        "every record on disk, then the recording still in flight"
+    );
+}
+
+/// A voice message of my own goes to disk like anyone else's, and comes
+/// back from it as a playable row: recorded with `autosave_messages` on,
+/// it lands in the channel's `.log` with its `.wav` beside it; a later
+/// session with `resume_from_log` on shows it as an outgoing on-disk row,
+/// and Enter on it loads the audio and replays exactly what was recorded.
+/// @requirement AC-472
+#[test]
+fn my_own_voice_message_is_autosaved_and_comes_back_playable_from_the_log() {
+    let home = shared_aloo_home();
+    let server_label = "resume-own-voice_1";
+    // 32,000 samples at 16kHz is exactly 2000ms - see export_test.rs for
+    // why a round duration matters to the on-disk format.
+    let samples = vec![1234i16; 32_000];
+    let pcm = aloo::client::voice::pcm_to_bytes(&samples);
+
+    // Session one: record and send it.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.autosave_messages = true;
+    state.select_channel_at(0);
+    state.log_own_voice_stream_start_channel("general", 7, None);
+    state.on_own_channel_stream_finished("general", 7, 2000, pcm.clone());
+
+    let log_path = home.join("exports").join(server_label).join("channels").join("general.log");
+    let log = std::fs::read_to_string(&log_path).expect("the channel log exists");
+    let line = log.lines().last().unwrap();
+    assert!(line.contains("-> me: voice (2.0s) -> ") && line.ends_with(".wav"), "{line:?}");
+
+    // Session two: the same channel, resumed from that log.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state
+        .last_messages_area_height
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    state.select_channel_at(0);
+    let entry = &state.channels[0].log[0];
+    assert!(entry.outgoing, "mine, so shown as mine: {entry:?}");
+    assert!(
+        matches!(&entry.body, MessageBody::VoiceOnDisk { duration_ms: 2000, wav_path: Some(_) }),
+        "{:?}",
+        entry.body
+    );
+
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::ReplayVoice { pcm: played, duration_ms, .. }) => {
+            assert_eq!(duration_ms, 2000);
+            assert_eq!(played, pcm, "what plays is what was recorded");
+        }
+        other => panic!("expected the row to replay, got {other:?}"),
+    }
+    assert!(
+        matches!(state.channels[0].log[0].body, MessageBody::Voice { .. }),
+        "loaded in place for the next replay"
+    );
+}
+
 /// With `autosave_messages` off, nothing this session ever reached disk -
 /// so a channel that already holds live entries (received before its
 /// first view) must not have that count skipped against the file's own
