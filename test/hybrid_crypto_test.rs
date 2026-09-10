@@ -617,3 +617,26 @@ fn ensure_bundle_at_regenerates_both_when_only_one_file_exists() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+
+/// The two files a prefix is written to are `<prefix>.priv` and
+/// `<prefix>.pub` - the same names an auto-generated keybundle carries -
+/// and reading a prefix prefers that layout, accepting an earlier
+/// release's bare `<prefix>` only when no `.priv` is beside it.
+/// @requirement AC-084
+#[test]
+fn a_prefix_is_written_as_priv_and_pub_and_read_back_the_same_way() {
+    let dir = std::env::temp_dir().join(format!("aloo-prefix-layout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+    let (priv_path, pub_path) = bundle_paths(&prefix);
+    assert_eq!(priv_path, std::path::PathBuf::from(format!("{prefix}.priv")));
+    assert_eq!(pub_path, std::path::PathBuf::from(format!("{prefix}.pub")));
+    assert_eq!(resolve_bundle_paths(&prefix), (priv_path.clone(), pub_path.clone()), "nothing on disk: the written layout");
+
+    std::fs::write(&prefix, b"legacy private").unwrap();
+    assert_eq!(resolve_bundle_paths(&prefix).0, std::path::PathBuf::from(&prefix), "a bare prefix alone is still read");
+
+    std::fs::write(&priv_path, b"private").unwrap();
+    assert_eq!(resolve_bundle_paths(&prefix).0, priv_path, ".priv wins when both are present");
+    std::fs::remove_dir_all(&dir).ok();
+}

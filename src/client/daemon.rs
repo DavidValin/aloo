@@ -1187,7 +1187,8 @@ impl DaemonConfig {
 }
 
 /// Resolves the `my_key` identity: an explicit `--my-key <PREFIX>` names
-/// `<PREFIX>.pub`/`<PREFIX>.priv`, otherwise the settings pair, otherwise
+/// `<PREFIX>.priv`/`<PREFIX>.pub` (or the bare `<PREFIX>` an earlier
+/// release's keygen wrote), otherwise the settings pair, otherwise
 /// whatever the connect cache last used for this host, otherwise a fresh
 /// location under `~/.aloo`.
 ///
@@ -1201,11 +1202,10 @@ fn resolve_my_key(
     cached: Option<(&str, u16, &str, &str)>,
 ) -> Result<crate::client::connect::MyKeySelection, String> {
     if let Some(prefix) = &flags.my_key_prefix {
-        // Through `crypto::pq` rather than spelled out here: this used to
-        // assume `<prefix>.priv`, which meant a keybundle written by
-        // `aloo --keygen-pq-hybrid <prefix>` (bare `<prefix>`) looked
-        // half-present and was silently regenerated over - see
-        // `resolve_bundle_paths`.
+        // Through `crypto::pq` rather than spelled out here: a reader that
+        // spells the private half itself can disagree with the writer,
+        // and then an intact keybundle looks half-present and is
+        // regenerated over - see `resolve_bundle_paths`.
         let (file_priv, file_pub) = crate::crypto::pq::resolve_bundle_paths(prefix);
         return Ok(crate::client::connect::MyKeySelection { file_pub, file_priv });
     }

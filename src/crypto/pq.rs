@@ -749,23 +749,21 @@ pub fn save_public_bundle(bundle: &PqPublicBundle, path: &Path) -> Result<()> {
 /// spelling below.
 pub(crate) const PUBLIC_SUFFIX: &str = ".pub";
 
-/// The suffix an auto-generated private half carries.
-///
-/// Still read (`resolve_bundle_paths`), and still what
-/// `client::connect::fresh_pq_hybrid_paths_in` generates, but never what a
-/// prefix given on the command line is *written* to - see `bundle_paths`.
+/// The suffix the private half of a keybundle carries - the one spelling
+/// every writer in this app produces: `--keygen-pq-hybrid` and
+/// `--rekey-pq-hybrid` (`bundle_paths`) and the bundles connecting
+/// generates on first use (`client::connect::fresh_pq_hybrid_paths_in`),
+/// so a key made by hand and a key aloo made itself sit side by side in
+/// `~/.aloo` under the same two names.
 pub(crate) const PRIVATE_SUFFIX: &str = ".priv";
 
-/// Where a keybundle prefix's two files are **written**: `<prefix>` holds
-/// the private bundle, `<prefix>.pub` the public one.
-///
-/// This is the spelling `--keygen-pq-hybrid` has always produced and that
-/// `docs/SPEC.md` and `docs/PROTOCOL.md` §13.9 document, so it is the one
-/// a freshly written bundle gets. Reading is deliberately more permissive
-/// - see `resolve_bundle_paths`.
+/// Where a keybundle prefix's two files are **written**: `<prefix>.priv`
+/// holds the private bundle, `<prefix>.pub` the public one - the layout
+/// `docs/SPEC.md` and `docs/PROTOCOL.md` §13.9 document. Reading is
+/// deliberately more permissive - see `resolve_bundle_paths`.
 pub fn bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
     (
-        PathBuf::from(prefix),
+        PathBuf::from(format!("{prefix}{PRIVATE_SUFFIX}")),
         PathBuf::from(format!("{prefix}{PUBLIC_SUFFIX}")),
     )
 }
@@ -773,27 +771,26 @@ pub fn bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
 /// Where a keybundle prefix's two files are **read from**, tolerating both
 /// layouts that exist on disk in the wild.
 ///
-/// Two spellings of "the private half of `<prefix>`" got written by
-/// different parts of this app: `--keygen-pq-hybrid` writes the bare
-/// `<prefix>` (`bundle_paths`), while everything that auto-generates one
-/// writes `<prefix>.priv` (`PRIVATE_SUFFIX`,
-/// `client::connect::fresh_pq_hybrid_paths_in`). A reader that knows only
+/// Two spellings of "the private half of `<prefix>`" exist: `<prefix>.priv`
+/// (`bundle_paths`, what everything writes), and the bare `<prefix>` that
+/// earlier releases' `--keygen-pq-hybrid` wrote. A reader that knows only
 /// one of them does not merely fail to find the other - it reports a
 /// *half-present* pair, and `ensure_bundle_at` then does exactly what
 /// TB-134 requires of it and regenerates both, destroying the public half
-/// that was sitting right there. That is the whole of the bug this
+/// that was sitting right there. That is the whole of the failure this
 /// function exists to make unrepresentable.
 ///
 /// `.priv` wins when both are present, and the order matters: an install
-/// that already went through the failure above has an orphaned bare
-/// `<prefix>` beside a *consistent* `.priv`/`.pub` pair, and picking the
-/// orphan would hand back a mismatched pair. Preferring `.priv` keeps the
-/// working pair and leaves the orphan alone.
+/// that went through that failure has an orphaned bare `<prefix>` beside a
+/// *consistent* `.priv`/`.pub` pair, and picking the orphan would hand
+/// back a mismatched pair. Preferring `.priv` keeps the working pair and
+/// leaves the orphan alone. With neither on disk the answer is the layout
+/// a fresh bundle is written to.
 pub fn resolve_bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
     let (private, public) = bundle_paths(prefix);
-    let generated_private = PathBuf::from(format!("{prefix}{PRIVATE_SUFFIX}"));
-    if generated_private.exists() {
-        return (generated_private, public);
+    let legacy_private = PathBuf::from(prefix);
+    if !private.exists() && legacy_private.exists() {
+        return (legacy_private, public);
     }
     (private, public)
 }

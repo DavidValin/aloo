@@ -389,7 +389,7 @@ Pressing `i` on a channel's admin reports `☀️ admin of #<name>`, in addition
     - **Trust gating and offline peers** work exactly like text (Functionality #7/#8): an offer from a `Pending`/`Rejected` sender is decrypted but held — no popup, no chime — until they're `Accept`ed, at which point it's queued for real; a gated or offline channel member is simply not offered the file at all, same as text/voice; an offline or gated DM peer's room can't receive one at all (same gate that already blocks `/file` from starting in the first place).
 
 10. **`pq_hybrid`: a post-quantum hybrid encryption method** — ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption. Full model in `docs/PROTOCOL.md` §13; from the user's point of view:
-    - Selected as the `my_key` type in the connect popup - and selected by default. Unlike every other type, its keys aren't generated fresh in-process at connect time; they live in a keybundle file pair (`file_pub`/`file_priv`). You don't have to prepare that pair yourself: the popup prefills the fields (from `~/.aloo/.cache`'s most-recently-used entry for a server you've connected to before, or otherwise a freshly-assigned location under `~/.aloo/`), and connecting transparently generates the actual keys at that location the first time it's used, if they don't already exist (`docs/PROTOCOL.md` §13.9). `aloo --keygen-pq-hybrid <prefix>` (writes `<prefix>` and `<prefix>.pub`) is still there if you want to generate one yourself - e.g. to point both files at a specific, memorable location, or to produce one to move to another machine - but it's optional now, not required.
+    - Selected as the `my_key` type in the connect popup - and selected by default. Unlike every other type, its keys aren't generated fresh in-process at connect time; they live in a keybundle file pair (`file_pub`/`file_priv`). You don't have to prepare that pair yourself: the popup prefills the fields (from `~/.aloo/.cache`'s most-recently-used entry for a server you've connected to before, or otherwise a freshly-assigned location under `~/.aloo/`), and connecting transparently generates the actual keys at that location the first time it's used, if they don't already exist (`docs/PROTOCOL.md` §13.9). `aloo --keygen-pq-hybrid <prefix>` (writes `<prefix>.priv` and `<prefix>.pub`, the same names an auto-generated pair carries) is still there if you want to generate one yourself - e.g. to point both files at a specific, memorable location, or to produce one to move to another machine - but it's optional now, not required.
     - **The connect popup remembers your `pq_hybrid` identity per server.** After connecting (attempted or not - whichever files were used to try), `~/.aloo/.cache` records that `(host, port)`'s `file_pub`/`file_priv`. Reopening the app, or returning to the same server later in one session, prefills the exact same identity automatically - a different server you haven't used before still gets its own freshly-assigned location the first time.
     - Text, file, and voice messages are all signed with **both** ML-DSA-87 and RSA-4096 before being encrypted — a receiver only accepts a message if **both** signatures check out, so a break in either primitive alone isn't enough to forge one. The bulk data is AES-256-GCM-encrypted once per send, and that one-time key is separately wrapped for each recipient by combining an ML-KEM-1024 exchange with a second, independent RSA-4096 encryption — recovering it needs breaking both, not just one.
     - Its own encryption keys rotate every message, per peer relationship - a fresh ML-KEM-1024+X25519 pair each time, cheap enough to run inline with no visible delay. A message typed for a peer before their next fresh key arrives isn't dropped - it's held and sent automatically the moment that key shows up, in the order it was typed. See `docs/PROTOCOL.md` §13.10.
@@ -783,14 +783,15 @@ and no prompt: if the keybundle does not exist yet, it is generated on
 first connect. Point at a specific one with:
 
 ```sh
-aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys + mykeys.pub
+aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys.priv + mykeys.pub
 ```
 
-That is the pair `aloo --keygen-pq-hybrid /home/you/.aloo/mykeys` writes, so
-a keybundle you generated yourself can be pointed at directly. A
-`mykeys.priv` left by an earlier auto-generated bundle is still accepted,
-and preferred when both are present; a fresh one is written as
-`mykeys` + `mykeys.pub`.
+That is the pair `aloo --keygen-pq-hybrid /home/you/.aloo/mykeys` writes -
+the same two names a keybundle aloo generates for itself carries - so a
+keybundle you generated yourself can be pointed at directly. A bare
+`mykeys` left by an earlier release's keygen is still accepted when there
+is no `mykeys.priv` beside it; a fresh one is written as `mykeys.priv` +
+`mykeys.pub`.
 
 Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
 

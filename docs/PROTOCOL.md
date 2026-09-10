@@ -4221,10 +4221,11 @@ outcome than just regenerating.
 **Resolving a prefix to that pair** (`crypto::pq::resolve_bundle_paths`),
 for the one entry point that names a keybundle by prefix rather than by its
 two paths: `aloo --daemon --my-key <prefix>`. Two spellings of the private
-half exist on disk in the wild - `aloo --keygen-pq-hybrid <prefix>` writes
-the bare `<prefix>`, while anything auto-generated (below) writes
-`<prefix>.priv` - so both are accepted, `.priv` winning when both are
-present, and a freshly written one takes the documented `<prefix>` form.
+half exist on disk in the wild - `<prefix>.priv`, which everything writes
+(`aloo --keygen-pq-hybrid <prefix>` and the auto-generation below alike),
+and the bare `<prefix>` that earlier releases' keygen wrote - so both are
+accepted, `.priv` winning when both are present, and a freshly written one
+takes the documented `<prefix>.priv` form.
 This matters more than it looks: a reader that knew only one spelling did
 not merely fail to find the other, it reported an *intact* keybundle as
 half-present, and the auto-generation above then did exactly what it is

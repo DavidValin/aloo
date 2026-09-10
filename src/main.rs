@@ -41,10 +41,10 @@ const HELP_STYLES: Styles = Styles::styled()
 )]
 struct Cli {
     /// Generate a fresh PQ-hybrid (`my_key` type `pq_hybrid`) keybundle and
-    /// exit - writes `<PREFIX>` (private) and `<PREFIX>.pub` (public),
-    /// mirroring `openssl genpkey ... -out my_key` / `my_key.pub` for `rsa`
-    /// keys (see README "Generating PQ-hybrid keys"). There is no
-    /// `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, hence this flag.
+    /// exit - writes `<PREFIX>.priv` (private) and `<PREFIX>.pub` (public),
+    /// the same two names the keys aloo generates for itself under
+    /// `~/.aloo` carry. There is no `openssl`-equivalent for
+    /// ML-DSA-87/ML-KEM-1024, hence this flag.
     #[arg(long, value_name = "PREFIX", help_heading = "Client Commands")]
     keygen_pq_hybrid: Option<String>,
 
@@ -111,9 +111,9 @@ struct Cli {
     nick_pwd: Option<String>,
 
     /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
-    /// `<PREFIX>` and `<PREFIX>.pub`, the pair `--keygen-pq-hybrid` writes.
-    /// A `<PREFIX>.priv` from an auto-generated bundle is accepted too.
-    /// Generated on first use if neither is there.
+    /// `<PREFIX>.priv` and `<PREFIX>.pub`, the pair `--keygen-pq-hybrid`
+    /// writes. A bare `<PREFIX>` left by an earlier release's keygen is
+    /// accepted too. Generated on first use if neither is there.
     #[arg(long, value_name = "PREFIX", help_heading = "Client Commands")]
     my_key: Option<String>,
 

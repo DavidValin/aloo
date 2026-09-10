@@ -1636,7 +1636,7 @@ evidence = "docs/PROTOCOL.md 13; tests hybrid_voice_chunk_round_trips, wrap_key_
 
 [[user_story.acceptance_criteria]]
 id = "AC-084"
-description = "`aloo --keygen-pq-hybrid <prefix>` writes a loadable <prefix> (private) and <prefix>.pub (public) keybundle; the connect popup's my_key group points at them with a file_pub/file_priv pair."
+description = "`aloo --keygen-pq-hybrid <prefix>` writes a loadable <prefix>.priv (private) and <prefix>.pub (public) keybundle - the same two names a keybundle aloo generates for itself under ~/.aloo carries; the connect popup's my_key group points at them with a file_pub/file_priv pair."
 evidence = "docs/PROTOCOL.md 13; README.md 'Generating PQ-hybrid keys'; tests save_and_load_bundle_files_roundtrip, focus_order_includes_both_my_key_files, build_request_succeeds_with_pq_hybrid_files, build_request_rejects_missing_pq_hybrid_files"
 
 [[user_story.technical_behavior]]
@@ -2342,7 +2342,7 @@ evidence = "src/crypto/pq.rs ensure_bundle_at; tests ensure_bundle_at_regenerate
 
 [[user_story.technical_behavior]]
 id = "TB-283"
-description = "Every keybundle prefix on the command line is turned into a (private, public) path pair by crypto::pq alone - bundle_paths for writing (<prefix> and <prefix>.pub, the documented layout) and resolve_bundle_paths for reading, which also accepts the <prefix>.priv spelling auto-generated bundles carry and prefers it when both are present. No caller derives the suffixes itself, so a reader can never disagree with the writer about where a half lives and report an intact bundle as half-present."
+description = "Every keybundle prefix on the command line is turned into a (private, public) path pair by crypto::pq alone - bundle_paths for writing (<prefix>.priv and <prefix>.pub, the documented layout, shared with auto-generated bundles) and resolve_bundle_paths for reading, which also accepts the bare <prefix> spelling earlier releases' keygen wrote, <prefix>.priv winning when both are present and named when neither exists. No caller derives the suffixes itself, so a reader can never disagree with the writer about where a half lives and report an intact bundle as half-present."
 evidence = "src/crypto/pq.rs PUBLIC_SUFFIX, PRIVATE_SUFFIX, bundle_paths, resolve_bundle_paths; src/client/daemon.rs resolve_my_key; src/main.rs run_rekey_pq_hybrid, run_export_identity_card; tests a_my_key_prefix_resolves_a_keygen_written_bundle_rather_than_regenerating_it, a_my_key_prefix_still_resolves_an_auto_generated_bundle, a_prefix_carrying_both_spellings_resolves_the_pair_that_matches, a_my_key_prefix_with_nothing_on_disk_names_the_documented_layout, a_keygen_written_bundle_survives_being_opened_by_prefix"
 
 [[user_story.technical_behavior]]

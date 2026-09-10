@@ -465,8 +465,8 @@ fn a_my_key_prefix_resolves_a_keygen_written_bundle_rather_than_regenerating_it(
     std::fs::create_dir_all(&dir).unwrap();
     let prefix = dir.join("mykey").display().to_string();
 
-    // Exactly what `--keygen-pq-hybrid <prefix>` leaves on disk: the bare
-    // prefix and its `.pub`, and no `.priv` at all.
+    // What an earlier release's `--keygen-pq-hybrid <prefix>` left on
+    // disk: the bare prefix and its `.pub`, and no `.priv` at all.
     std::fs::write(&prefix, b"private").unwrap();
     std::fs::write(format!("{prefix}.pub"), b"public").unwrap();
 
@@ -486,14 +486,13 @@ fn a_my_key_prefix_resolves_a_keygen_written_bundle_rather_than_regenerating_it(
             file_pub: format!("{prefix}.pub").into(),
             file_priv: prefix.clone().into(),
         },
-        "the private half is the bare prefix keygen actually wrote"
+        "the private half is the bare prefix that keygen wrote"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The other layout on disk: a keybundle some earlier run auto-generated,
-/// whose private half is `<prefix>.priv`. Still resolved, so fixing the
-/// case above does not break the installs that were working.
+/// The documented layout: `<prefix>.priv`, written by keygen and by
+/// auto-generation alike.
 /// @requirement TB-283
 #[test]
 fn a_my_key_prefix_still_resolves_an_auto_generated_bundle() {
@@ -560,7 +559,7 @@ fn a_prefix_carrying_both_spellings_resolves_the_pair_that_matches() {
 
 /// With neither spelling on disk there is nothing to be compatible with,
 /// so a fresh bundle is generated at the documented location - the same
-/// `<prefix>` + `<prefix>.pub` `--keygen-pq-hybrid` writes and
+/// `<prefix>.priv` + `<prefix>.pub` `--keygen-pq-hybrid` writes and
 /// `--my-key`'s own help promises.
 /// @requirement TB-283
 #[test]
@@ -583,7 +582,7 @@ fn a_my_key_prefix_with_nothing_on_disk_names_the_documented_layout() {
         config.my_key,
         MyKeySelection {
             file_pub: format!("{prefix}.pub").into(),
-            file_priv: prefix.clone().into(),
+            file_priv: format!("{prefix}.priv").into(),
         }
     );
     std::fs::remove_dir_all(&dir).ok();
