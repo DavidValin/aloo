@@ -42,38 +42,46 @@ jobs:
           # Linux glibc
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: aloo-x86_64_linux
+            os: linux
+            arch: x86_64
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: aloo-aarch64_linux
+            os: linux
+            arch: aarch64
             use_cross: true
           # Linux musl (static)
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            artifact: aloo-x86_64_linux_musl
+            os: linux
+            arch: x86_64-musl
             use_cross: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
-            artifact: aloo-aarch64_linux_musl
+            os: linux
+            arch: aarch64-musl
             use_cross: true
           # macOS
           - target: x86_64-apple-darwin
             runner: macos-14
-            artifact: aloo-x86_64_macos-intel
+            os: macos
+            arch: x86_64
             use_cross: false
           - target: aarch64-apple-darwin
             runner: macos-14
-            artifact: aloo-aarch64_macos
+            os: macos
+            arch: aarch64
             use_cross: false
           # Windows
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            artifact: aloo-x86_64_windows
+            os: windows
+            arch: x86_64
             use_cross: false
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
-            artifact: aloo-aarch64_windows
+            os: windows
+            arch: aarch64
             use_cross: false
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +128,7 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/release/aloo staging/aloo
           chmod +x staging/aloo
-          tar -czf "${{ matrix.artifact }}.tar.gz" -C staging aloo
+          tar -czf "aloo-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tgz" -C staging aloo
 
       - name: Archive artifact (windows)
         if: runner.os == 'Windows'
@@ -128,15 +136,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/aloo.exe" "staging/aloo.exe"
-          Compress-Archive -Path "staging/aloo.exe" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+          tar -czf "aloo-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tgz" -C staging aloo.exe
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
+          name: aloo-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: aloo-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tgz
 
   build-freebsd:
     name: Build (x86_64-unknown-freebsd)
@@ -158,13 +164,13 @@ jobs:
             mkdir -p staging
             cp target/release/aloo staging/aloo
             chmod +x staging/aloo
-            tar -czf aloo-x86_64_freebsd.tar.gz -C staging aloo
+            tar -czf aloo-${{ github.ref_name }}-freebsd-x86_64.tgz -C staging aloo
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aloo-x86_64_freebsd
-          path: aloo-x86_64_freebsd.tar.gz
+          name: aloo-${{ github.ref_name }}-freebsd-x86_64
+          path: aloo-${{ github.ref_name }}-freebsd-x86_64.tgz
 
   build-netbsd:
     name: Build (x86_64-unknown-netbsd)
@@ -186,13 +192,13 @@ jobs:
             mkdir -p staging
             cp target/release/aloo staging/aloo
             chmod +x staging/aloo
-            tar -czf aloo-x86_64_netbsd.tar.gz -C staging aloo
+            tar -czf aloo-${{ github.ref_name }}-netbsd-x86_64.tgz -C staging aloo
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aloo-x86_64_netbsd
-          path: aloo-x86_64_netbsd.tar.gz
+          name: aloo-${{ github.ref_name }}-netbsd-x86_64
+          path: aloo-${{ github.ref_name }}-netbsd-x86_64.tgz
 
   build-openbsd:
     name: Build (x86_64-unknown-openbsd)
@@ -214,13 +220,13 @@ jobs:
             mkdir -p staging
             cp target/release/aloo staging/aloo
             chmod +x staging/aloo
-            tar -czf aloo-x86_64_openbsd.tar.gz -C staging aloo
+            tar -czf aloo-${{ github.ref_name }}-openbsd-x86_64.tgz -C staging aloo
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aloo-x86_64_openbsd
-          path: aloo-x86_64_openbsd.tar.gz
+          name: aloo-${{ github.ref_name }}-openbsd-x86_64
+          path: aloo-${{ github.ref_name }}-openbsd-x86_64.tgz
 
   release:
     name: Create release & upload assets

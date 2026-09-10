@@ -26,25 +26,32 @@ is baked in as a build arg default instead (see below).
 ## Building the image
 
 ```sh
-docker build -f docker-server/Dockerfile-server -t aloo-server docker-server
+docker build --no-cache -f docker-server/Dockerfile-server -t aloo-server docker-server
 ```
 
 Note the build context at the end is `docker-server`, not `.` — the
 Dockerfile only needs its own directory.
 
-This builds the **newest** release: the `ALOO_VERSION` build arg defaults to
-`latest`, which the build resolves against the
-[releases page](https://github.com/DavidValin/aloo/releases) each time it
-runs. To build a specific released version instead:
+Always pass `--no-cache`. The `ALOO_VERSION` build arg defaults to `latest`,
+resolved by a `RUN` step early in the Dockerfile — but that step's input (the
+literal string `latest`) never changes, so Docker's layer cache happily
+reuses whatever version it resolved to on the *first* build. Without
+`--no-cache`, `docker build` looks like it "picks up the newest release each
+time" but actually just replays the cached resolution forever; a real check
+against the [releases page](https://github.com/DavidValin/aloo/releases)
+only happens when the cache is bypassed.
+
+To build a specific released version instead:
 
 ```sh
-docker build -f docker-server/Dockerfile-server -t aloo-server \
+docker build --no-cache -f docker-server/Dockerfile-server -t aloo-server \
   --build-arg ALOO_VERSION=0.1.0-alpha.5 \
   docker-server
 ```
 
-`ALOO_VERSION` must then match a tag that has `aloo-x86_64_linux_musl.tar.gz`
-/ `aloo-aarch64_linux_musl.tar.gz` assets on that page. The build picks
+`ALOO_VERSION` must then match a tag that has
+`aloo-<version>-linux-x86_64-musl.tgz` / `aloo-<version>-linux-aarch64-musl.tgz`
+assets on that page. The build picks
 x86_64 vs aarch64 from the build machine's own architecture (`uname -m`), so
 it also resolves correctly under an emulated (QEMU) `--platform` build.
 
@@ -62,8 +69,9 @@ clients fail during the opening handshake, before authenticating.
 That is why the default is `latest` rather than a tag written into the
 Dockerfile — a pinned default quietly becomes a server nobody can connect to
 as soon as the next release ships. If you do pin `ALOO_VERSION`, pin your
-clients to the same tag, and rebuild the image (with `--no-cache`, or after
-`docker pull`ing a fresh base) whenever you upgrade them.
+clients to the same tag, and rebuild the image with `--no-cache` whenever you
+upgrade them (see "Building the image" above for why `--no-cache` is
+required, not optional, to actually pick up a new version).
 
 ## Which version am I running?
 
@@ -84,7 +92,7 @@ docker run -d \
   --restart unless-stopped \
   -p 7878:7878/tcp \
   -p 7878:7878/udp \
-  -v aloo-data:/home/aloo/.aloo \
+  -v /srv/aloo-data:/home/aloo/.aloo \
   -e ALOO_PASSWORD=mypassword \
   aloo-server
 ```
@@ -101,7 +109,7 @@ docker run -d \
   candidates only, which can't punch across two different NATs). If you
   change `ALOO_PORT` (below), update both mappings to match —
   `-p <host>:<ALOO_PORT>/tcp -p <host>:<ALOO_PORT>/udp`.
-- `-v aloo-data:/home/aloo/.aloo` — see "The `~/.aloo` mount point" below.
+- `-v /srv/aloo-data:/home/aloo/.aloo` — see "The `~/.aloo` mount point" below.
 
 ## Parameters
 
@@ -139,7 +147,7 @@ then:
 ```sh
 docker run -d --name aloo-server --restart unless-stopped \
   -p 7878:7878/tcp -p 7878:7878/udp \
-  -v aloo-data:/home/aloo/.aloo \
+  -v /srv/aloo-data:/home/aloo/.aloo \
   -e ALOO_SSL=on \
   -e ALOO_SSL_FULLCHAIN=/home/aloo/.aloo/certs/fullchain.pem \
   -e ALOO_SSL_PRIVKEY=/home/aloo/.aloo/certs/privkey.pem \
@@ -156,7 +164,7 @@ Or register a couple of accounts by hand instead of taking registrations at all:
 ```sh
 docker run -d --name aloo-server --restart unless-stopped \
   -p 7878:7878/tcp -p 7878:7878/udp \
-  -v aloo-data:/home/aloo/.aloo \
+  -v /srv/aloo-data:/home/aloo/.aloo \
   -e ALOO_REGISTER_USERS=alice:s3cret,bob:hunter2 \
   aloo-server
 ```
@@ -172,26 +180,27 @@ container it's `/home/aloo/.aloo`:
 - `downloads/` — files accepted through the app; not really applicable to a
   headless server, but the same binary, so the path exists.
 
-Mount a named volume or bind mount at `/home/aloo/.aloo` so this survives
+Bind mount a host directory at `/home/aloo/.aloo` so this survives
 `docker rm`/recreation:
 
 ```sh
--v aloo-data:/home/aloo/.aloo          # named volume (recommended)
--v /srv/aloo-data:/home/aloo/.aloo     # bind mount to a host path instead
+-v /srv/aloo-data:/home/aloo/.aloo
 ```
 
-The image pre-creates and `chown`s `/home/aloo/.aloo` to the `aloo` user
-(UID/GID `100:101`), so a **brand new named volume gets the right ownership
-automatically — but only if the `aloo-server` container is the first one to
-ever mount it** (Docker seeds an empty named volume from whatever image
-mounts it first, content and ownership included). If some other image
-touches the volume first — e.g. the RSA-key-generation snippet above, which
-uses plain `alpine` to get `openssl` — that other image creates the mount
-point as root instead, and `aloo` then can't write to it. The RSA example
-above works around this with an explicit `chown 100:101` on both the
-directory and the key file; do the same for a bind mount to a host
-directory, which never gets the image's seeded ownership either way:
-`chown 100:101 /srv/aloo-data` before first use.
+The image runs as the unprivileged `aloo` user (UID/GID `100:101`), and a
+bind mount always keeps whatever ownership the host directory already has —
+it never inherits ownership from the image. Create the directory and
+`chown` it to that UID/GID before the first run, or `aloo` won't be able to
+write to it:
+
+```sh
+mkdir -p /srv/aloo-data && chown 100:101 /srv/aloo-data
+```
+
+Do the same for anything placed there ahead of time — e.g. a TLS
+certificate pair copied in before enabling `ALOO_SSL` (see "Generating a TLS
+certificate for a server" in the README) needs `chown 100:101` on those
+files too, or `aloo` won't be able to read them either.
 
 ## Crash recovery
 
@@ -241,9 +250,10 @@ docker exec aloo-server cat /etc/aloo-version
 aloo --help | head -1        # on the machine running the client
 ```
 
-If they differ, rebuild the image (see "Building the image" — the default
-`ALOO_VERSION=latest` picks up the newest release) and recreate the
-container:
+If they differ, rebuild the image with `--no-cache` (see "Building the
+image" — without it, the default `ALOO_VERSION=latest` just replays the
+cached resolution from the first build instead of picking up the newest
+release) and recreate the container:
 
 ```sh
 docker build --no-cache -f docker-server/Dockerfile-server -t aloo-server docker-server

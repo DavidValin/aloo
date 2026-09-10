@@ -2,13 +2,16 @@
 # this project's GitHub releases. Self-contained build context.
 #
 # Usage:
-#   # builds the newest release, which is what a freshly-installed client is:
-#   docker build -f docker-server/Dockerfile-server -t aloo-server docker-server
+#   # builds the newest release, which is what a freshly-installed client is;
+#   # always use --no-cache, otherwise the "latest" resolution below gets
+#   # replayed from Docker's layer cache instead of re-checked (see
+#   # docs/SERVER_ON_DOCKER.md "Building the image"):
+#   docker build --no-cache -f docker-server/Dockerfile-server -t aloo-server docker-server
 #   # pinning an exact version instead (must match the clients that connect):
 #   #   --build-arg ALOO_VERSION=<tag from https://github.com/DavidValin/aloo/releases>
 #   docker run -d --name aloo-server --restart unless-stopped \
 #     -p 7878:7878/tcp -p 7878:7878/udp \
-#     -v aloo-data:/home/aloo/.aloo \
+#     -v /srv/aloo-data:/home/aloo/.aloo \
 #     -e ALOO_REGISTER_USERS=alice:s3cret \
 #     aloo-server
 #
@@ -53,10 +56,10 @@ RUN set -eu; \
     else \
         version="$ALOO_VERSION"; \
     fi; \
-    url="https://github.com/DavidValin/aloo/releases/download/${version}/aloo-${arch}_linux_musl.tar.gz"; \
+    url="https://github.com/DavidValin/aloo/releases/download/${version}/aloo-${version}-linux-${arch}-musl.tgz"; \
     echo "aloo-server: fetching $url" >&2; \
-    curl -fsSL "$url" -o aloo.tar.gz; \
-    tar -xzf aloo.tar.gz; \
+    curl -fsSL "$url" -o aloo.tgz; \
+    tar -xzf aloo.tgz; \
     chmod +x aloo; \
     printf '%s\n' "$version" > version
 
@@ -70,7 +73,9 @@ COPY --from=fetcher /fetch/version /etc/aloo-version
 COPY aloo-server-entrypoint.sh /usr/local/bin/aloo-server-entrypoint.sh
 RUN chmod 755 /usr/local/bin/aloo /usr/local/bin/aloo-server-entrypoint.sh
 
-# Chowned so a fresh named volume mounted here inherits "aloo" ownership.
+# Only matters if the container is run with nothing bind-mounted here; a
+# real bind mount (see docs/SERVER_ON_DOCKER.md "The ~/.aloo mount point")
+# keeps whatever ownership the host directory already has, regardless.
 RUN mkdir -p /home/aloo/.aloo && chown aloo:aloo /home/aloo/.aloo
 
 USER aloo

@@ -310,6 +310,11 @@ list_release_assets_hint() {
 # ---------------------------------------------------------------------------
 # Asset resolution: prefer musl on Linux, fall back gracefully if a given
 # release does not ship a musl build for that architecture.
+#
+# aloo's own release assets are named "aloo-<version>-<os>-<arch>.tgz"
+# (get_aloo_arch_candidates / pick_asset's "aloo" branch below). otp-toolkit
+# is a separate repo/release process and still uses the older
+# "<name>-<suffix>.<ext>" naming (get_suffixes / pick_asset's default branch).
 # ---------------------------------------------------------------------------
 
 get_suffixes() {
@@ -341,9 +346,61 @@ get_suffixes() {
   esac
 }
 
+get_aloo_arch_candidates() {
+  # ordered candidates for the "<arch>" field of
+  # aloo-<version>-<os>-<arch>.tgz; musl tried before glibc on Linux.
+  ALOO_ARCH_CANDIDATES=()
+  case "$OS" in
+    linux)
+      case "$ARCH" in
+        x86_64)  ALOO_ARCH_CANDIDATES=(x86_64-musl x86_64) ;;
+        aarch64) ALOO_ARCH_CANDIDATES=(aarch64-musl aarch64) ;;
+      esac
+      ;;
+    macos)
+      case "$ARCH" in
+        x86_64)  ALOO_ARCH_CANDIDATES=(x86_64) ;;
+        aarch64) ALOO_ARCH_CANDIDATES=(aarch64) ;;
+      esac
+      ;;
+    windows)
+      case "$ARCH" in
+        x86_64)  ALOO_ARCH_CANDIDATES=(x86_64) ;;
+        aarch64) ALOO_ARCH_CANDIDATES=(aarch64) ;;
+      esac
+      ;;
+    freebsd) [ "$ARCH" = "x86_64" ] && ALOO_ARCH_CANDIDATES=(x86_64) ;;
+    netbsd)  [ "$ARCH" = "x86_64" ] && ALOO_ARCH_CANDIDATES=(x86_64) ;;
+    openbsd) [ "$ARCH" = "x86_64" ] && ALOO_ARCH_CANDIDATES=(x86_64) ;;
+  esac
+}
+
 pick_asset() {
   # sets ASSET_FILENAME and ASSET_URL
   local name="$1" repo="$2" version="$3"
+
+  if [ "$name" = "aloo" ]; then
+    get_aloo_arch_candidates
+    if [ "${#ALOO_ARCH_CANDIDATES[@]}" -eq 0 ]; then
+      err "'$name' has no prebuilt binaries for ${OS}/${ARCH}."
+    fi
+    local cand filename url
+    for cand in "${ALOO_ARCH_CANDIDATES[@]}"; do
+      filename="aloo-${version}-${OS}-${cand}.tgz"
+      url="https://github.com/${repo}/releases/download/${version}/${filename}"
+      info "Checking for ${filename} (${version})..."
+      if url_exists "$url"; then
+        ASSET_FILENAME="$filename"
+        ASSET_URL="$url"
+        return 0
+      fi
+    done
+    warn "Tried candidates: ${ALOO_ARCH_CANDIDATES[*]}"
+    warn "Assets actually published for ${repo}@${version}:"
+    list_release_assets_hint "$repo" "$version"
+    err "Could not find a '$name' release asset for ${OS}/${ARCH} at version ${version}."
+  fi
+
   get_suffixes
   if [ "${#SUFFIXES[@]}" -eq 0 ]; then
     err "'$name' has no prebuilt binaries for ${OS}/${ARCH}."
