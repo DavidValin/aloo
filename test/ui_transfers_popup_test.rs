@@ -138,6 +138,11 @@ fn a_chord_needs_exactly_its_own_modifiers() {
     assert!(state.transfers_popup.is_none(), "nor is alt alone");
     chord(&mut state, KeyCode::Char('d'), KeyModifiers::NONE);
     assert!(state.transfers_popup.is_none(), "nor is a bare d");
+    chord(&mut state, KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    assert!(
+        state.transfers_popup.is_none(),
+        "nor is ctrl+shift: shift is a modifier the chord did not name"
+    );
 }
 
 /// @requirement AC-467

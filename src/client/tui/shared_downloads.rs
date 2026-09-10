@@ -330,14 +330,6 @@ impl UiState {
         self.transfers.clear_finished()
     }
 
-    /// The Downloads tab's list: this peer's downloads, live ones first.
-    pub fn shared_download_rows_for(&self, peer_name: &str) -> Vec<&SharedDownload> {
-        self.transfers
-            .rows()
-            .into_iter()
-            .filter(|r| r.direction == TransferDirection::Download && r.peer_name == peer_name)
-            .collect()
-    }
 
     /// Every download, whoever it is from - what the tab shows when it
     /// has no one peer in view.

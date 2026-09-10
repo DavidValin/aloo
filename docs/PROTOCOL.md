@@ -2757,7 +2757,7 @@ Every message in this section is an ordinary sealed envelope (§13.3) on
 the reliable link (§7.1.1), `channel: None`, exactly like `ChannelPresence`:
 the names of someone's folders are private to the pair, and an envelope
 that opens under the pinned key is what makes the announcement theirs.
-Six `Content` tags name the six payloads, each carried on the
+Eight `Content` tags name the eight payloads, each carried on the
 `P2pPayload` variant of the same name.
 
 ```
@@ -2772,7 +2772,7 @@ owner                                             requester
   |                                                    |
   |<-- SharedDownloadRequest { request_id, share, rel }|   d on a file or folder
   |                                                    |
-  |   for each file, one at a time:                    |
+  |   for each file, up to four at a time:             |
   |-- SharedFileTag { request_id, stream_id, rel } --->|
   |-- FileOffer { stream_id, envelope } -------------->|   accepted with no popup
   |<-- FileAccept { stream_id } -----------------------|
@@ -2817,8 +2817,8 @@ each finishes, so a folder of small files is not one round trip per
 file. Tag and offer travel the same reliable, ordered link, so
 the tag always lands first; the requester accepts an offer whose
 `stream_id` it holds a tag for straight away, into
-`~/.aloo/downloads/<owner nickname>/<share>/<rel path>` (folder structure
-kept), and the transfer proceeds exactly as §7.6 - chunks and all.
+`~/.aloo/downloads/fileshare/<owner nickname>/<share>/<rel path>` (folder
+structure kept), and the transfer proceeds exactly as §7.6 - chunks and all.
 Two things differ from an ordinary transfer, and both follow from the
 requester having asked for this rather than been sent it: **neither side
 writes a row into the conversation** (the requester's Downloads list is
@@ -2960,14 +2960,11 @@ requester has given up on. The owner drops whatever is still queued for
 it; a file already in flight is left to finish or fail on its own, since
 the transport cannot unsend it and the requester discards it either way.
 Either side's cancel also **detaches** those in-flight files from the
-request - the owner's own cancel as much as the requester's. They must
-stop being credited to it, or they are credited to whatever job next
-carries that id, which is the resume of the same transfer, and drive it
-to "every file sent" while most of its own files are still queued; and
-they must stop counting against the parallel-send budget, or a cancel
-that leaves streams whose workers are already gone keeps the budget full
-for good, so nothing more is ever offered and the upload sits at
-"transferring" with nothing moving.
+request - the owner's own cancel as much as the requester's: their
+completions are no longer credited to the request (nor to a resume of
+it, which carries the same id), and they no longer count against the
+parallel-send budget, so a stream whose worker is already gone cannot
+hold a slot.
 On the requester's side every `.part` of that request is removed and
 every file already complete is kept - cancelling costs only what had not
 arrived. Resuming is the same request made again, **under the same request id**:
@@ -3006,10 +3003,10 @@ walk, a file in flight and a cancel all take time. `SharedDownloadRequest`
 therefore carries an `attempt`, one for the first ask and one more for
 each resume, and `SharedDownloadPlan`, `SharedFileTag`,
 `SharedDownloadCancel` and `SharedDownloadDone` all echo it. Each side
-drops whatever is not stamped with the attempt it is on. Without that
-the answer to a cancel - the message most likely to be late, since a
-cancel is re-asked until it is answered - closed the round that had
-already replaced it.
+drops whatever is not stamped with the attempt it is on - above all the
+answer to a cancel, the message most likely to be late since a cancel is
+re-asked until it is answered, which must not close the round that has
+replaced it.
 
 The number is used to set a message aside, never to refuse a cancel.
 Only a cancel naming an attempt **older** than the live round is set
@@ -3018,10 +3015,7 @@ at or ahead of what the owner knows always stops the request: the
 requester is the only judge of whether it still wants the download, and
 it only ever cancels the attempt it is on, while the owner's view can be
 behind, since its record of the round goes with the link and the ask that
-would have advanced it can itself go missing. Requiring the two to agree
-exactly made that disagreement permanent - with nothing remembered the
-owner reads attempt 1, so the first cancel of a download matched and
-worked while every later one was acknowledged and ignored.
+would have advanced it can itself go missing.
 
 A `SharedFileTag` is honoured whatever attempt it names, so long as it
 names a download this side asked that peer for. A file of a round the
@@ -3039,13 +3033,11 @@ each retry - and a shared-folder message dropped before it is acted on
 Two clients disagreeing about a transfer is otherwise indistinguishable
 from the feature being broken, and the log is what tells the two apart.
 
-**A cancel is asked again until it is answered.** It used to go out once,
-with its result discarded, so a single failure to seal or deliver it -
-the peer momentarily unknown, no key to seal to, a link that dropped as
-it went - left the requester showing "cancelled" and the owner still
-showing the upload, with nothing that would ever bring the two back
-together: cancelling again did nothing, because from the requester's own
-point of view it already had. The owner answers every
+**A cancel is asked again until it is answered.** A single send can fail
+quietly - the peer momentarily unknown, no key to seal to, a link that
+drops as it goes out - and a cancel lost that way would leave the
+requester showing "cancelled" and the owner still showing the upload,
+with nothing else that would bring the two together. The owner answers every
 `SharedDownloadCancel` with `SharedDownloadDone` carrying
 `SharedError::Cancelled`, including for a request it has already stopped,
 forgotten, or never had, and that answer is what ends the retries. A
@@ -3058,10 +3050,8 @@ which it does off its event loop (§7.8 "Downloading"). Each ask opens a
 round of that request id - a resume re-uses the id, so it counts as one -
 and either side's cancel retires it; a walk carries the round it was
 started for, and one that comes back under a retired round is dropped
-rather than allowed to start sending. Without that a cancel landing
-mid-walk cancelled nothing at all: the walk began a full round a moment
-later, the requester's row already said cancelled so nothing on that side
-would ever stop it, and the owner showed the upload as running for good.
+rather than allowed to start sending - a round begun after the cancel
+would be one the requester has no record of and no way to stop.
 
 **A link lost** drops everything both sides held for that peer - queued
 files, offers in flight, outstanding requests and tags, and the
@@ -3070,14 +3060,12 @@ return under the same id; the announce is repeated when it does. The
 requester's own downloads for that peer end the same way a cancel does:
 partial files removed, completed ones kept.
 
-The transfer's row closes on **both** sides, saying the link went away.
-Dropping the owner's job is exactly what stops anything ever closing its
-record, so a job dropped without closing its row left that row at
-"transferring" for the rest of the session with nothing in flight behind
-it - and no later cancel could reach it either, because the requester's
-own state for that transfer went with the same link, so its cancel was
-never sent. Once the peer is back the download resumes from where it got
-to: what arrived is kept and refused as it is offered again, so only the
+The transfer's row closes on **both** sides, saying the link went away:
+the owner's job is what closes its record, so the record is closed
+together with the job, and the requester's own state for the transfer
+goes with the same link, so no later cancel of its own could reach the
+owner. Once the peer is back the download resumes from where it got to:
+what arrived is kept and refused as it is offered again, so only the
 rest moves.
 
 ## 8. Encryption model
@@ -4350,11 +4338,10 @@ what it protected.
 
 **A sender never rotates out from under its peer.** The peer seals to the
 newest key of ours they have *heard of*, and mid-burst that is however
-many rotations behind the burst is long: a folder download offers
-several files at once and rotates after each, so a cancel sealed in
-between arrived nine generations behind the eight-key window -
-unopenable, silently, and every retry the same. Two things keep that from
-happening. A rotation goes onto the link the moment it is made, in order
+many rotations behind the burst is long - a folder download offers
+several files at once and rotates after each, so a reply sealed in
+between could be more generations behind than the window holds. Two
+things keep that from happening. A rotation goes onto the link the moment it is made, in order
 with the sends around it, so a peer with a live link is never more than
 one behind. And each side tracks which of its keys the peer was last seen
 sealing to (the open reports which key opened it) and **does not rotate

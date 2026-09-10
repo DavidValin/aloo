@@ -579,7 +579,7 @@ pub enum P2pEvent {
         envelope: crate::proto::Envelope,
     },
 
-    /// Mirrors `p2p_proto::P2pPayload::CallInvite" - see
+    /// Mirrors `p2p_proto::P2pPayload::CallInvite` - see
     /// `crate::client::voice_call` for how a call's roster/audio are handled
     /// from here.
     CallInvite {

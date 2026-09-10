@@ -1897,15 +1897,11 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
     // opened. Each rotation retires the oldest retained key once more
     // than `PQ_KEY_RETENTION` are held, and the peer seals to the newest
     // key of ours they have *heard of* - which, mid-burst, is however
-    // many rotations behind the burst is long. A folder download offers
-    // several files at once and rotates after each, and the peer's
-    // cancel, sealed in between, arrived nine generations behind an
-    // eight-key window: unopenable, silently, and every retry the same.
-    // Rotating our decryption key protects what the peer sends *to us*,
-    // so while they have not used the current one, rotating again buys
-    // nothing and only moves the window away from them. The bound on
-    // retained keys stays exactly as §13.10 states it; this is the
-    // sender pacing itself to it.
+    // many rotations behind the burst is long. Rotating our decryption
+    // key protects what the peer sends *to us*, so while they have not
+    // used the current one, rotating again buys nothing and only moves
+    // the window away from them. The bound on retained keys stays
+    // exactly as §13.10 states it; this is the sender pacing itself to it.
     if session.own_pq_keys.rotations_ahead_of_peer(peer)
         >= crate::client::pq_rekey::PQ_KEY_RETENTION as u64 - 1
     {
@@ -1918,17 +1914,14 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
         return;
     };
     // Onto the link *now*, in order with the sends around it, whenever
-    // the link is the path those sends take. Rotations used to go by the
-    // main loop's `rotate_out_rx`, which drains only after the handler
-    // that requested them returns - so a burst of sealed sends (a folder
-    // download offers several files at once, each with its tag) reached
-    // the peer first and the rotations they triggered only afterwards.
-    // The peer, sealing a reply in between, was as many keys behind as
-    // the burst was long; past `PQ_KEY_RETENTION` this side could not
-    // open it, and a cancel lost that way was lost for good, since every
-    // retry sealed to the same stale key. With the rotation queued here,
-    // in wire order, the peer is never more than one behind (§13.10).
-    // A peer with no live link is relayed through the server as before.
+    // the link is the path those sends take. The main loop's
+    // `rotate_out_rx` drains only after the handler that requested the
+    // rotation returns, so a rotation routed through it would reach the
+    // peer after every send of the burst that triggered it, and a reply
+    // sealed in between would be as many keys behind as the burst is
+    // long. Queued here, in wire order, the peer is never more than one
+    // behind (§13.10). A peer with no live link is relayed through the
+    // server.
     if rotation_rides_the_link(session.server, peer) || session.peer_link.is_active(peer) {
         session.peer_link.send_reliable_or_queue(
             peer,

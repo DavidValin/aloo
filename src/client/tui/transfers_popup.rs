@@ -17,12 +17,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
-use crate::client::shared_folders::format_size;
-use crate::client::transfer_log::{TransferDirection, TransferStatus};
+use crate::client::transfer_log::TransferDirection;
 
 use super::ui::{Mode, UiAction, UiState, centered_rect};
-use super::widgets::progress_bar::{DEFAULT_BAR_CELLS, percent_of, progress_line};
-use super::widgets::text::elide_start;
+use super::widgets::transfer_row::transfer_lines;
 
 /// Wide, because every row is a path and a path is what a reader is
 /// scanning for - the columns after it are short and fixed.
@@ -285,62 +283,23 @@ pub(crate) fn render_transfers_popup(frame: &mut Frame, area: Rect, state: &UiSt
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in rows.iter().enumerate() {
         let marker = if i == popup_state.selected { "\u{25b8} " } else { "  " };
-        let (color, status) = match &item.status {
-            TransferStatus::Asking | TransferStatus::Running => (Color::Yellow, item.status.label()),
-            TransferStatus::Completed => (Color::Green, item.status.label()),
-            TransferStatus::Cancelled => (Color::DarkGray, item.status.label()),
-            TransferStatus::Failed(_) => (Color::Red, item.status.label()),
-        };
+        let (color, _) = super::widgets::transfer_row::status_style(&item.status);
         // The arrow says which way it went and the preposition says who
         // with, so a row reads without having to know the convention.
         let preposition = match item.direction {
             TransferDirection::Download => "from",
             TransferDirection::Upload => "to",
         };
-        let counted = match item.files_total {
-            Some(total) => format!("{}/{total} files", item.files_done),
-            None => format!("{} files", item.files_done),
-        };
-        // A resumed download offers the whole folder again and refuses
-        // what is already on disk, so its count climbs straight back up
-        // without a byte moving. Saying how many were skipped is what
-        // makes that read as resuming rather than starting over - the
-        // browser's own Downloads tab has said so all along, and this
-        // popup is where the user actually watches a transfer.
-        let skipped = if item.files_skipped > 0 {
-            format!(", {} already had", item.files_skipped)
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{marker}{} ", item.direction.marker()),
-                Style::default().fg(color),
-            ),
-            // The tail of the path, not the head: the last components
-            // say which file this is, the first ones repeat down the
-            // whole list.
-            Span::styled(
-                elide_start(&item.label(), path_width),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {preposition} {}", item.peer_name),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw("  "),
-            Span::styled(status, Style::default().fg(color)),
-            Span::styled(format!("  {counted}{skipped}"), Style::default().fg(Color::DarkGray)),
-        ]));
-        let suffix = match item.fraction() {
-            Some(f) => format!("  {}%  {}", percent_of(f), format_size(item.bytes_done)),
-            None => format!("  {}", format_size(item.bytes_done)),
-        };
-        let mut bar =
-            progress_line(item.fraction().unwrap_or(0.0), DEFAULT_BAR_CELLS, color, &suffix).spans;
-        bar.insert(0, Span::raw("  "));
-        lines.push(Line::from(bar));
-        lines.push(Line::from(""));
+        let lead = vec![Span::styled(
+            format!("{marker}{} ", item.direction.marker()),
+            Style::default().fg(color),
+        )];
+        lines.extend(transfer_lines(
+            item,
+            lead,
+            path_width,
+            &format!("{preposition} {}", item.peer_name),
+        ));
     }
     frame.render_widget(Paragraph::new(lines), body);
 }

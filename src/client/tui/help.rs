@@ -285,7 +285,8 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
         keys: "Tab",
         text: "switch between their folders and your Downloads. While anything is arriving \
                the tab reads 'Downloading <n>...', and the header shows a blinking yellow \
-               down arrow with the current speed.",
+               arrow with the current speed - down for what is arriving, up for what \
+               is leaving your shared folders.",
     },
     HelpLine::Item {
         keys: "Ctrl+D",

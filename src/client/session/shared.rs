@@ -71,14 +71,10 @@ pub struct SharedJob {
     pub finished: u32,
     pub error: Option<SharedError>,
     /// The requester's nickname as it was when this job opened - the
-    /// name its transfer record is filed under.
-    ///
-    /// Remembered rather than looked up again each time, because every
-    /// later update would otherwise depend on the peer still being in
-    /// `known_users`: one who has gone offline or come back under a new
-    /// `UserId` resolves to no name, the record is then never found, and
-    /// the row sits at "transferring" for good with nothing left that
-    /// could ever close it.
+    /// name its transfer record is filed under. Remembered here rather
+    /// than resolved from `known_users` on each update, so the record
+    /// stays reachable after the peer goes offline or returns under a
+    /// new `UserId`.
     pub peer_name: String,
 }
 
@@ -134,18 +130,17 @@ pub struct PendingSharedRequest {
     /// Given up on from this side, but kept rather than forgotten: the
     /// owner may already have several files in flight when the cancel
     /// reaches it, and their tags and offers are still on their way.
-    /// Dropping the request outright made those offers look unasked-for,
-    /// and the ordinary Accept popup went up for each of them. They are
-    /// refused instead (`drain_auto_accepts`), and the record goes when
-    /// the owner's `SharedDownloadDone` closes it.
+    /// With the record gone those offers would look unasked-for and
+    /// each would raise the Accept popup; kept and marked, they are
+    /// refused instead (`drain_auto_accepts`). The record goes when the
+    /// owner's `SharedDownloadDone` closes it.
     pub cancelled: bool,
     /// When the cancel was last put on the wire, for as long as the
-    /// owner has not acknowledged it. A cancel used to be sent once and
-    /// forgotten, so any single failure to seal or deliver it left the
-    /// two sides permanently disagreeing - this side cancelled, the
-    /// owner still showing the upload - with nothing that would ever
-    /// correct it. It is re-sent on this schedule until the owner's
-    /// `SharedDownloadDone` arrives and takes this record away.
+    /// owner has not answered it. The cancel is re-sent on this schedule
+    /// (`retry_pending_cancels`) until the owner's `SharedDownloadDone`
+    /// takes this record away, so a single failure to seal or deliver it
+    /// cannot leave this side showing "cancelled" while the owner still
+    /// shows the upload.
     pub cancel_sent: Option<Instant>,
     /// Which ask for this request id this record is - 1 for the first,
     /// one more for each resume. Everything the owner sends back is
@@ -405,27 +400,16 @@ fn serve_download(
     }
 }
 
-/// Stops a stopped request's files from being attributed to it any
-/// longer. They are already on the wire and cannot be unsent, so they
-/// will still finish - but two things must no longer happen when they
-/// do.
-///
-/// They must not be *credited* to whatever job next carries this id,
-/// which is the resume of the very same transfer: crediting them drove
-/// the resumed job to "every file sent" while most of its own files were
-/// still queued, so the requester saw the download finish early, its row
-/// went inactive, and cancelling again did nothing at all.
-///
-/// And they must stop holding the parallel-send budget
-/// (`MAX_PARALLEL_SHARED_SENDS`, counted by `in_flight_to`). A cancel
-/// can leave streams whose workers are already gone, and nothing then
-/// removes them: the budget stays full, the pump never offers another
-/// file, and the upload sits at "transferring" for good with nothing
-/// moving.
-///
-/// Both cancels need this - the requester's, and the owner's own
-/// `cancel_upload`. Only the first had it, which is why stopping from
-/// the sender and then resuming wedged this side.
+/// Detaches a stopped request's in-flight files from it. They are
+/// already on the wire and cannot be unsent, so they still finish - but
+/// from here on their completions are not credited to whatever job next
+/// carries this id (the resume of the same transfer, which would
+/// otherwise be counted finished while its own files were still
+/// queued), and they no longer hold the parallel-send budget
+/// (`MAX_PARALLEL_SHARED_SENDS`, counted by `in_flight_to`), which a
+/// stream whose worker is already gone would otherwise occupy for good.
+/// Both cancels go through this: the requester's, and the owner's own
+/// `cancel_upload`.
 fn detach_request_streams(session: &mut SessionState, peer: UserId, request_id: u64) {
     session
         .shared_request_of_stream
@@ -520,11 +504,9 @@ pub async fn on_shared_event(
             attempt,
         } => {
             // Cancelled, or asked again, while this walk was running:
-            // whatever it found belongs to a round nobody is waiting on.
-            // Starting it here would open a transfer the requester has
-            // no record of and no way to stop - its own row already says
-            // cancelled - and this side would show "transferring" for
-            // good (§7.8).
+            // whatever it found belongs to a round nobody is waiting on,
+            // and starting it would open a transfer the requester has no
+            // record of and no way to stop (§7.8).
             if session
                 .shared_request_round
                 .get(&(peer, request_id))
@@ -545,14 +527,16 @@ pub async fn on_shared_event(
                 send_download_done(session, ui_state, peer, request_id, attempt, 0, error);
                 return Ok(());
             }
+            // A requester no longer on the roster cannot be sent to at
+            // all (`send_sealed` needs their key), so the round is not
+            // opened: a record under no name could never be closed.
+            let Some(peer_name_for_record) = ui_state.known_users.get(&peer).map(|u| u.name.clone())
+            else {
+                return Ok(());
+            };
             // The sender's own record of this transfer, so it shows in
             // the global transfers popup and can be cancelled from there
             // (§7.8) - one per request, per requester.
-            let peer_name_for_record = ui_state
-                .known_users
-                .get(&peer)
-                .map(|u| u.name.clone())
-                .unwrap_or_default();
             ui_state.start_transfer(
                 crate::client::transfer_log::TransferDirection::Upload,
                 request_id,
@@ -923,15 +907,10 @@ pub fn on_peer_link_lost(session: &mut SessionState, ui_state: &mut UiState, pee
         session.shared_sending.remove(&(peer, stream_id));
         session.shared_request_of_stream.remove(&stream_id);
     }
-    // The rows this side keeps for those uploads are closed with them.
-    // Dropping the jobs is exactly what stops `finish_job_file` ever
-    // closing a record, so a job dropped here without closing its row
-    // leaves that row at "transferring" for good - nothing is in flight,
-    // so neither header shows a speed, and no later cancel can reach it
-    // either, since the requester's own state for it is dropped just
-    // below and its cancel is never sent. The requester's side of the
-    // same transfer is closed a few lines down; both ends have to be, or
-    // the two screens disagree for the rest of the session.
+    // The rows this side keeps for those uploads close with the jobs:
+    // `finish_job_file` is what closes a record, and it needs the job.
+    // The requester's side of the same transfer is closed below, so both
+    // screens say the same thing.
     let orphaned: Vec<(u64, String)> = session
         .shared_jobs
         .iter()
@@ -975,6 +954,27 @@ pub fn on_peer_link_lost(session: &mut SessionState, ui_state: &mut UiState, pee
 // Both sides: an arriving shared-folder message
 // ---------------------------------------------------------------------
 
+/// Decodes one payload, or logs why it could not be and returns `None`.
+/// Never silent: these are bincode structs, positional and without field
+/// names, so a field added on one side makes every message of that kind
+/// unreadable to a peer built before it - and dropped quietly that is
+/// indistinguishable from the feature not working.
+fn decode_or_report<T: for<'de> serde::Deserialize<'de>>(
+    plaintext: &[u8],
+    what: &str,
+    sender: &str,
+) -> Option<T> {
+    match proto::decode::<T>(plaintext) {
+        Ok(value) => Some(value),
+        Err(why) => {
+            crate::log_warn!(
+                "could not read a {what} from {sender}: {why} - are both clients the same build?"
+            );
+            None
+        }
+    }
+}
+
 /// Opens `envelope` and acts on whichever of the six payloads it is.
 /// Access is checked afresh on every request (`find_visible_share`),
 /// never trusted from the announce.
@@ -986,10 +986,8 @@ pub async fn on_shared_folder_message(
 ) -> proto::Result<()> {
     let content = envelope.content.clone();
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
-        // Not silent: a shared-folder message from someone this side does
-        // not know is dropped, and if that someone is mid-download the
-        // effect is "the other side never reacts" - which has to be
-        // tellable apart from the feature being broken.
+        // Logged, never silent: a message dropped here looks, from the
+        // other side, exactly like a peer that does not react.
         crate::log_warn!("dropped a {content:?} from {from:?}: not in known_users");
         return Ok(());
     };
@@ -1004,23 +1002,8 @@ pub async fn on_shared_folder_message(
     super::request_rotation(session, from);
     match content {
         Content::SharedFolders => {
-            let list = match proto::decode::<Vec<SharedFolderSummary>>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedFolders from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(list) = decode_or_report::<Vec<SharedFolderSummary>>(&plaintext, "SharedFolders", &sender.name) else {
+                return Ok(());
             };
             let mut names: Vec<String> = Vec::new();
             for summary in list {
@@ -1031,23 +1014,8 @@ pub async fn on_shared_folder_message(
             ui_state.set_peer_shares(from, names);
         }
         Content::SharedListRequest => {
-            let req = match proto::decode::<SharedListRequest>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedListRequest from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(req) = decode_or_report::<SharedListRequest>(&plaintext, "SharedListRequest", &sender.name) else {
+                return Ok(());
             };
             if ui_state.is_trust_gated(from) {
                 return Ok(());
@@ -1055,23 +1023,8 @@ pub async fn on_shared_folder_message(
             serve_listing(session, &sender.name, from, req);
         }
         Content::SharedListResponse => {
-            let response = match proto::decode::<SharedListResponse>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedListResponse from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(response) = decode_or_report::<SharedListResponse>(&plaintext, "SharedListResponse", &sender.name) else {
+                return Ok(());
             };
             let matches = session
                 .shared_requests
@@ -1094,23 +1047,8 @@ pub async fn on_shared_folder_message(
             );
         }
         Content::SharedDownloadRequest => {
-            let req = match proto::decode::<SharedDownloadRequest>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedDownloadRequest from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(req) = decode_or_report::<SharedDownloadRequest>(&plaintext, "SharedDownloadRequest", &sender.name) else {
+                return Ok(());
             };
             if ui_state.is_trust_gated(from) {
                 return Ok(());
@@ -1118,47 +1056,19 @@ pub async fn on_shared_folder_message(
             serve_download(session, &sender.name, from, req);
         }
         Content::SharedDownloadCancel => {
-            let cancel = match proto::decode::<SharedDownloadCancel>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedDownloadCancel from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(cancel) = decode_or_report::<SharedDownloadCancel>(&plaintext, "SharedDownloadCancel", &sender.name) else {
+                return Ok(());
             };
-            // Retires the round, so a folder walk still running for this
-            // request comes back to nothing instead of starting to send.
-            // Without this a cancel that landed mid-walk cancelled
-            // nothing at all: the walk started the round a moment later,
-            // and there was no longer anything on the requester's side
-            // that would ever stop it.
             // Only a cancel for a round this side has already moved
-            // *past* is set aside - it is still answered, so the
-            // requester stops asking, but must not stop the round that
-            // replaced it.
-            //
-            // Anything else stops the request, including a cancel naming
-            // an attempt ahead of what this side knows about. The
+            // *past* is set aside - still answered, so the requester
+            // stops asking, but not allowed to stop the round that
+            // replaced it. Anything else stops the request, including a
+            // cancel naming an attempt ahead of what this side knows: the
             // requester is the only judge of whether it still wants the
-            // download, and it only ever cancels the attempt it is on;
-            // this side's view can be behind, because its record of the
-            // round is dropped with the link (`on_peer_link_lost`) and
-            // because the ask that would have advanced it can itself go
-            // missing. Requiring the two to agree exactly made that
-            // disagreement permanent: with no record, this side reads
-            // attempt 1, so the first cancel of a download matched and
-            // worked while every later one was quietly ignored and the
-            // upload ran on for good.
+            // download and only ever cancels the attempt it is on, while
+            // this side's view can be behind - its record of the round
+            // goes with the link (`on_peer_link_lost`), and the ask that
+            // would advance it can itself go missing.
             let live_attempt = round_attempt(session, from, cancel.request_id);
             crate::log_warn!(
                 "fileshare: cancel of request {} attempt {} from {} (this side is on attempt {live_attempt})",
@@ -1179,6 +1089,9 @@ pub async fn on_shared_folder_message(
                 );
                 return Ok(());
             }
+            // Retires the round, so a folder walk still running for this
+            // request comes back to nothing rather than starting to send
+            // a transfer the requester has already given up on.
             bump_request_round(session, from, cancel.request_id, None);
             // Only what is still queued: a file already in flight cannot
             // be unsent, and the requester discards it either way.
@@ -1193,20 +1106,10 @@ pub async fn on_shared_folder_message(
                 .remove(&(from, cancel.request_id))
                 .map(|job| job.peer_name)
                 .unwrap_or_else(|| sender.name.clone());
-            // Files of this request already on the wire cannot be
-            // unsent, but they must stop being *attributed* to it: their
-            // completions would otherwise be credited to whatever job
-            // next carries this id - a resume of the very same transfer -
-            // and drive it to "every file sent" while most of them were
-            // still queued. The requester then saw the download complete,
-            // its own row went inactive, and cancelling again did
-            // nothing, which left this side transferring for good.
             detach_request_streams(session, from, cancel.request_id);
-            // And this side's own row says so. Without it the sender went
-            // on showing an upload in progress for a download the other
-            // end had already given up on - nothing was left to finish
-            // the record, since removing the job above is exactly what
-            // stops `finish_job_file` ever closing it.
+            // This side's own row says so too. Removing the job above is
+            // what stops `finish_job_file` ever closing the record, so
+            // the row has to be closed here.
             let marked = ui_state.cancel_transfer(
                 crate::client::transfer_log::TransferDirection::Upload,
                 &named,
@@ -1221,10 +1124,8 @@ pub async fn on_shared_folder_message(
             // Answered, always - including a cancel for something this
             // side has already stopped, forgotten, or never had. The
             // requester re-sends until it hears this, so the answer is
-            // what ends the retries and what lets a cancel survive a
-            // send that quietly failed. Being idempotent is the point:
-            // the second and third copies of a cancel cost one reply
-            // each and change nothing else.
+            // what ends the retries. Idempotent by design: a repeated
+            // cancel costs one reply and changes nothing else.
             let sent = session
                 .shared_jobs
                 .get(&(from, cancel.request_id))
@@ -1241,23 +1142,8 @@ pub async fn on_shared_folder_message(
             );
         }
         Content::SharedDownloadPlan => {
-            let plan = match proto::decode::<SharedDownloadPlan>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedDownloadPlan from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(plan) = decode_or_report::<SharedDownloadPlan>(&plaintext, "SharedDownloadPlan", &sender.name) else {
+                return Ok(());
             };
             // Stamped with the ask it answers: a plan for a round this
             // side has already replaced would reset the current one's
@@ -1272,23 +1158,8 @@ pub async fn on_shared_folder_message(
             }
         }
         Content::SharedFileTag => {
-            let tag = match proto::decode::<SharedFileTag>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedFileTag from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(tag) = decode_or_report::<SharedFileTag>(&plaintext, "SharedFileTag", &sender.name) else {
+                return Ok(());
             };
             // Only a request this side made, to this peer, is honoured -
             // anyone else's tag is dropped and the offer behind it gets
@@ -1316,23 +1187,8 @@ pub async fn on_shared_folder_message(
             );
         }
         Content::SharedDownloadDone => {
-            let done = match proto::decode::<SharedDownloadDone>(&plaintext) {
-                Ok(value) => value,
-                Err(why) => {
-                    // Never silent. A payload from this peer that will
-                    // not decode is almost always the two clients
-                    // running different builds - these are bincode
-                    // structs, positional and without field names, so a
-                    // field added on one side makes every message of
-                    // that kind unreadable on the other. Dropped
-                    // quietly it looks exactly like a bug in the
-                    // feature: the other side simply never reacts.
-                    crate::log_warn!(
-                        "could not read a SharedDownloadDone from {}: {why} - are both clients the same build?",
-                        sender.name
-                    );
-                    return Ok(());
-                }
+            let Some(done) = decode_or_report::<SharedDownloadDone>(&plaintext, "SharedDownloadDone", &sender.name) else {
+                return Ok(());
             };
             // The answer to a round this side has already replaced -
             // most often the acknowledgement of the cancel that stopped
@@ -1356,11 +1212,7 @@ pub async fn on_shared_folder_message(
             if !ours {
                 return Ok(());
             }
-            let pending = session
-                .shared_requests
-                .remove(&done.request_id)
-                .expect("just checked");
-            let _ = &pending;
+            session.shared_requests.remove(&done.request_id);
             // The Downloads tab is where a download's outcome lives
             // (§7.8) - the conversation is for what people send each
             // other, not for what this side went and fetched.
@@ -1584,17 +1436,13 @@ async fn send_cancel(
 }
 
 /// Re-sends every cancel the owner has not yet answered - run from the
-/// session ticker beside `pump_all_shared_sends`.
-///
-/// A cancel used to be sent exactly once, and its send could fail
-/// quietly: the peer momentarily unknown, no key to seal to, a link that
-/// dropped the moment it went out. Any one of those left this side
-/// showing "cancelled" and the owner still showing the upload, with
-/// nothing in the protocol that would ever bring them back together -
-/// the user cancelling again did nothing, because from this side's point
-/// of view it already had. The owner answers every cancel with
-/// `SharedDownloadDone`, and that answer removing this record is what
-/// ends the retries.
+/// session ticker beside `pump_all_shared_sends`. A single send can fail
+/// quietly (the peer momentarily unknown, no key to seal to, a link that
+/// drops as it goes out), and a cancel that is lost leaves this side
+/// showing "cancelled" while the owner still shows the upload, with
+/// nothing else that would bring the two together. The owner answers
+/// every cancel with `SharedDownloadDone`, and that answer removing the
+/// record is what ends the retries.
 pub async fn retry_pending_cancels(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -1704,8 +1552,7 @@ pub async fn resume_shared_download(
     // transfer carrying on rather than a second one: the row here is
     // reset in place, and the owner - which keys its own record by
     // direction, peer and id - refreshes the row it already has instead
-    // of opening another. A new id gave both sides a duplicate item for
-    // what the user thinks of as one download.
+    // of opening another.
     ui_state.restart_shared_download(request_id);
     // A number never used for this request before, so nothing still in
     // flight from the round being replaced - a tag, a plan, the answer to

@@ -21,10 +21,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use crate::client::shared_folders::{self, SharedEntry, SharedError, format_size};
 use crate::proto::UserId;
 
-use super::shared_downloads::SharedDownloadStatus;
 use super::ui::{Mode, UiAction, UiState, centered_rect};
-use super::widgets::progress_bar::{DEFAULT_BAR_CELLS, percent_of, progress_line};
-use super::widgets::text::elide_start;
+use super::widgets::transfer_row::transfer_lines;
 
 /// Which half of the popup is showing. Downloads are a tab rather than a
 /// popup of their own because they are the other half of one activity:
@@ -213,17 +211,7 @@ impl UiState {
                     state.selected = names.iter().position(|n| *n == share).unwrap_or(0);
                     return None;
                 }
-                let leaving = state
-                    .rel_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
                 state.rel_path = shared_folders::parent_rel(&state.rel_path);
-                // The folder just left is reselected once its parent's
-                // listing lands - see `set_shared_listing`'s reset to 0;
-                // the name is kept only for that.
-                let _ = leaving;
                 Some(Self::ask_listing(state))
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -497,45 +485,13 @@ fn render_downloads_tab(frame: &mut Frame, inner: Rect, state: &UiState, selecte
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in rows.iter().enumerate() {
         let marker = if i == selected { "\u{25b8} " } else { "  " };
-        let (color, status) = match &item.status {
-            SharedDownloadStatus::Asking | SharedDownloadStatus::Running => {
-                (Color::Yellow, item.status.label())
-            }
-            SharedDownloadStatus::Completed => (Color::Green, item.status.label()),
-            SharedDownloadStatus::Cancelled => (Color::DarkGray, item.status.label()),
-            SharedDownloadStatus::Failed(_) => (Color::Red, item.status.label()),
-        };
-        let counted = match item.files_total {
-            Some(total) => format!("{}/{total} files", item.files_done),
-            None => format!("{} files", item.files_done),
-        };
-        let skipped = if item.files_skipped > 0 {
-            format!(", {} already had", item.files_skipped)
-        } else {
-            String::new()
-        };
-        // The tail of the path, not the head - see `text::elide_start`.
         let path_width = (body.width as usize).saturating_sub(44).max(12);
-        lines.push(Line::from(vec![
-            Span::raw(marker.to_string()),
-            Span::styled(
-                format!("{} ", elide_start(&item.label(), path_width)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("from {}", item.peer_name), Style::default().fg(Color::Gray)),
-            Span::raw("  "),
-            Span::styled(status, Style::default().fg(color)),
-            Span::styled(format!("  {counted}{skipped}"), Style::default().fg(Color::DarkGray)),
-        ]));
-        let suffix = match item.fraction() {
-            Some(f) => format!("  {}%  {}", percent_of(f), format_size(item.bytes_done)),
-            None => format!("  {}", format_size(item.bytes_done)),
-        };
-        let mut bar = progress_line(item.fraction().unwrap_or(0.0), DEFAULT_BAR_CELLS, color, &suffix)
-            .spans;
-        bar.insert(0, Span::raw("  "));
-        lines.push(Line::from(bar));
-        lines.push(Line::from(""));
+        lines.extend(transfer_lines(
+            item,
+            vec![Span::raw(marker.to_string())],
+            path_width,
+            &format!("from {}", item.peer_name),
+        ));
     }
     frame.render_widget(Paragraph::new(lines), body);
 }

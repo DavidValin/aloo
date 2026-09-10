@@ -41,7 +41,7 @@ src/client/file_transfer.rs       <-- consent-gated, streamed file transfer: Fil
 src/client/file_browser.rs   <-- fs-backed directory-listing model with back/forward history (rendering lives in tui/)
 src/client/transfer_log.rs    <-- the durable history of every shared-folder transfer, both directions, that Ctrl+D shows, Functionality #35
 src/client/shared_folders.rs  <-- shared folders: the sealed payloads, path confinement, listing/walk, the upload pacer, the download layout (docs/PROTOCOL.md section 7.8), Functionality #35
-src/client/session/shared.rs   <-- the shared-folder exchange over the link: announce, serve listings/downloads one file at a time, tag-matched popup-free accepts (likewise)
+src/client/session/shared.rs   <-- the shared-folder exchange over the link: announce, serve listings/downloads up to four files at a time, tag-matched popup-free accepts (likewise)
 src/client/voice.rs           <-- handles capture / live playback (mixer)
 src/client/voice_pulse.rs      <-- musl-only PulseAudio backend replacing voice.rs's cpal path
 src/client/rekey.rs             <-- freshness/queueing for a peer whose key rotates (currently pq_hybrid only)

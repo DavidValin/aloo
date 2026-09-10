@@ -349,8 +349,8 @@ impl UiState {
         self.push_dm_system_message(peer, peer_name, text);
     }
 
-    /// A system row in `peer`'s DM - what `push_otp_system_message` has
-    /// always written, under a name that says it is not OTP's alone.
+    /// A system row in `peer`'s DM - the gray line OTP prompts and the
+    /// shared-folder notice are both written as.
     pub fn push_dm_system_message(&mut self, peer: UserId, peer_name: &str, text: String) {
         let fallback_peer = self.peer_or_fallback(peer, peer_name);
         self.ensure_private_room(peer, fallback_peer);

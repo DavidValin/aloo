@@ -1053,13 +1053,12 @@ impl UiState {
         let chord = &self.transfers_shortcut;
         if modifiers.contains(KeyModifiers::CONTROL) != chord.ctrl
             || modifiers.contains(KeyModifiers::ALT) != chord.alt
+            || modifiers.contains(KeyModifiers::SHIFT) != chord.shift
         {
             return false;
         }
         match (&chord.key, code) {
-            (KeyChordKey::Char(want), KeyCode::Char(got)) => {
-                got.to_ascii_lowercase() == want.to_ascii_lowercase()
-            }
+            (KeyChordKey::Char(want), KeyCode::Char(got)) => got.eq_ignore_ascii_case(want),
             (KeyChordKey::Function(want), KeyCode::F(got)) => *want == got,
             _ => false,
         }
