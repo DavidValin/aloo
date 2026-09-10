@@ -890,6 +890,7 @@ pub(super) fn apply_channel_presence_plaintext(
     // this client encrypts to under that nickname.
     seed_direct_peer_keys(session, from, info);
     let theirs: Vec<String> = proto::decode(plaintext).ok()?;
+    let first_sighting = !ui_state.known_users.contains_key(&from);
 
     let ours: Vec<String> = ui_state
         .channels
@@ -932,17 +933,25 @@ pub(super) fn apply_channel_presence_plaintext(
     // actually loses data - no `--otp` proposal, since that is what a
     // focused peer *appearing* is supposed to trigger.
     if shared.is_empty() {
-        let first_sighting = !ui_state.known_users.contains_key(&from);
         ui_state.known_users.insert(from, info.clone());
         if first_sighting {
             action = on_daemon_peer_appeared(ui_state, session, from, nickname, None);
         }
     }
-    // Last, and deliberately: what this side shares with them (§7.8) is
-    // sealed to their `known_users` entry, which only exists once the
-    // registration above has run - the link-up announce found nothing to
-    // seal to and sent nothing.
+    // Last, and deliberately: everything sealed to their `known_users`
+    // entry, which only exists once the registration above has run - the
+    // link-up sends of both found nothing to seal to and sent nothing.
+    // What this side shares with them (§7.8)...
     shared::send_shared_folders(session, ui_state, from, false);
+    // ...and this side's device id (§12.7), which for a serverless pair
+    // travels nowhere else: a `PqWrapped` pad contact is named by both
+    // devices (`otp::contact_name_for_peer`), so without it `/otp` to a
+    // pinned direct-punch peer can never name the pad. Once per
+    // registration, not per presence - the announce is idempotent, but a
+    // membership change need not repeat it.
+    if first_sighting {
+        send_device_id_announce(session, ui_state, from);
+    }
     action
 }
 
@@ -999,7 +1008,18 @@ pub(super) fn on_device_id_announce(
     if envelope.content != Content::DeviceIdAnnounce {
         return;
     }
-    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+    // A serverless peer's announce can arrive before the presence that
+    // registers them (§7.1.5 - the two are queued back to back at their
+    // link-up). Their pinned key is what the envelope is checked against
+    // either way, exactly as `on_channel_presence` reads it, so the
+    // announce is accepted from the pin rather than dropped for having
+    // come first.
+    let pinned = || {
+        let nickname = session.peer_link.direct_nickname_of(from)?;
+        let device_id = session.peer_link.direct_device_id_of(from);
+        direct_peer_identity(&session.id_store, &nickname, device_id.as_deref())
+    };
+    let Some(sender) = ui_state.known_users.get(&from).cloned().or_else(pinned) else {
         return;
     };
     let Some(plaintext) = decrypt_own_envelope(&envelope, from, &sender, None, session) else {

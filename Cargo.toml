@@ -166,6 +166,10 @@ name = "shared_two_sides_test"
 path = "test/shared_two_sides_test.rs"
 
 [[test]]
+name = "serverless_otp_naming_test"
+path = "test/serverless_otp_naming_test.rs"
+
+[[test]]
 name = "shared_session_test"
 path = "test/shared_session_test.rs"
 

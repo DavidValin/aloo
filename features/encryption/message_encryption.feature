@@ -324,22 +324,22 @@ Feature: How a message is encrypted, at every layer
     When alice runs /otp with bob
     Then otp is active for bob immediately, with nothing sent to negotiate it
 
-  @US-033 @AC-260 @AC-310 @direct_otp
+  @US-033 @AC-260 @AC-310 @pqhybrid_otp
   Scenario: Ending a session travels under the pad it is ending
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     When alice runs /endotp with bob
     Then the notice reaches bob under the pad, and his proof-carrying ack settles it
 
-  @US-033 @AC-310 @direct_otp
+  @US-033 @AC-310 @pqhybrid_otp
   Scenario: Ending needs the peer reachable, and a refusal spends nothing
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     And bob has become unreachable for alice
     When alice runs /endotp with bob expecting a refusal
     Then the end is refused with nothing spent and the session still active
 
-  @US-033 @AC-307 @direct_otp
+  @US-033 @AC-307 @pqhybrid_otp
   Scenario: An unconfirmed end notice is recovered on reconnect, never re-encrypted
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     When alice runs /endotp with bob
     And bob drops before confirming, and later reconnects
     Then the very same notice is re-sent from recovery, and his confirmation ends it for both
@@ -347,27 +347,27 @@ Feature: How a message is encrypted, at every layer
   # A confirmed end is a durable fact of the contact, not of the connection
   # that carried it: neither side coming back, nor an app restart, may
   # switch it back on for one side only. Only /otp does, on both sides.
-  @US-033 @AC-443 @direct_otp
+  @US-033 @AC-443 @pqhybrid_otp
   Scenario: A confirmed end stays ended across a restart
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     When alice runs /endotp with bob
     And bob confirms the end
     And alice's app restarts and bob's link comes up again
     Then alice still shows the session with bob as ended
     When alice runs /otp with bob
-    Then otp is active for bob immediately, with nothing sent to negotiate it
+    Then alice asks bob to resume, and nothing is on until he confirms
 
-  @US-033 @AC-444 @direct_otp
+  @US-033 @AC-444 @pqhybrid_otp
   Scenario: Two ends crossing keep every spent position accounted for
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     When alice runs /endotp with bob
     And bob runs /endotp with alice at the same moment
     And bob's notice reaches alice first
     Then alice's own notice keeps its slot, is re-sent from recovery, and bob's confirmation settles it
 
-  @US-033 @AC-445 @direct_otp
+  @US-033 @AC-445 @pqhybrid_otp
   Scenario: An end asked for while sealed messages still wait goes out after them
-    Given alice and bob reach each other directly and hold a pad for each other
+    Given alice and bob reach each other directly, pinning each other's keybundle, and hold a pad for each other
     And queued sends are on for that pair
     When alice sends bob "one"
     And alice sends bob "two"
@@ -533,6 +533,14 @@ Feature: How a message is encrypted, at every layer
     When I type "/endotp" into the compose bar
     And I press Enter
     Then nothing happens
+
+  @US-033 @AC-474 @otp_control @direct_otp
+  Scenario: /endotp is refused for a pad-only pair
+    Given alice and bob reach each other directly and hold a pad for each other
+    And alice's link to bob is up, so the pad has introduced him
+    When alice runs /endotp against bob
+    Then alice is told that /endotp does not apply to a pad-only pair
+    And alice's pad session with bob is still on, and nothing was sent to him
 
   @US-033 @AC-310 @otp_control
   Scenario: /endotp is refused while the peer is offline

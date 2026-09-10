@@ -2335,6 +2335,9 @@ pub fn decide_end_otp(state: Option<&crate::client::otp_store::OtpContactState>)
 /// for why pausing mid-mail is refused rather than allowed. Every other
 /// pending send (a live P2P text/file/voice spend) has no second store
 /// depending on that gate surviving, so it does not block ending.
+/// What `/endotp` says to a pad-only pair (`handle_end_otp_command`).
+pub const PAD_ONLY_ENDOTP_REFUSAL: &str = "OTP: /endotp does not apply to a pad-only pair - the pad is the only channel there is; delete the key from /contacts (d) to stop using it";
+
 pub async fn handle_end_otp_command(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -2357,6 +2360,21 @@ pub async fn handle_end_otp_command(
         );
         return Ok(());
     };
+    // A pad-only pair (`OtpFraming::Direct`) has no `pq_hybrid` channel to
+    // fall back to: the pad is the only way a message can reach them at
+    // all, so "ending" it would leave a room that looks plain and sends
+    // padded, or a room nothing can be sent from. Neither is an end.
+    // The one way to stop using that pad is to delete it from /contacts.
+    if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            PAD_ONLY_ENDOTP_REFUSAL.to_string(),
+            false,
+        );
+        return Ok(());
+    }
     match decide_end_otp(session.otp_store.get(&contact_name)) {
         EndOtpDecision::NoActiveSession => {
             notify(

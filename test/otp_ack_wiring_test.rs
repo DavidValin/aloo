@@ -168,6 +168,24 @@ impl Side {
     }
 }
 
+/// The screen as `ui` would draw it, one string per row.
+fn rendered_rows(ui: &UiState) -> Vec<String> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|f| aloo::client::tui::ui::render(f, ui))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 /// One real pad, split in two and filed on opposite sides under `contact` -
 /// alice's encryption half is bob's decryption half and vice versa.
 async fn split_one_pad(label: &str, contact: &str) -> (OtpCliConfig, OtpCliConfig) {
@@ -1214,6 +1232,25 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
         bob.ui.known_users.contains_key(&bob.peer),
         "opening the message is what proves who sent it, and registers them"
     );
+    assert!(
+        bob.ui.is_otp_active(bob.peer),
+        "and the session shows as active on his side too, with nobody typing /otp"
+    );
+    // What each of them sees: the room drawn as an OTP session - the pad
+    // header under the title and the pad marker in the compose bar - on
+    // both sides, before either has typed a command.
+    for (side, who) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+        side.ui.active_private_room = Some(side.peer);
+        let rows = rendered_rows(&side.ui);
+        let marked = rows
+            .iter()
+            .filter(|r| r.contains(aloo::client::tui::ui::OTP_ICON))
+            .count();
+        assert!(
+            marked >= 2,
+            "{who}'s room must read as an active OTP session (header and compose bar): {rows:?}"
+        );
+    }
     let body = bob.ui.private_rooms[&bob.peer]
         .log
         .iter()
@@ -1525,19 +1562,6 @@ async fn end_session_both_pq_hybrid_travels_under_the_pad() {
     end_session_round_trip("end-pq-pq", Id::Pq, Id::Pq).await;
 }
 
-/// A pad-only pair: `pad(notice)`, which is the only shape that can carry
-/// it - before this, `/endotp` on such a pair tore the session down
-/// locally and the peer was never told at all.
-///
-/// @requirement AC-260, AC-252
-#[tokio::test]
-async fn end_session_no_pq_hybrid_anywhere_still_reaches_the_peer() {
-    if !require_otp() {
-        return;
-    }
-    end_session_round_trip("end-pw-pw", Id::Opaque, Id::Opaque).await;
-}
-
 /// The exact bug `/endotp` used to have for a `PqWrapped` pair:
 /// `contact_name_if_active` alone (what every send-gating call site used
 /// to check) only ever asked "is a pad provisioned here", which
@@ -1610,18 +1634,18 @@ async fn a_send_after_endotp_no_longer_rides_the_paused_pad() {
 
 /// The mirror case: a `Direct`-framed (pad-only) pair has no `pq_hybrid`
 /// to fall back to at all, so for them the pad *is* the whole relationship
-/// - `contact_name_for_sending` must keep answering `Some` even once the
-/// confirmed end has cleared `is_otp_active`, unlike the `PqWrapped` case
-/// above.
+/// - `/endotp` is refused outright, nothing leaves for the peer, the
+/// session stays active on screen, and sending keeps using the pad.
 ///
-/// @requirement AC-303
+/// @requirement AC-474
 #[tokio::test]
-async fn endotp_on_a_pad_only_pair_never_stops_contact_name_for_sending() {
+async fn endotp_is_refused_for_a_pad_only_pair_and_the_session_stays_on() {
     if !require_otp() {
         return;
     }
-    let (mut alice, mut bob, contact) = pair("endotp-send-gate-direct", Id::Opaque, Id::Opaque).await;
+    let (mut alice, _bob, contact) = pair("endotp-refused-direct", Id::Opaque, Id::Opaque).await;
     alice.ui.mark_otp_active(BOB);
+    let sent_before = alice.queued().len();
 
     let peer_der = alice.peer_der.clone();
     aloo::client::otp::handle_end_otp_command(
@@ -1633,19 +1657,22 @@ async fn endotp_on_a_pad_only_pair_never_stops_contact_name_for_sending() {
     )
     .await
     .expect("/endotp should not fail");
-    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
-    let (ack_seq, proof) = last_ack(&mut bob);
-    ack(&mut alice, BOB, ack_seq, proof).await;
-    assert!(
-        !alice.ui.is_otp_active(BOB),
-        "the live toggle clears once the peer confirmed, as usual"
-    );
 
+    assert_eq!(
+        alice.ui.status_notice,
+        Some((aloo::client::otp::PAD_ONLY_ENDOTP_REFUSAL.to_string(), false)),
+        "the refusal names the way out"
+    );
+    assert_eq!(alice.queued().len(), sent_before, "nothing goes to bob - there is no end to tell him about");
+    assert!(alice.ui.is_otp_active(BOB), "the session is untouched");
+    assert!(
+        !alice.session.otp_store_mut().get(&contact).is_some_and(|s| s.pending_end_notice),
+        "no end was recorded either"
+    );
     assert_eq!(
         aloo::client::otp::contact_name_for_sending(&alice.session, &alice.ui, BOB, &alice.peer_der),
         Some(contact),
-        "a pad-only pair has no plain channel to fall back to, so sending must still use the pad"
+        "and sending still uses the pad"
     );
 }
 

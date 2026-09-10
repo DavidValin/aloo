@@ -1878,6 +1878,13 @@ holds that key. This requires a pinned identity - a peer with none stays a
 transport-only link - and one that reads as a keybundle, since that is
 what the envelope is sealed to.
 
+Registration is also when this side's `DeviceIdAnnounce` (§12.7) goes to
+them: the one sent at link-up found nobody registered to seal to, and a
+pinned pair's pad contact is named by both device ids (§16.1), so it is
+sent again here, once per registration. From then on `/otp` between two
+serverless clients pinning each other proposes and shares a pad exactly
+as it would through a server.
+
 **A pad is the other thing that can register someone.** A pair who hold a
 one-time pad for each other but have never exchanged keybundles cannot
 send a `ChannelPresence` at all - there is nothing to seal one to - and
@@ -3800,8 +3807,12 @@ only ever sent once the link reaches `Active` and the peer's key is
 already known (from `Identify`/`UserJoined`, over the TCP control
 channel). Sent automatically, unprompted, every time a link reaches
 `Active` (`session::send_device_id_announce`) - idempotent, and cheap
-enough that a link flap simply resends it. Silently skipped if the
-recipient announced no keybundle to seal to (the same partial-delivery
+enough that a link flap simply resends it - and once more the moment a
+serverless peer's `ChannelPresence` registers them (§7.1.5): at their
+link-up nothing is known to seal to yet, so that first send goes nowhere,
+and without this second one a pinned direct-punch pair could never name
+the device-qualified pad contact `/otp` needs (§16.1). Silently skipped if
+the recipient announced no keybundle to seal to (the same partial-delivery
 rule every other content type follows) or encryption fails for any other
 reason; there is nothing to retry beyond
 the automatic resend the next `Active` transition already gives it.
@@ -3809,7 +3820,11 @@ the automatic resend the next `Active` transition already gives it.
 On arrival, `session::on_device_id_announce` decrypts it (independent of
 any trust gate on the sender - this is exactly the data an impersonation
 review needs to resolve, not visible chat content subject to §12.4's
-hold-and-reveal) and caches the plaintext. Processed unconditionally on
+hold-and-reveal) and caches the plaintext. A serverless peer's announce
+may be delivered ahead of the `ChannelPresence` that registers them (the
+two are queued back to back at their link-up); it is then checked against
+their pin, exactly as the presence is, rather than dropped for coming
+from someone not yet registered. Processed unconditionally on
 both sides regardless of who initiated the mismatch review, if any.
 
 **Last-seen address.** Once *both* a peer's direct link is `Active` (the
@@ -5610,6 +5625,16 @@ restarting, ends it on its own. It ends only when one of the two
 participants deliberately runs `/endotp` against that contact's private
 room. Unlike starting a session, ending one needs no round trip to agree:
 either side may do it alone, and the far side is *told*, not asked.
+
+A pad-only pair (§16.2's `Direct` framing) is excluded: with no readable
+`pq_hybrid` key on either side the pad is the only channel a message can
+travel on, so there is no plain send to fall back to and no state an end
+could leave them in that is not either a room sending padded while
+showing plain, or a room nothing can be sent from. `/endotp` refuses for
+them, sends nothing, records nothing, and leaves the session on; deleting
+the key from `/contacts` is what stops the pad being used. Their session
+is turned on by the pad being provisioned on both sides (§7.1.5), never by
+a handshake, which is also why it has no handshake to undo.
 
 ```
  alice (has decided to end it)                                bob

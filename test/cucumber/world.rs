@@ -364,6 +364,13 @@ pub struct AlooWorld {
     /// sessions, because what is under test is registration and the send
     /// path, neither of which the UI alone reaches.
     pub pad_only: Option<(PadOnlyPeer, PadOnlyPeer)>,
+    /// How much the pad-only pair's first side had sent before a step
+    /// that must send nothing (`/endotp` refused).
+    pub pad_only_sent_before: usize,
+    /// Whether the `pad_only` pair was built pinning each other's real
+    /// keybundle (a `PqWrapped` pair, which the end-session scenarios use
+    /// as their carrier) rather than opaque pins (a genuine pad-only pair).
+    pub pad_only_pinned: bool,
 
     // -- identity pinning ----------------------------------------------
     pub id_store: Option<IdStore>,

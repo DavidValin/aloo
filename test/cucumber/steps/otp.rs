@@ -746,6 +746,22 @@ async fn pad_only_peer(
     cfg: OtpCliConfig,
     contact: &str,
 ) -> crate::world::PadOnlyPeer {
+    direct_peer(w, own_name, peer_name, cfg, contact, false).await
+}
+
+/// One side of a serverless pair. `pinned` picks what each side holds
+/// for the other: an opaque pin (a genuine pad-only pair, `Direct`
+/// framing) or the other's real keybundle (a `PqWrapped` pair reached
+/// with no server - the carrier the end-session scenarios use, since a
+/// pad-only pair has no `/endotp` at all).
+async fn direct_peer(
+    w: &mut AlooWorld,
+    own_name: &str,
+    peer_name: &str,
+    cfg: OtpCliConfig,
+    contact: &str,
+    pinned: bool,
+) -> crate::world::PadOnlyPeer {
     let (_, own_private) = pq_bundle_for(own_name);
     let (own_public, _) = pq_bundle_for(own_name);
     let mut session = aloo::client::session::SessionState::for_test(
@@ -759,13 +775,29 @@ async fn pad_only_peer(
         },
     )
     .await;
-    // Neither side's key reads as a keybundle *to the other*, which is
-    // exactly what makes this pair `Direct` from both ends.
-    session.set_own_pinned_der_for_test(pad_only_pin(own_name));
+    let peer = aloo::client::p2p::direct_peer_id(peer_name, None);
+    let peer_der = if pinned {
+        let (peer_public, _) = pq_bundle_for(peer_name);
+        let der = aloo::proto::encode(&peer_public).expect("encode peer bundle");
+        // What a server's `UserJoined` - or, with none, the peer's own
+        // `ChannelPresence` and `DeviceIdAnnounce` - would have seeded.
+        session.pq_peer_keys_mut().bootstrap(
+            peer,
+            peer_public.bootstrap_encap().clone(),
+            aloo::crypto::pq::bundle_fingerprint(&peer_public).expect("fingerprint"),
+        );
+        session.set_peer_device_id_for_test(peer, "test-device".to_string());
+        der
+    } else {
+        // Neither side's key reads as a keybundle *to the other*, which is
+        // exactly what makes this pair `Direct` from both ends.
+        session.set_own_pinned_der_for_test(pad_only_pin(own_name));
+        pad_only_pin(peer_name)
+    };
     session.id_store_mut().pin_new_device(
         peer_name,
         "test-device",
-        &pad_only_pin(peer_name),
+        &peer_der,
         aloo::client::idstore::Trust::Tofu,
     );
     session.otp_store_mut().mark_provisioned(contact);
@@ -786,7 +818,6 @@ async fn pad_only_peer(
         }],
         0,
     );
-    let peer = aloo::client::p2p::direct_peer_id(peer_name, None);
     session.peer_link_mut().open_unpunched_link_for_test(peer);
 
     let mut ui = UiState::new(own_name.into());
@@ -797,11 +828,23 @@ async fn pad_only_peer(
     // definition, currently linked - individual scenarios modeling a peer
     // going unreachable override this explicitly.
     ui.set_link_status(peer, aloo::client::p2p::LinkStatus::Active);
+    if pinned {
+        // Registered, as their presence over the link would have.
+        ui.known_users.insert(
+            peer,
+            aloo::proto::UserInfo {
+                id: peer,
+                name: peer_name.into(),
+                public_key_der: peer_der.clone(),
+                key_mode: aloo::proto::KeyMode::PqHybrid,
+            },
+        );
+    }
     crate::world::PadOnlyPeer {
         session,
         ui,
         peer,
-        peer_der: pad_only_pin(peer_name),
+        peer_der,
     }
 }
 
@@ -841,6 +884,105 @@ async fn pad_only_pair(w: &mut AlooWorld, a: String, b: String) {
     let side_b = pad_only_peer(w, &b, &a, cfg_b, &contact).await;
     w.otp_contact_name = Some(contact);
     w.pad_only = Some((side_a, side_b));
+}
+
+#[given(expr = "{word}'s link to {word} is up, so the pad has introduced him")]
+async fn pad_only_link_up(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    aloo::client::session::register_pad_only_peer(&mut a.session, &mut a.ui, peer);
+    assert!(a.ui.is_otp_active(peer), "an installed pad is a session already on");
+    a.ui.status_notice = None;
+}
+
+#[when(expr = "{word} runs \\/endotp against {word}")]
+async fn pad_only_endotp_against(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    let peer_der = a.peer_der.clone();
+    w.pad_only_sent_before = a.session.sent_or_queued_payloads(peer).len();
+    aloo::client::otp::handle_end_otp_command(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        peer,
+        peer_der,
+    )
+    .await
+    .expect("/endotp is handled");
+}
+
+#[then(expr = "{word} is told that \\/endotp does not apply to a pad-only pair")]
+async fn pad_only_endotp_does_not_apply(w: &mut AlooWorld, _a: String) {
+    let (a, _) = w.pad_only.as_ref().expect("no pad-only pair");
+    assert_eq!(
+        a.ui.status_notice,
+        Some((aloo::client::otp::PAD_ONLY_ENDOTP_REFUSAL.to_string(), false))
+    );
+}
+
+#[then(expr = "{word}'s pad session with {word} is still on, and nothing was sent to him")]
+async fn pad_only_session_untouched(w: &mut AlooWorld, _a: String, _b: String) {
+    let before = w.pad_only_sent_before;
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    assert!(a.ui.is_otp_active(peer), "the session is untouched");
+    assert_eq!(a.session.sent_or_queued_payloads(peer).len(), before, "nothing left for bob");
+}
+
+#[given(expr = "{word} and {word} reach each other directly, pinning each other's keybundle, and hold a pad for each other")]
+async fn pinned_direct_pair(w: &mut AlooWorld, a: String, b: String) {
+    let (a_public, _) = pq_bundle_for(&a);
+    let (b_public, _) = pq_bundle_for(&b);
+    let a_fp = aloo::crypto::pq::bundle_fingerprint(&a_public).expect("fingerprint");
+    let b_fp = aloo::crypto::pq::bundle_fingerprint(&b_public).expect("fingerprint");
+    let contact = contact_name_for(&a_fp, "test-device", &b_fp, "test-device");
+    let cfg_a = cfg_at(w.temp_path(&format!("pinned-otp-{a}")));
+    let cfg_b = cfg_at(w.temp_path(&format!("pinned-otp-{b}")));
+    otp_cli::new_key_pair(&cfg_a, 1, "a", "b")
+        .await
+        .expect("generating a real pad");
+    let a_keys = cfg_a.working_dir.join("a_keys");
+    let b_keys = cfg_a.working_dir.join("b_keys");
+    otp_cli::add_contact(
+        &cfg_a,
+        &contact,
+        &a_keys.join("encryption_for_b.key"),
+        &a_keys.join("decryption_from_b.key"),
+    )
+    .await
+    .expect("alice adds the contact");
+    otp_cli::add_contact(
+        &cfg_b,
+        &contact,
+        &b_keys.join("encryption_for_a.key"),
+        &b_keys.join("decryption_from_a.key"),
+    )
+    .await
+    .expect("bob adds the mirror");
+
+    let side_a = direct_peer(w, &a, &b, cfg_a, &contact, true).await;
+    let side_b = direct_peer(w, &b, &a, cfg_b, &contact, true).await;
+    w.otp_contact_name = Some(contact);
+    w.pad_only = Some((side_a, side_b));
+    w.pad_only_pinned = true;
+}
+
+#[then(expr = "{word} asks {word} to resume, and nothing is on until he confirms")]
+async fn resume_asked_not_yet_on(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pair");
+    let peer = a.peer;
+    assert!(
+        !a.ui.is_otp_active(peer),
+        "a pinned pair resumes by handshake - nothing is on until the peer agrees"
+    );
+    assert!(
+        a.session
+            .sent_or_queued_payloads(peer)
+            .iter()
+            .any(|p| matches!(p, aloo::p2p_proto::P2pPayload::Envelope { .. })),
+        "the resume request went out to them"
+    );
 }
 
 #[given("neither of them has ever learned the other's keybundle")]
@@ -1818,6 +1960,7 @@ async fn pad_only_bob_confirms_end(w: &mut AlooWorld) {
 
 #[when("alice's app restarts and bob's link comes up again")]
 async fn pad_only_alice_restarts(w: &mut AlooWorld) {
+    let pinned = w.pad_only_pinned;
     let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
     // Her store comes back from the file the confirmation wrote; her UI
     // starts empty, exactly as a fresh process does.
@@ -1827,8 +1970,21 @@ async fn pad_only_alice_restarts(w: &mut AlooWorld) {
     a.ui.set_own_id(aloo::client::p2p::direct_peer_id("alice", None));
     a.ui.set_link_status(a.peer, aloo::client::p2p::LinkStatus::Active);
     // What his link coming up establishes on her screen - the one place a
-    // pad-only peer's session marker is ever re-derived.
-    aloo::client::session::register_pad_only_peer(&mut a.session, &mut a.ui, a.peer);
+    // pad-only peer's session marker is ever re-derived. A pinned peer is
+    // registered by his presence instead, and re-derives nothing.
+    if pinned {
+        a.ui.known_users.insert(
+            a.peer,
+            aloo::proto::UserInfo {
+                id: a.peer,
+                name: "bob".into(),
+                public_key_der: a.peer_der.clone(),
+                key_mode: aloo::proto::KeyMode::PqHybrid,
+            },
+        );
+    } else {
+        aloo::client::session::register_pad_only_peer(&mut a.session, &mut a.ui, a.peer);
+    }
 }
 
 #[then("alice still shows the session with bob as ended")]
