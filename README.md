@@ -662,7 +662,7 @@ Your PQ-Hybrid identity is what gets pinned, and it stays the same across reconn
 | `a` | Add a contact by hand — nickname (device id and identity card both optional) — for someone you haven't connected with yet; submitting pins them right away, even with no keys, and opens their PQH key popup to install one now or later |
 | `d` | Delete the selected contact outright — forgets their pin and both other keys (confirms first) |
 | `r` | Refresh the list (e.g. after the remaining key has moved) |
-| `x` (or select the **Export identity card** button at the end of the list, `Enter`) | Export your own identity card (own pqhybrid key) — the live equivalent of `aloo --export-identity-card`, writing `~/.aloo/exports/<your-nickname>.aloo-card` |
+| `x` (or select the **Export identity card** button at the end of the list, `Enter`) | Export your own identity card (own pqhybrid key) — the live equivalent of `aloo --export-identity-card`, writing `~/.aloo/exports/<your-nickname>.aloo-card`. The card is meant to be handed to others: importing it pins your contact as verified before they ever contact you. Your keybundle is written beside it as `<your-nickname>.priv` / `.pub` (for your own other machines; never share the `.priv`) |
 | `Esc` | Close |
 
 **A key's details popup** (`Enter`) explains what that key is for, then shows either its path on disk and live figures (seq/offset/remaining-MB, same as the `/otp` session header) with a **Delete key** action, or, if it doesn't exist yet, a **Create key** (PQH) / **Install manually** (OTP/OTP MAIL) action. Never both at once. `Left`/`Right` inside the popup switches which key it's showing.

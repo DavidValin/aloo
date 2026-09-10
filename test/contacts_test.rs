@@ -917,11 +917,12 @@ fn export_own_identity_card_to_writes_a_card_a_recipient_can_import_and_verify()
         aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
     let public_der = aloo::proto::encode(&public).unwrap();
 
-    let (path, phrase) = export_own_identity_card_to(&private, &public_der, "alice", &dir)
+    let exported = export_own_identity_card_to(&private, &public_der, "alice", &dir)
         .expect("exporting this client's own card");
+    let path = exported.card.clone();
     assert_eq!(path, dir.join("alice.aloo-card"));
     assert!(path.is_file());
-    assert!(!phrase.is_empty());
+    assert!(!exported.phrase.is_empty());
 
     let mut id_store = IdStore::new_empty(dir.join("ids_store"));
     let outcome = pin_identity_card(&mut id_store, "alice", &path);
@@ -939,8 +940,8 @@ fn export_own_identity_card_to_names_the_file_after_the_nickname() {
         aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
     let public_der = aloo::proto::encode(&public).unwrap();
 
-    let (alice_path, _) = export_own_identity_card_to(&private, &public_der, "alice", &dir).unwrap();
-    let (bob_path, _) = export_own_identity_card_to(&private, &public_der, "bob", &dir).unwrap();
+    let alice_path = export_own_identity_card_to(&private, &public_der, "alice", &dir).unwrap().card;
+    let bob_path = export_own_identity_card_to(&private, &public_der, "bob", &dir).unwrap().card;
     assert_ne!(alice_path, bob_path);
     assert!(alice_path.is_file());
     assert!(bob_path.is_file());
@@ -974,3 +975,36 @@ fn export_own_identity_card_to_reports_an_undecodable_public_bundle() {
     assert!(result.is_err());
 }
 
+
+/// The export also carries the keybundle itself, under the same two names
+/// `aloo --keygen-pq-hybrid` and aloo's own generated keys use, so the
+/// pair can be pointed at from another machine's connect popup as it is
+/// - and the private half is owner-only, like every private bundle aloo
+/// writes.
+/// @requirement AC-370
+#[test]
+fn export_own_identity_card_to_writes_the_keybundle_pair_beside_the_card() {
+    let dir = scratch_dir("export-own-keys");
+    let (public, private) =
+        aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
+    let public_der = aloo::proto::encode(&public).unwrap();
+
+    let exported = export_own_identity_card_to(&private, &public_der, "alice", &dir).unwrap();
+    assert_eq!(exported.key_private, dir.join("alice.priv"));
+    assert_eq!(exported.key_public, dir.join("alice.pub"));
+    assert_eq!(
+        aloo::crypto::pq::resolve_bundle_paths(&dir.join("alice").display().to_string()),
+        (exported.key_private.clone(), exported.key_public.clone()),
+        "the pair resolves from its prefix exactly as a keygen'd one does"
+    );
+    let read_private = aloo::crypto::pq::load_private_bundle(&exported.key_private).unwrap();
+    let read_public = aloo::crypto::pq::load_public_bundle(&exported.key_public).unwrap();
+    assert!(aloo::crypto::pq::bundle_pair_matches(&read_private, &read_public));
+    assert_eq!(aloo::proto::encode(&read_public).unwrap(), public_der, "the same identity, not a fresh one");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&exported.key_private).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the private half is owner-only");
+    }
+}

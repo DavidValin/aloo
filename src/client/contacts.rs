@@ -1009,34 +1009,63 @@ pub async fn handle_pin_identity_card_for_device(
     }
 }
 
+/// What `export_own_identity_card_to` wrote: the card to hand to other
+/// people, the keybundle pair to carry to another machine of one's own,
+/// and the bundle's safety phrase to read out alongside the card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedIdentity {
+    /// `<dir>/<nickname>.aloo-card` - public, signed, shareable.
+    pub card: PathBuf,
+    /// `<dir>/<nickname>.priv` - the private half, owner-only on unix,
+    /// never to be shared.
+    pub key_private: PathBuf,
+    /// `<dir>/<nickname>.pub` - the public half.
+    pub key_public: PathBuf,
+    pub phrase: String,
+}
+
 /// Signs `nickname`'s own already-loaded `pq_hybrid` keybundle into an
-/// identity card and writes it to `<dir>/<nickname>.aloo-card` - the pure
-/// half of `handle_export_own_identity_card`, taking the destination
-/// directory explicitly (rather than reaching for `platform::aloo_dir()`
-/// itself) so it's exercisable against a scratch directory in tests. `Ok`
-/// carries the path written and this bundle's safety phrase.
+/// identity card and writes it to `<dir>/<nickname>.aloo-card`, and writes
+/// the keybundle itself beside it as `<dir>/<nickname>.priv` and
+/// `<dir>/<nickname>.pub` - the same two names `aloo --keygen-pq-hybrid`
+/// and the keys aloo generates for itself carry (`crypto::pq::bundle_paths`),
+/// so the exported pair can be pointed at from any connect popup or
+/// `--my-key` as it is. The pure half of `handle_export_own_identity_card`,
+/// taking the destination directory explicitly (rather than reaching for
+/// `platform::aloo_dir()` itself) so it's exercisable against a scratch
+/// directory in tests.
 pub fn export_own_identity_card_to(
     private: &crate::crypto::pq::PqPrivateBundle,
     public_der: &[u8],
     nickname: &str,
     dir: &Path,
-) -> Result<(PathBuf, String), String> {
+) -> Result<ExportedIdentity, String> {
     let public = crate::proto::decode::<crate::crypto::pq::PqPublicBundle>(public_der)
         .map_err(|_| "this session's own keybundle does not decode".to_string())?;
     let card = crate::crypto::pq::make_identity_card(private, &public, nickname)
         .map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{nickname}.aloo-card"));
-    crate::crypto::pq::save_identity_card(&card, &path).map_err(|e| e.to_string())?;
+    let card_path = dir.join(format!("{nickname}.aloo-card"));
+    crate::crypto::pq::save_identity_card(&card, &card_path).map_err(|e| e.to_string())?;
+    let (key_private, key_public) =
+        crate::crypto::pq::bundle_paths(&dir.join(nickname).display().to_string());
+    crate::crypto::pq::save_private_bundle(private, &key_private).map_err(|e| e.to_string())?;
+    crate::crypto::pq::save_public_bundle(&public, &key_public).map_err(|e| e.to_string())?;
     let fp = crate::crypto::pq::bundle_fingerprint(&public).map_err(|e| e.to_string())?;
-    Ok((path, crate::crypto::safety::phrase(&fp)))
+    Ok(ExportedIdentity {
+        card: card_path,
+        key_private,
+        key_public,
+        phrase: crate::crypto::safety::phrase(&fp),
+    })
 }
 
 /// `UiAction::ExportOwnIdentityCard`'s handler - `/contacts`' `x`, the
 /// live-session equivalent of `aloo --export-identity-card <prefix>
 /// <nickname>`: no separate prefix/nickname arguments needed, since a
-/// live session already has both loaded. Writes to
-/// `~/.aloo/exports/<nickname>.aloo-card` (the same `~/.aloo/exports`
+/// live session already has both loaded. Writes
+/// `~/.aloo/exports/<nickname>.aloo-card` and the keybundle pair
+/// `<nickname>.priv`/`<nickname>.pub` beside it (the same `~/.aloo/exports`
 /// root every other export already writes under, `client::export`) -
 /// never the server, never anywhere the CLI form's own working directory
 /// would put it, since a live session has no natural "current directory"
@@ -1049,10 +1078,13 @@ pub async fn handle_export_own_identity_card(session: &SessionState, ui_state: &
         &ui_state.own_name,
         &dir,
     ) {
-        Ok((path, phrase)) => ui_state.push_status_notice(
+        Ok(exported) => ui_state.push_status_notice(
             format!(
-                "exported identity card (own pqhybrid key) to {} - safety phrase: {phrase}",
-                path.display()
+                "exported identity card (own pqhybrid key) to {} and keybundle to {} + {} - safety phrase: {}",
+                exported.card.display(),
+                exported.key_private.display(),
+                exported.key_public.display(),
+                exported.phrase
             ),
             true,
         ),
