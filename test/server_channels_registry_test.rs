@@ -1114,3 +1114,150 @@ fn creating_a_private_channel_is_unaffected_by_the_policy() {
         .unwrap();
     assert!(out.iter().any(|o| matches!(&o.message, ServerMessage::Joined { .. })));
 }
+
+// ---------------------------------------------------------------------
+// Federation join-proxying (`crate::server::federation`): a channel this
+// server owns granting a peer's join-proxy request, and this server's own
+// local mirror of a channel a *different* server owns.
+// ---------------------------------------------------------------------
+
+/// @requirement AC-479
+#[test]
+fn join_channel_remote_grants_a_peer_the_right_password_and_records_it() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
+        .unwrap();
+    let outcome = reg
+        .join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP)
+        .expect("the channel exists locally");
+    let (kind, admin) = outcome.expect("the right password is granted");
+    assert_eq!(kind, ChannelKind::Private);
+    assert_eq!(admin.as_deref(), Some("alice"));
+}
+
+/// @requirement AC-479
+#[test]
+fn join_channel_remote_rejects_the_wrong_password() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
+        .unwrap();
+    let outcome = reg
+        .join_channel_remote("vault", "serverB", "bob", Some("wrong"), TEST_IP)
+        .unwrap();
+    assert_eq!(outcome, Err(ChannelJoinRejection::WrongPassword));
+}
+
+/// A federation peer's join-proxy is checked against the same ban list a
+/// local joiner would be - the channel's admin can still remove a
+/// nickname regardless of which server it actually connects through.
+/// @requirement AC-479
+#[test]
+fn join_channel_remote_respects_a_ban() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Public, None, TEST_IP).unwrap();
+    reg.ban_from_channel(alice, "vault", "bob").unwrap();
+    let outcome = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    assert_eq!(outcome, Err(ChannelJoinRejection::UserBanned));
+}
+
+/// A directory entry naming a channel this server doesn't actually have
+/// (stale gossip, or a channel removed since) answers `None`, not a
+/// rejection - the caller reports `JoinProxyOutcome::UnknownChannel`
+/// for that, never a made-up ban/password reason.
+/// @requirement AC-479
+#[test]
+fn join_channel_remote_is_none_for_a_channel_that_does_not_exist_here() {
+    let mut reg = Registry::new();
+    assert!(reg.join_channel_remote("nowhere", "serverB", "bob", None, TEST_IP).is_none());
+}
+
+/// Two federation join-proxy requests for the same (server, nickname)
+/// pair are idempotent, exactly like a local rejoin - the second one
+/// grants without re-checking the password (there is nothing new to
+/// check: it is already a member).
+/// @requirement AC-479
+#[test]
+fn join_channel_remote_is_idempotent_for_an_already_granted_member() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
+        .unwrap();
+    reg.join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP).unwrap().unwrap();
+    let second = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    assert!(second.is_ok(), "an already-granted member needs no password on a repeat request");
+}
+
+/// `leave_channel_remote` forgets a granted federation member - a later
+/// join-proxy request for the same nickname is treated as new again (the
+/// password is checked once more), rather than staying implicitly
+/// granted forever.
+/// @requirement AC-479
+#[test]
+fn leave_channel_remote_forgets_a_granted_member() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
+        .unwrap();
+    reg.join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP).unwrap().unwrap();
+    reg.leave_channel_remote("vault", "serverB", "bob");
+    let outcome = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    assert_eq!(outcome, Err(ChannelJoinRejection::PasswordRequired));
+}
+
+/// `mirror_remote_join` (this server's own bookkeeping once a federation
+/// peer has granted a join elsewhere) behaves like an ordinary local join
+/// for every LOCAL client involved: the first gets a plain `Joined`, and
+/// a second local client mirroring the same remote-homed channel gets
+/// real `UserJoined` notices both ways - they are genuinely connected to
+/// the same server and can punch a direct link to each other.
+/// @requirement AC-479
+#[test]
+fn mirror_remote_join_gives_local_clients_real_presence_with_each_other() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let out = reg
+        .mirror_remote_join(alice, "remote-room", ChannelKind::Private, Some("carol".to_string()))
+        .unwrap();
+    assert!(matches!(
+        &out[0],
+        Outgoing { to, message: ServerMessage::Joined { channel, admin } }
+            if *to == alice && channel.name == "remote-room" && admin.as_deref() == Some("carol")
+    ));
+
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
+    let out = reg
+        .mirror_remote_join(bob, "remote-room", ChannelKind::Private, Some("carol".to_string()))
+        .unwrap();
+    assert!(out.iter().any(|o| o.to == alice && matches!(&o.message, ServerMessage::UserJoined { .. })));
+    assert!(out.iter().any(|o| o.to == bob && matches!(&o.message, ServerMessage::UserJoined { .. })));
+    assert!(out.iter().any(|o| o.to == bob && matches!(&o.message, ServerMessage::Joined { .. })));
+}
+
+/// A second `mirror_remote_join` for the same local client and channel is
+/// a no-op that simply re-confirms `Joined`, the same way a local rejoin
+/// never re-broadcasts presence.
+/// @requirement AC-479
+#[test]
+fn mirror_remote_join_is_idempotent_for_the_same_local_client() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.mirror_remote_join(alice, "remote-room", ChannelKind::Public, None).unwrap();
+    let out = reg.mirror_remote_join(alice, "remote-room", ChannelKind::Public, None).unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(matches!(&out[0].message, ServerMessage::Joined { .. }));
+}
+
+/// @requirement AC-479
+#[test]
+fn channel_membership_of_lists_every_channel_a_client_is_in() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP).unwrap();
+    reg.mirror_remote_join(alice, "remote-room", ChannelKind::Public, None).unwrap();
+    let mut membership = reg.channel_membership_of(alice);
+    membership.sort();
+    assert_eq!(membership, vec!["general".to_string(), "remote-room".to_string()]);
+}

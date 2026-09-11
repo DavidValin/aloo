@@ -157,3 +157,8 @@ pub async fn connect<S: Stream + 'static>(
         None => Ok(Box::new(stream)),
     }
 }
+
+// Federation (`crate::server::federation`) does not use TLS at all - see
+// `crate::server::federation::handshake` for its PQ-hybrid mutual
+// authentication, built on the same durable identity shape as a client's
+// `my_key` rather than certificates.

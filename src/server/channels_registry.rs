@@ -62,6 +62,14 @@ struct ChannelRecord {
     /// inactivity sweep can read, since the server never sees P2P
     /// channel-message content at all.
     last_join_at: Instant,
+    /// Federation only (`crate::server::federation`): every (owning
+    /// server, nickname) pair a join-proxy request has granted entry to,
+    /// for a channel *this* server owns. Never touches `members` - there
+    /// is no `UserId` for a connection to a different server - and stays
+    /// empty forever on a channel this server only *mirrors* (one it
+    /// joined via someone else's proxy), since only the true owner ever
+    /// grants a federation join.
+    remote_members: BTreeSet<(String, String)>,
 }
 
 /// Brute-force tracking for one (source IP, channel name) pair's wrong
@@ -123,6 +131,7 @@ impl ChannelsRegistry {
                 banned: BTreeSet::new(),
                 join_lock: None,
                 last_join_at: Instant::now(),
+                remote_members: BTreeSet::new(),
             },
         );
         Self {
@@ -146,6 +155,15 @@ impl ChannelsRegistry {
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
+    }
+
+    /// Whether `name` already exists, public or private - what
+    /// `crate::server::mod`'s federation hook checks *before* calling
+    /// `join` to tell "this created a new channel" apart from "this
+    /// joined an existing one" without `join` itself needing to know
+    /// anything about federation.
+    pub fn contains(&self, name: &str) -> bool {
+        self.channels.contains_key(name)
     }
 
     /// Joins `id` (whose own info is `joiner`) to `name`, creating the
@@ -210,6 +228,7 @@ impl ChannelsRegistry {
                     banned: BTreeSet::new(),
                     join_lock: None,
                     last_join_at: Instant::now(),
+                    remote_members: BTreeSet::new(),
                 });
             let existing: Vec<UserId> = rec.members.iter().copied().collect();
             let already = rec.members.contains(&id);
@@ -224,52 +243,16 @@ impl ChannelsRegistry {
         // joining, never membership already held.
         if !already_member {
             let rec = self.channels.get(name).expect("just looked up above");
-            if rec.banned.contains(&joiner.name) {
-                return Ok(reject_join(id, name, ChannelJoinRejection::UserBanned));
-            }
-            if let Some(allowed) = &rec.join_lock
-                && rec.admin.as_deref() != Some(joiner.name.as_str())
-                && !allowed.contains(&joiner.name)
-            {
-                return Ok(reject_join(id, name, ChannelJoinRejection::NotOnAllowlist));
+            if let Err(rejection) = Self::ban_and_allowlist_check(rec, &joiner.name) {
+                return Ok(reject_join(id, name, rejection));
             }
         }
 
-        if !already_member && let Some(expected) = &channel_password {
-            let attempt_key = (source_ip, name.to_string());
-            let banned = self
-                .channel_password_attempts
-                .get(&attempt_key)
-                .and_then(|rec| rec.banned_at)
-                .is_some_and(|t| t.elapsed() < CHANNEL_PASSWORD_BAN_DURATION);
-            if banned {
-                return Ok(reject_join(id, name, ChannelJoinRejection::Banned));
-            }
-            match password {
-                None => {
-                    return Ok(reject_join(id, name, ChannelJoinRejection::PasswordRequired));
-                }
-                Some(given) if !crypto::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {
-                    let rec = self
-                        .channel_password_attempts
-                        .entry(attempt_key)
-                        .or_insert_with(|| PasswordAttemptRecord {
-                            wrong_attempts: 0,
-                            banned_at: None,
-                        });
-                    rec.wrong_attempts += 1;
-                    let rejection = if rec.wrong_attempts > CHANNEL_MAX_PASSWORD_ATTEMPTS {
-                        rec.banned_at = Some(Instant::now());
-                        ChannelJoinRejection::Banned
-                    } else {
-                        ChannelJoinRejection::WrongPassword
-                    };
-                    return Ok(reject_join(id, name, rejection));
-                }
-                Some(_) => {
-                    self.channel_password_attempts.remove(&attempt_key);
-                }
-            }
+        if !already_member
+            && let Some(expected) = &channel_password
+            && let Err(rejection) = self.password_check(name, expected, password, source_ip)
+        {
+            return Ok(reject_join(id, name, rejection));
         }
 
         if already_member {
@@ -334,6 +317,220 @@ impl ChannelsRegistry {
         }
 
         Ok(outgoing)
+    }
+
+    /// The ban/allowlist gate: banned by nickname, or a join-lock this
+    /// nickname isn't on (the admin is always implicitly exempt from
+    /// their own lock). Shared by `join` (a local member, keyed by
+    /// `UserId` everywhere else) and `join_remote` (a federation peer's
+    /// member, which has no `UserId` at all) - both actually gate on the
+    /// nickname, never the connection.
+    fn ban_and_allowlist_check(rec: &ChannelRecord, joiner_name: &str) -> Result<(), ChannelJoinRejection> {
+        if rec.banned.contains(joiner_name) {
+            return Err(ChannelJoinRejection::UserBanned);
+        }
+        if let Some(allowed) = &rec.join_lock
+            && rec.admin.as_deref() != Some(joiner_name)
+            && !allowed.contains(joiner_name)
+        {
+            return Err(ChannelJoinRejection::NotOnAllowlist);
+        }
+        Ok(())
+    }
+
+    /// The password gate: the brute-force ban first, then the comparison
+    /// itself, incrementing `channel_password_attempts` on a wrong one -
+    /// shared with `join_remote` for the same reason
+    /// `ban_and_allowlist_check` is.
+    fn password_check(
+        &mut self,
+        name: &str,
+        expected: &str,
+        given: Option<&str>,
+        source_ip: IpAddr,
+    ) -> Result<(), ChannelJoinRejection> {
+        let attempt_key = (source_ip, name.to_string());
+        let banned = self
+            .channel_password_attempts
+            .get(&attempt_key)
+            .and_then(|rec| rec.banned_at)
+            .is_some_and(|t| t.elapsed() < CHANNEL_PASSWORD_BAN_DURATION);
+        if banned {
+            return Err(ChannelJoinRejection::Banned);
+        }
+        match given {
+            None => Err(ChannelJoinRejection::PasswordRequired),
+            Some(given) if !crypto::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {
+                let rec = self
+                    .channel_password_attempts
+                    .entry(attempt_key)
+                    .or_insert_with(|| PasswordAttemptRecord {
+                        wrong_attempts: 0,
+                        banned_at: None,
+                    });
+                rec.wrong_attempts += 1;
+                Err(if rec.wrong_attempts > CHANNEL_MAX_PASSWORD_ATTEMPTS {
+                    rec.banned_at = Some(Instant::now());
+                    ChannelJoinRejection::Banned
+                } else {
+                    ChannelJoinRejection::WrongPassword
+                })
+            }
+            Some(_) => {
+                self.channel_password_attempts.remove(&attempt_key);
+                Ok(())
+            }
+        }
+    }
+
+    /// A federation peer's join-proxy request for `name`, which this
+    /// server owns (`crate::server::federation`): the same ban/allowlist/
+    /// password gates `join` applies to a local member, applied to
+    /// `joiner_nickname` (a client connected to `remote_server`, not
+    /// here) instead. Records the join in `remote_members` on success -
+    /// never `members`, since there is no `UserId` for a connection to a
+    /// different server - and never stores or exposes the password
+    /// itself beyond comparing against it. `None` if this server doesn't
+    /// actually have `name` at all (a stale federation directory entry);
+    /// the caller answers with `JoinProxyOutcome::UnknownChannel`.
+    pub fn join_remote(
+        &mut self,
+        name: &str,
+        remote_server: &str,
+        joiner_nickname: &str,
+        password: Option<&str>,
+        source_ip: IpAddr,
+    ) -> Option<Result<(ChannelKind, Option<String>), ChannelJoinRejection>> {
+        if !self.channels.contains_key(name) {
+            return None;
+        }
+        let member_key = (remote_server.to_string(), joiner_nickname.to_string());
+        let (channel_password, already_member) = {
+            let rec = self.channels.get(name).expect("checked above");
+            (rec.password.clone(), rec.remote_members.contains(&member_key))
+        };
+        if !already_member {
+            let rec = self.channels.get(name).expect("checked above");
+            if let Err(rejection) = Self::ban_and_allowlist_check(rec, joiner_nickname) {
+                return Some(Err(rejection));
+            }
+        }
+        if !already_member
+            && let Some(expected) = &channel_password
+            && let Err(rejection) = self.password_check(name, expected, password, source_ip)
+        {
+            return Some(Err(rejection));
+        }
+        let rec = self.channels.get_mut(name).expect("checked above");
+        rec.remote_members.insert(member_key);
+        rec.last_join_at = Instant::now();
+        Some(Ok((rec.kind, rec.admin.clone())))
+    }
+
+    /// The federation mirror of `leave`: removes `(remote_server,
+    /// nickname)` from `name`'s `remote_members`. A no-op for a channel
+    /// that doesn't exist or wasn't a member - this only ever runs on the
+    /// *home* server, in response to a best-effort `LeaveProxyNotice` that
+    /// nothing else waits on.
+    pub fn leave_remote(&mut self, name: &str, remote_server: &str, nickname: &str) {
+        if let Some(rec) = self.channels.get_mut(name) {
+            rec.remote_members.remove(&(remote_server.to_string(), nickname.to_string()));
+        }
+    }
+
+    /// After a federation join-proxy grants `id` (whose own info is
+    /// `joiner`) entry to `name` - owned by a different federated server,
+    /// as the `kind`/`admin` that server reported - mirrors it locally so
+    /// this server's own membership bookkeeping, and any other *local*
+    /// client who also joins the same remote-homed channel, work exactly
+    /// like an ordinary local channel: they get real `UserJoined`
+    /// broadcasts and can punch a real direct link to each other, since
+    /// both are genuinely connected here. Idempotent for a channel `id`
+    /// already mirrors. Never stores a password - there is none to store;
+    /// only the home server ever checks one.
+    pub fn mirror_remote_join(
+        &mut self,
+        id: UserId,
+        joiner: &UserInfo,
+        name: &str,
+        kind: ChannelKind,
+        admin: Option<String>,
+        user_info_of: impl Fn(UserId) -> Option<UserInfo>,
+    ) -> Vec<Outgoing> {
+        let existing_members: Vec<UserId> = self
+            .channels
+            .get(name)
+            .map(|rec| rec.members.iter().copied().collect())
+            .unwrap_or_default();
+        let rec = self.channels.entry(name.to_string()).or_insert_with(|| ChannelRecord {
+            kind,
+            members: BTreeSet::new(),
+            password: None,
+            admin: admin.clone(),
+            banned: BTreeSet::new(),
+            join_lock: None,
+            last_join_at: Instant::now(),
+            remote_members: BTreeSet::new(),
+        });
+        if rec.members.contains(&id) {
+            return vec![Outgoing::new(
+                id,
+                ServerMessage::Joined {
+                    channel: ChannelInfo {
+                        name: name.to_string(),
+                        kind: rec.kind,
+                    },
+                    admin: rec.admin.clone(),
+                },
+            )];
+        }
+        rec.members.insert(id);
+        rec.last_join_at = Instant::now();
+        let channel_kind = rec.kind;
+        let admin = rec.admin.clone();
+
+        let mut outgoing = Vec::new();
+        for member_id in existing_members {
+            if let Some(info) = user_info_of(member_id) {
+                outgoing.push(Outgoing::new(
+                    id,
+                    ServerMessage::UserJoined {
+                        channel: name.to_string(),
+                        user: info,
+                    },
+                ));
+            }
+            outgoing.push(Outgoing::new(
+                member_id,
+                ServerMessage::UserJoined {
+                    channel: name.to_string(),
+                    user: joiner.clone(),
+                },
+            ));
+        }
+        outgoing.push(Outgoing::new(
+            id,
+            ServerMessage::Joined {
+                channel: ChannelInfo {
+                    name: name.to_string(),
+                    kind: channel_kind,
+                },
+                admin,
+            },
+        ));
+        outgoing
+    }
+
+    /// Every channel `id` currently belongs to - read-only, used to
+    /// notify a federation home server of a departure before removal
+    /// actually happens (`crate::server::mod`'s `LeaveChannel`/disconnect
+    /// handling).
+    pub fn member_of(&self, id: UserId) -> Vec<String> {
+        self.channels
+            .iter()
+            .filter(|(_, rec)| rec.members.contains(&id))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Removes `id` from `name`'s membership, if it was a member - a
@@ -594,14 +791,24 @@ impl ChannelsRegistry {
     /// the "activity" measured: the server never sees P2P channel
     /// content, so a channel that still has members is never a candidate
     /// regardless of how long ago the last join into it was.
-    pub(crate) fn sweep_inactive(&mut self) {
+    /// Returns the names actually removed, so a federation-enabled server
+    /// can gossip each one's departure (`crate::server::mod`'s
+    /// `channel_sweep_loop`) - empty whenever nothing was due, including
+    /// when no period is configured at all.
+    pub(crate) fn sweep_inactive(&mut self) -> Vec<String> {
         let Some(period) = self.deletion_unactivity_period else {
-            return;
+            return Vec::new();
         };
+        let mut removed = Vec::new();
         self.channels.retain(|name, rec| {
-            name == DEFAULT_CHANNEL_NAME
+            let keep = name == DEFAULT_CHANNEL_NAME
                 || !rec.members.is_empty()
-                || rec.last_join_at.elapsed() < period
+                || rec.last_join_at.elapsed() < period;
+            if !keep {
+                removed.push(name.clone());
+            }
+            keep
         });
+        removed
     }
 }

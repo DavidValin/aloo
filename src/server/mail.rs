@@ -146,6 +146,60 @@ impl MailStore {
         receipts
     }
 
+    /// Every pending mail, addressed to anyone at all - federation only
+    /// (`crate::server::federation`): swept whenever a peer link comes up,
+    /// to forward whatever is addressed to a nickname that peer owns.
+    pub fn pending_all(&self) -> Vec<StoredMail> {
+        self.read_dir_decoded::<StoredMail>(&self.dir.join("pending"))
+    }
+
+    /// Every delivery receipt on file, for any sender - federation only,
+    /// the `receipts_from` counterpart of `pending_all`: swept on the same
+    /// peer-link-up event, to relay whatever receipt is owed to a sender
+    /// that peer owns.
+    pub fn receipts_all(&self) -> Vec<DeliveredReceipt> {
+        self.read_dir_decoded::<DeliveredReceipt>(&self.dir.join("delivered"))
+    }
+
+    /// The single delivery receipt for `mail_id`, if one exists -
+    /// federation only: lets a caller learn what `on_mail_ack` just wrote
+    /// (or had already written) without re-deriving it, since
+    /// `mark_delivered` itself only reports the sender's nickname, not the
+    /// full receipt a relay needs.
+    pub fn receipt_for(&self, mail_id: &str) -> Option<DeliveredReceipt> {
+        if !mail_id_is_valid(mail_id) {
+            return None;
+        }
+        let bytes = std::fs::read(self.delivered_path(mail_id)).ok()?;
+        proto::decode::<DeliveredReceipt>(&bytes).ok()
+    }
+
+    /// Writes `receipt` directly, as if `mark_delivered` had just run here
+    /// - federation only: applies a `MailDeliveredReceipt` relayed from
+    /// the server that actually holds the mail, so this server's own
+    /// `OtpMailFetch`/live-notify path can tell the original sender (who
+    /// connects here, not there) that their mail was delivered. Also
+    /// removes any local `pending/` copy, in case this server's own
+    /// `MailForward` hasn't been acknowledged yet - the receipt is proof
+    /// delivery already happened, so nothing is still waiting on it.
+    pub fn record_relayed_receipt(&self, receipt: &DeliveredReceipt) -> io::Result<()> {
+        let encoded = proto::encode(receipt).map_err(io::Error::other)?;
+        std::fs::write(self.delivered_path(&receipt.mail_id), encoded)?;
+        let _ = std::fs::remove_file(self.pending_path(&receipt.mail_id));
+        Ok(())
+    }
+
+    /// Forgets a local `pending/` copy once a `MailForward` of it has been
+    /// acknowledged (`MailForwardAck`) as durably stored on the mail's
+    /// actual owner - federation only. Never touches `delivered/`: unlike
+    /// `mark_delivered`, this server was never the mail's destination, so
+    /// there is no receipt of its own to write.
+    pub fn forget_after_relay(&self, mail_id: &str) {
+        if mail_id_is_valid(mail_id) {
+            let _ = std::fs::remove_file(self.pending_path(mail_id));
+        }
+    }
+
     fn read_dir_decoded<T: for<'de> Deserialize<'de>>(&self, dir: &Path) -> Vec<T> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
@@ -217,7 +271,7 @@ impl MailStore {
 // these under its existing lock, and tests exercise them with no socket.
 // ---------------------------------------------------------------------
 
-fn deliver_message(to: UserId, m: StoredMail) -> Outgoing {
+pub(crate) fn deliver_message(to: UserId, m: StoredMail) -> Outgoing {
     Outgoing::new(
         to,
         ServerMessage::OtpMailDeliver {
@@ -294,6 +348,54 @@ pub fn on_mail_send(
     }
 }
 
+/// `on_mail_send`, plus the freshly-built `StoredMail` a federation
+/// forward needs if `to` turns out to belong to a different server - the
+/// wire message itself carries no way back to the caller, so this exists
+/// purely to hand `crate::server::mod`'s federation hook the same mail
+/// `on_mail_send` just stored, without it re-deriving `from` a second way.
+/// `None` for the mail half exactly when `on_mail_send` itself found no
+/// such sender (an impossible `UserId`) - the same case it answers with
+/// an empty `Vec`.
+#[allow(clippy::too_many_arguments)]
+pub fn on_mail_send_with_relay_info(
+    reg: &Registry,
+    store: &MailStore,
+    sender: UserId,
+    mail_id: String,
+    to: String,
+    contact_name: String,
+    seq: u64,
+    sent_at_utc: u64,
+    ciphertext: Vec<u8>,
+) -> (Vec<Outgoing>, Option<StoredMail>) {
+    let Some(sender_info) = reg.user_info(sender) else {
+        return (Vec::new(), None);
+    };
+    let mail = StoredMail {
+        mail_id: mail_id.clone(),
+        from: sender_info.name,
+        to: to.clone(),
+        contact_name: contact_name.clone(),
+        seq,
+        sent_at_utc,
+        ciphertext: ciphertext.clone(),
+    };
+    let outgoing = on_mail_send(reg, store, sender, mail_id, to, contact_name, seq, sent_at_utc, ciphertext);
+    (outgoing, Some(mail))
+}
+
+/// The "push it now if the recipient happens to be connected" half of
+/// `on_mail_send`, reused by `crate::server::federation` once a
+/// `MailForward` has been stored on the server it was actually addressed
+/// to - `on_mail_send` itself only ever runs for a mail *this* server's
+/// own client uploaded.
+pub(crate) fn deliver_locally_if_connected(reg: &Registry, mail: &StoredMail) -> Vec<Outgoing> {
+    match reg.id_by_name(&mail.to) {
+        Some(recipient_id) => vec![deliver_message(recipient_id, mail.clone())],
+        None => Vec::new(),
+    }
+}
+
 /// Applies one `ClientMessage::OtpMailFetch` (docs/PROTOCOL.md §17.3): both
 /// halves of what a freshly-connected client is owed - every pending mail
 /// addressed to its nickname (in per-sender `seq` order), and every
@@ -339,6 +441,26 @@ pub fn on_mail_ack(
         )],
         None => Vec::new(),
     }
+}
+
+/// `on_mail_ack`, plus the full `DeliveredReceipt` it just wrote (or had
+/// already written) - `crate::server::federation` needs `from` to know
+/// whether it must relay this receipt to a different server, and
+/// `on_mail_ack` itself only ever reports it indirectly, as who to notify
+/// *locally*. Reads the receipt back from disk rather than threading it
+/// through `on_mail_ack`'s own return value, so a mid-suite change to that
+/// function's local-notify logic can never drift out of step with what
+/// this reports. `None` when the ack was a no-op (unknown id, a claimant
+/// mismatch) - or, harmlessly, when the exact same ack is repeated after
+/// racing a receipt that already existed.
+pub fn on_mail_ack_with_relay_info(
+    reg: &Registry,
+    store: &MailStore,
+    requester: UserId,
+    mail_id: String,
+) -> (Vec<Outgoing>, Option<DeliveredReceipt>) {
+    let outgoing = on_mail_ack(reg, store, requester, mail_id.clone());
+    (outgoing, store.receipt_for(&mail_id))
 }
 
 /// Applies one `ClientMessage::OtpMailDeliveredAck` from a sender: the

@@ -130,6 +130,9 @@ the server starts (`docker-server/aloo-server-entrypoint.sh`), all optional:
 | `ALOO_SSL_FULLCHAIN` / `ALOO_SSL_PRIVKEY` | `server_ssl_fullchain` / `server_ssl_privkey` settings | Paths *inside the container* to the certificate pair - put them in the mounted volume so they survive recreation. |
 | `ALOO_ALLOW_REGISTRATION` | `server_allow_registration` setting | `on` to let anyone register themselves from the connect screen. |
 | `ALOO_SMTP_HOST` / `ALOO_SMTP_PORT` / `ALOO_SMTP_USERNAME` / `ALOO_SMTP_PASSWORD` | `server_smtp_*` settings | The relay activation emails go out through - required for `ALOO_ALLOW_REGISTRATION` to do anything but refuse every registration. |
+| `ALOO_FEDERATION_ENABLED` | `server_federation_enabled` setting | `on` to link this server into a federation of peers (`docs/PROTOCOL.md` §18). |
+| `ALOO_FEDERATION_ID` / `ALOO_FEDERATION_PORT` / `ALOO_FEDERATION_ADVERTISE_ADDR` / `ALOO_FEDERATION_IDENTITY` | `server_federation_id` / `_port` / `_advertise_addr` / `_identity` settings | This server's own federation identity - a PQ-hybrid keybundle prefix (no TLS/certificates), generated automatically on first start if missing; put it in a mounted volume so it survives a container restart. |
+| `ALOO_FEDERATION_PEERS` | one `server_federation_peer` setting line per entry | `;`-separated list of trusted peers, each `<peer_id>,<host>,<port>,<public_key_path>` - `<public_key_path>` (that peer's `.pub` file, copied out of band) is also inside the container. Rewritten from this env var on every start, so it's the one source of truth for the peer list. |
 
 If you omit port/bind, on a *second* run the container picks up whatever
 was last saved to `~/.aloo/settings` on the mounted volume — same

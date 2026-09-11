@@ -22,6 +22,7 @@
 //! and typed back into the client's own activation popup.
 
 pub mod channels_registry;
+pub mod federation;
 pub mod mail;
 pub mod ssl;
 pub mod users_registry;
@@ -96,6 +97,12 @@ pub struct ServerOptions {
     /// that address's registrations for the next 7 days
     /// (`client::ip_ban::REGISTRATION_ABUSE_STRIKES`).
     pub registration_bans: Arc<Mutex<IpBanList>>,
+    /// `server_federation_enabled=on` - this server's link into a
+    /// federation of peer servers (`federation`). `None` (the default)
+    /// means every federation-aware check in this module is a no-op, so
+    /// an unconfigured server behaves exactly as it did before federation
+    /// existed.
+    pub federation: Option<Arc<federation::FederationConfig>>,
 }
 
 impl ServerOptions {
@@ -119,6 +126,7 @@ impl ServerOptions {
             registration_bans: Arc::new(Mutex::new(load_ip_bans(
                 crate::client::ip_ban::registration_ban_default_path(),
             ))),
+            federation: None,
         }
     }
 
@@ -172,6 +180,11 @@ impl ServerOptions {
     /// list.
     pub fn with_registration_bans_path(mut self, path: PathBuf) -> Self {
         self.registration_bans = Arc::new(Mutex::new(load_ip_bans(path)));
+        self
+    }
+
+    pub fn with_federation(mut self, config: federation::FederationConfig) -> Self {
+        self.federation = Some(Arc::new(config));
         self
     }
 }
@@ -329,6 +342,62 @@ impl Registry {
     /// knowing their name (Ctrl+J), never advertised in the tab list.
     pub fn channel_list(&self) -> Vec<proto::ChannelInfo> {
         self.channels.list()
+    }
+
+    /// Whether `name` already exists, public or private.
+    pub fn channel_exists(&self, name: &str) -> bool {
+        self.channels.contains(name)
+    }
+
+    /// Every channel `id` currently belongs to.
+    pub fn channel_membership_of(&self, id: UserId) -> Vec<String> {
+        self.channels.member_of(id)
+    }
+
+    /// Whether `id` already belongs to `channel`.
+    pub fn is_channel_member(&self, channel: &str, id: UserId) -> bool {
+        self.channels.is_member(channel, id)
+    }
+
+    /// Validates and (on success) records a federation peer's join-proxy
+    /// request - see `channels_registry::ChannelsRegistry::join_remote`.
+    /// Only ever called on the server that actually owns `name`.
+    pub fn join_channel_remote(
+        &mut self,
+        name: &str,
+        remote_server: &str,
+        joiner_nickname: &str,
+        password: Option<&str>,
+        source_ip: IpAddr,
+    ) -> Option<Result<(ChannelKind, Option<String>), proto::ChannelJoinRejection>> {
+        self.channels.join_remote(name, remote_server, joiner_nickname, password, source_ip)
+    }
+
+    /// Applies a federation peer's `LeaveProxyNotice` - see
+    /// `channels_registry::ChannelsRegistry::leave_remote`.
+    pub fn leave_channel_remote(&mut self, name: &str, remote_server: &str, nickname: &str) {
+        self.channels.leave_remote(name, remote_server, nickname);
+    }
+
+    /// Mirrors a federation join-proxy's grant locally - see
+    /// `channels_registry::ChannelsRegistry::mirror_remote_join`.
+    pub fn mirror_remote_join(
+        &mut self,
+        id: UserId,
+        name: &str,
+        kind: ChannelKind,
+        admin: Option<String>,
+    ) -> Result<Vec<Outgoing>, String> {
+        let joiner = self.user_info(id).ok_or_else(|| "unknown user".to_string())?;
+        let clients = &self.clients;
+        Ok(self.channels.mirror_remote_join(id, &joiner, name, kind, admin, |uid| {
+            clients.get(&uid).map(|c| UserInfo {
+                id: uid,
+                name: c.name.clone(),
+                public_key_der: c.public_key_der.clone(),
+                key_mode: c.key_mode,
+            })
+        }))
     }
 
     /// Joins `id` to `name`, creating the channel (as `kind`) if needed;
@@ -506,8 +575,8 @@ impl Registry {
 
     /// The background inactivity sweep's one entry point - see
     /// `channels_registry::ChannelsRegistry::sweep_inactive`.
-    pub fn sweep_inactive_channels(&mut self) {
-        self.channels.sweep_inactive();
+    pub fn sweep_inactive_channels(&mut self) -> Vec<String> {
+        self.channels.sweep_inactive()
     }
 
     /// Relays a `pq_hybrid` key rotation (PROTOCOL.md §7.5/§13.10) point to
@@ -571,7 +640,7 @@ impl Registry {
 // Async wiring
 // ---------------------------------------------------------------------
 
-type Senders = Arc<Mutex<HashMap<UserId, mpsc::UnboundedSender<ServerMessage>>>>;
+pub(crate) type Senders = Arc<Mutex<HashMap<UserId, mpsc::UnboundedSender<ServerMessage>>>>;
 
 /// Binds `addr` (both TCP and, for the UDP rendezvous socket, the same
 /// numeric port - independent port namespaces, so this needs no separate
@@ -610,14 +679,20 @@ pub async fn serve_with_rendezvous(
 const CHANNEL_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Periodically sweeps channels that have been empty and unjoined for too
-/// long (`channels_registry::ChannelsRegistry::sweep_inactive`). Modeled
-/// on `udp_rendezvous_loop`'s "degrade, never take the whole task down"
+/// long (`channels_registry::ChannelsRegistry::sweep_inactive`), gossiping
+/// each one's departure when federation is on. Modeled on
+/// `udp_rendezvous_loop`'s "degrade, never take the whole task down"
 /// shape, though there is nothing here that can actually fail.
-async fn channel_sweep_loop(registry: Arc<Mutex<Registry>>) {
+async fn channel_sweep_loop(registry: Arc<Mutex<Registry>>, federation: Option<Arc<federation::FederationConfig>>) {
     let mut ticker = tokio::time::interval(CHANNEL_SWEEP_INTERVAL);
     loop {
         ticker.tick().await;
-        registry.lock().await.sweep_inactive_channels();
+        let removed = registry.lock().await.sweep_inactive_channels();
+        if let Some(federation) = &federation {
+            for name in &removed {
+                federation::announce_channel_removed(federation, name).await;
+            }
+        }
     }
 }
 
@@ -626,13 +701,26 @@ async fn serve_tcp(listener: TcpListener, options: ServerOptions) -> std::io::Re
         options.channel_deletion_unactivity_period,
     )));
     if options.channel_deletion_unactivity_period.is_some() {
-        tokio::spawn(channel_sweep_loop(registry.clone()));
+        tokio::spawn(channel_sweep_loop(registry.clone(), options.federation.clone()));
     }
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
     // Shared without a lock of its own: every method works on one file at a
     // time and the racy interleavings (two connections storing/acking the
     // same id) each resolve to a harmless no-op for the loser.
     let mail_store = Arc::new(mail::MailStore::open(options.mail_dir.clone())?);
+    if let Some(config) = options.federation.clone() {
+        let ctx = federation::FederationContext {
+            config,
+            registry: registry.clone(),
+            senders: senders.clone(),
+            mail_store: mail_store.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = federation::run(ctx).await {
+                crate::log_warn!("federation listener stopped: {e}");
+            }
+        });
+    }
     let options = Arc::new(options);
 
     loop {
@@ -778,9 +866,16 @@ async fn handle_connection(
         .await;
         return Ok(());
     }
-    // The derivation is deliberately slow (§5.1) and the check reads the
-    // registry's files - neither belongs on the async executor.
-    let check = {
+    // A nickname with no local account can never pass the credential
+    // check below regardless of password - if federation already knows
+    // it belongs elsewhere (or is in conflict), answer that directly
+    // rather than paying for the derivation just to say "rejected" for a
+    // reason federation can already name more precisely.
+    let check = if let Some(check) = federation_login_precheck(&options, &nickname).await {
+        check
+    } else {
+        // The derivation is deliberately slow (§5.1) and the check reads
+        // the registry's files - neither belongs on the async executor.
         let users = options.users.clone();
         let (nickname, password) = (nickname.clone(), password.clone());
         tokio::task::spawn_blocking(move || {
@@ -791,6 +886,25 @@ async fn handle_connection(
     };
     match check {
         AuthCheck::Ok => {}
+        AuthCheck::RegisteredElsewhere { server_addr } => {
+            refuse_auth(
+                &mut wr,
+                format!(
+                    "this nickname is registered on a different federated server - connect to \
+                     {server_addr} instead"
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+        AuthCheck::Conflicted => {
+            refuse_auth(
+                &mut wr,
+                "this nickname exists on multiple federated servers - contact an administrator",
+            )
+            .await;
+            return Ok(());
+        }
         AuthCheck::Rejected => {
             options
                 .login_bans
@@ -854,6 +968,7 @@ async fn handle_connection(
                     Some("this account's activation code has expired - register again".to_string())
                 }
                 users_registry::ActivationOutcome::TooManyWrongCodesAccountRemoved => {
+                    federation_announce_nickname_removed(&options, &nickname).await;
                     Some(users_registry::ACCOUNT_REMOVED_ACTIVATION_REASON.to_string())
                 }
             };
@@ -926,6 +1041,22 @@ async fn handle_connection(
 
     let result = client_loop(id, &mut rd, &registry, &senders, peer_ip, &options, &mail_store).await;
 
+    // Every federation-owned-elsewhere channel this connection was still
+    // in is told about the departure before `unregister` forgets its
+    // membership entirely - a disconnect gets exactly the same notice an
+    // explicit `LeaveChannel` does (see that arm in `client_loop`).
+    if let Some(federation) = &options.federation {
+        let (nickname, channels) = {
+            let reg = registry.lock().await;
+            (reg.user_info(id).map(|u| u.name), reg.channel_membership_of(id))
+        };
+        if let Some(nickname) = nickname {
+            for channel in channels {
+                federation.notify_leave_if_remote(&channel, &nickname).await;
+            }
+        }
+    }
+
     {
         let mut reg = registry.lock().await;
         let outgoing = reg.unregister(id);
@@ -935,6 +1066,199 @@ async fn handle_connection(
     senders.lock().await.remove(&id);
     writer_task.abort();
     result
+}
+
+/// Whether `nickname` belongs to a different federated server, or is
+/// claimed by more than one - checked before the slow local credential
+/// derivation runs (see the call site in `handle_connection`). `None`
+/// when there is nothing to redirect: federation is off, the nickname has
+/// a local account (an ordinary login, or a login while its registration
+/// is still only locally recorded and hasn't gossiped out yet), or it is
+/// unknown anywhere in the federation - an ordinary `AuthCheck::Rejected`
+/// still applies for that last case, exactly as before federation
+/// existed.
+async fn federation_login_precheck(options: &ServerOptions, nickname: &str) -> Option<AuthCheck> {
+    let federation = options.federation.as_ref()?;
+    if options.users.is_registered(nickname) {
+        return None;
+    }
+    match federation.directory.lock().await.owner_of_nickname(nickname)? {
+        federation::directory::Ownership::Owned(owner) if *owner == federation.self_id => None,
+        federation::directory::Ownership::Owned(owner) => Some(AuthCheck::RegisteredElsewhere {
+            server_addr: federation
+                .peer_advertise_addr(owner)
+                .unwrap_or_else(|| owner.clone()),
+        }),
+        federation::directory::Ownership::Conflicted(_) => Some(AuthCheck::Conflicted),
+    }
+}
+
+/// If `name` is a channel the federation directory says a *different*
+/// server owns, proxies the join to it (`FederationConfig::request_join_proxy`)
+/// and returns the answer to give `id` either way: a real local mirror
+/// join on success (`Registry::mirror_remote_join`), or the same
+/// `ChannelJoinRejected`/`ChannelJoinFailed` shape a local `join` would
+/// have produced on refusal. Already-mirrored membership short-circuits
+/// straight to a fresh `Joined` with no round trip at all - proxying is
+/// only ever needed the *first* time this connection joins a given
+/// remote-homed channel. `None` when there is nothing to proxy
+/// (federation is off, or `name` is unowned or owned by this server) -
+/// `client_loop` falls through to an ordinary local `join` in that case.
+async fn federation_proxy_join(
+    options: &ServerOptions,
+    registry: &Arc<Mutex<Registry>>,
+    id: UserId,
+    name: &str,
+    password: Option<&str>,
+) -> Option<Vec<Outgoing>> {
+    let federation = options.federation.as_ref()?;
+    let owner = {
+        let dir = federation.directory.lock().await;
+        match dir.owner_of_channel(name) {
+            Some(info) if info.owner != federation.self_id => info.owner.clone(),
+            Some(_) => return None, // owned by this server - ordinary local join
+            None if dir.channel_is_conflicted(name) => {
+                return Some(vec![Outgoing::new(
+                    id,
+                    ServerMessage::ChannelJoinFailed {
+                        name: name.to_string(),
+                        reason: "this channel exists on multiple federated servers and needs \
+                                 administrator resolution"
+                            .to_string(),
+                    },
+                )]);
+            }
+            None => return None, // genuinely unknown - fall through to local create/join
+        }
+    };
+    // Already mirrored locally (this connection proxied this exact
+    // channel before): a no-op, exactly like `join`'s own
+    // already-a-member case - no round trip, no answer sent.
+    let already_mirrored = {
+        let reg = registry.lock().await;
+        reg.is_channel_member(name, id)
+    };
+    if already_mirrored {
+        return Some(Vec::new());
+    }
+    let joiner_nickname = {
+        let reg = registry.lock().await;
+        reg.user_info(id)?.name
+    };
+    let outcome = federation.request_join_proxy(name, &joiner_nickname, password).await;
+    Some(match outcome {
+        Ok(federation::proto::JoinProxyOutcome::Joined { kind, admin }) => {
+            let mut reg = registry.lock().await;
+            reg.mirror_remote_join(id, name, kind, admin)
+                .unwrap_or_else(|reason| Outgoing::refuse(id, reason))
+        }
+        Ok(federation::proto::JoinProxyOutcome::Rejected(rejection)) => vec![Outgoing::new(
+            id,
+            ServerMessage::ChannelJoinRejected {
+                name: name.to_string(),
+                kind: rejection,
+            },
+        )],
+        Ok(federation::proto::JoinProxyOutcome::UnknownChannel) => vec![Outgoing::new(
+            id,
+            ServerMessage::ChannelJoinFailed {
+                name: name.to_string(),
+                reason: format!("federated server '{owner}' no longer has this channel"),
+            },
+        )],
+        Err(reason) => vec![Outgoing::new(id, ServerMessage::ChannelJoinFailed { name: name.to_string(), reason })],
+    })
+}
+
+/// `ClientMessage::JoinChannel`'s full handling, run with the registry
+/// unlocked except for the brief, bounded moments `federation_proxy_join`
+/// and the local `join_channel_with_policy` call themselves need it -
+/// pulled out of `client_loop`'s "lock once for the whole match" pattern
+/// for exactly that reason (see the call site).
+async fn handle_join_channel(
+    id: UserId,
+    registry: &Arc<Mutex<Registry>>,
+    options: &Arc<ServerOptions>,
+    source_ip: IpAddr,
+    name: String,
+    kind: ChannelKind,
+    password: Option<String>,
+) -> Vec<Outgoing> {
+    if let Some(outgoing) = federation_proxy_join(options, registry, id, &name, password.as_deref()).await {
+        return outgoing;
+    }
+    let name_for_err = name.clone();
+    let (existed_before, result) = {
+        let mut reg = registry.lock().await;
+        let existed_before = reg.channel_exists(&name);
+        let result = reg.join_channel_with_policy(
+            id,
+            &name,
+            kind,
+            password.as_deref(),
+            source_ip,
+            options.allow_create_public_channels,
+        );
+        (existed_before, result)
+    };
+    if !existed_before && result.is_ok() {
+        federation_announce_channel(options, &name, kind).await;
+    }
+    result.unwrap_or_else(|reason| {
+        vec![Outgoing::new(
+            id,
+            ServerMessage::ChannelJoinFailed {
+                name: name_for_err,
+                reason,
+            },
+        )]
+    })
+}
+
+/// Records a freshly (locally) created channel in the federation
+/// directory and gossips it to every linked peer - called only once,
+/// right after a `JoinChannel` is confirmed to have created `name`
+/// (see the call site in `client_loop`), never for a join of an
+/// already-existing channel.
+async fn federation_announce_channel(options: &ServerOptions, name: &str, kind: ChannelKind) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    let info = federation::proto::FederatedChannelInfo {
+        name: name.to_string(),
+        kind,
+        owner: federation.self_id.clone(),
+    };
+    federation.directory.lock().await.record_local_channel(info.clone());
+    federation::broadcast(
+        federation,
+        federation::proto::FederationMessage::ChannelRegistered { channel: info },
+        federation::event::CHANNEL_GOSSIP,
+    )
+    .await;
+}
+
+/// Records a locally-removed channel's departure in the federation
+/// directory and gossips it to every linked peer - the deletion mirror of
+/// `federation_announce_channel`. Called for `/delete-channel`, a
+/// superadmin's `/remove-channel` (single or via account removal), and
+/// the inactivity sweep alike, so a deleted channel's name eventually
+/// stops being permanently blocked federation-wide instead of staying
+/// "owned by a server that no longer has it" forever.
+async fn federation_announce_channel_removed(options: &ServerOptions, name: &str) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    federation::announce_channel_removed(federation, name).await;
+}
+
+/// The nickname mirror of `federation_announce_channel_removed` - called
+/// for a superadmin's `/remove-account`.
+async fn federation_announce_nickname_removed(options: &ServerOptions, nickname: &str) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    federation::announce_nickname_removed(federation, nickname).await;
 }
 
 /// `id`'s own nickname, checked against `options.superadmins` - the
@@ -1010,36 +1334,45 @@ async fn client_loop<R: AsyncRead + Unpin>(
         let Some(msg) = recv? else {
             return Ok(());
         };
+        // `JoinChannel` is handled outside the "lock the registry for the
+        // whole match" pattern every other arm below uses: proxying it to
+        // a federation peer (`federation_proxy_join`) can wait seconds on
+        // a real network round trip, and holding the registry locked that
+        // long would stall every other client on this server - including
+        // this server's own federation link, which needs that same lock
+        // to answer *other* servers' requests.
+        if let ClientMessage::JoinChannel { name, kind, password } = msg {
+            let outgoing = handle_join_channel(
+                id,
+                registry,
+                options,
+                source_ip,
+                name,
+                kind,
+                password,
+            )
+            .await;
+            dispatch(senders, outgoing).await;
+            continue;
+        }
         let outgoing = {
             let mut reg = registry.lock().await;
             match msg {
-                ClientMessage::JoinChannel {
-                    name,
-                    kind,
-                    password,
-                } => {
-                    let name_for_err = name.clone();
-                    reg.join_channel_with_policy(
-                        id,
-                        &name,
-                        kind,
-                        password.as_deref(),
-                        source_ip,
-                        options.allow_create_public_channels,
-                    )
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing::new(
-                            id,
-                            ServerMessage::ChannelJoinFailed {
-                                name: name_for_err,
-                                reason,
-                            },
-                        )]
-                    })
+                ClientMessage::LeaveChannel { name } => {
+                    let outgoing = reg.leave_channel(id, &name);
+                    if let Some(federation) = &options.federation
+                        && let Some(nickname) = reg.user_info(id).map(|u| u.name)
+                    {
+                        federation.notify_leave_if_remote(&name, &nickname).await;
+                    }
+                    outgoing
                 }
-                ClientMessage::LeaveChannel { name } => reg.leave_channel(id, &name),
                 ClientMessage::DeleteChannel { name } => {
-                    or_refuse(id, reg.delete_channel(id, &name))
+                    let result = reg.delete_channel(id, &name);
+                    if result.is_ok() {
+                        federation_announce_channel_removed(options, &name).await;
+                    }
+                    or_refuse(id, result)
                 }
                 ClientMessage::BanFromChannel { channel, nickname } => {
                     or_refuse(id, reg.ban_from_channel(id, &channel, &nickname))
@@ -1121,10 +1454,15 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         Err(e) => Outgoing::refuse(id, e),
                         Ok(_) => {
                             let _ = options.users.remove(&nickname);
+                            let administered = reg.channels.channels_administered_by(&nickname);
                             let mut out = reg.remove_channels_administered_by(
                                 &nickname,
                                 "the channel has been removed by the admin",
                             );
+                            for name in &administered {
+                                federation_announce_channel_removed(options, name).await;
+                            }
+                            federation_announce_nickname_removed(options, &nickname).await;
                             if let Some(target_id) = reg.id_by_name(&nickname) {
                                 out.push(Outgoing::error(
                                     target_id,
@@ -1138,7 +1476,11 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 ClientMessage::AdminRemoveChannel { name } => {
                     match require_superadmin(options, &reg, id) {
                         Err(e) => Outgoing::refuse(id, e),
-                        Ok(_) => reg.remove_channel(&name, "removed by a superadmin"),
+                        Ok(_) => {
+                            let out = reg.remove_channel(&name, "removed by a superadmin");
+                            federation_announce_channel_removed(options, &name).await;
+                            out
+                        }
                     }
                 }
                 ClientMessage::RequestUsersList => match require_superadmin(options, &reg, id) {
@@ -1182,15 +1524,32 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     seq,
                     sent_at_utc,
                     ciphertext,
-                } => mail::on_mail_send(
-                    &reg, mail_store, id, mail_id, to, contact_name, seq, sent_at_utc, ciphertext,
-                ),
+                } => {
+                    let (outgoing, mail_for_relay) = mail::on_mail_send_with_relay_info(
+                        &reg, mail_store, id, mail_id, to.clone(), contact_name, seq, sent_at_utc, ciphertext,
+                    );
+                    if let Some(federation) = &options.federation
+                        && let Some(mail) = mail_for_relay
+                    {
+                        federation.forward_mail_if_remote(&mail).await;
+                    }
+                    outgoing
+                }
                 ClientMessage::OtpMailFetch => mail::on_mail_fetch(&reg, mail_store, id),
                 ClientMessage::OtpMailAck { mail_id } => {
-                    mail::on_mail_ack(&reg, mail_store, id, mail_id)
+                    let (outgoing, receipt) = mail::on_mail_ack_with_relay_info(&reg, mail_store, id, mail_id);
+                    if let Some(federation) = &options.federation
+                        && let Some(receipt) = receipt
+                    {
+                        federation.relay_receipt_if_remote(&receipt).await;
+                    }
+                    outgoing
                 }
                 ClientMessage::OtpMailDeliveredAck { mail_id } => {
                     mail::on_mail_delivered_ack(&reg, mail_store, id, mail_id)
+                }
+                ClientMessage::JoinChannel { .. } => {
+                    unreachable!("handled above, before this match, and always `continue`s")
                 }
                 ClientMessage::SecureChannel(_)
                 | ClientMessage::Auth { .. }
@@ -1244,6 +1603,17 @@ async fn register_account(
     let Some(smtp) = &options.smtp else {
         return Err("this server has no email delivery configured for registrations".into());
     };
+    // Federation-wide uniqueness, checked before writing anything locally:
+    // a nickname already owned by a peer (or in conflict) is refused the
+    // same way an already-taken local nickname is, naming which server
+    // owns it so the client knows where to register instead.
+    if let Some(federation) = &options.federation {
+        federation
+            .directory
+            .lock()
+            .await
+            .is_registrable_here(nickname, &federation.self_id)?;
+    }
     let registration = {
         let users = options.users.clone();
         let (nickname, password, email) = (
@@ -1264,6 +1634,29 @@ async fn register_account(
         crate::log_warn!("activation email for {nickname} could not be sent: {e}");
         let _ = options.users.remove(nickname);
         return Err("the activation email could not be sent - try again later".into());
+    }
+    // Recorded and gossiped only once the account is actually going to
+    // stick (past the email-delivery rollback above). Removed later -
+    // an exhausted activation code (`handle_connection`'s
+    // `TooManyWrongCodesAccountRemoved` arm) or a superadmin's
+    // `/remove-account` (`AdminRemoveAccount`) - is gossiped too, via
+    // `federation_announce_nickname_removed`, so a removed nickname does
+    // not stay permanently blocked federation-wide.
+    if let Some(federation) = &options.federation {
+        let _ = federation
+            .directory
+            .lock()
+            .await
+            .record_local_nickname(nickname.to_string(), &federation.self_id);
+        federation::broadcast(
+            federation,
+            federation::proto::FederationMessage::NicknameRegistered {
+                nickname: nickname.to_string(),
+                owner: federation.self_id.clone(),
+            },
+            federation::event::NICKS_GOSSIP,
+        )
+        .await;
     }
     Ok(())
 }
@@ -1315,7 +1708,7 @@ async fn reissue_and_resend_activation(options: &ServerOptions, nickname: &str) 
     true
 }
 
-async fn dispatch(senders: &Senders, outgoing: Vec<Outgoing>) {
+pub(crate) async fn dispatch(senders: &Senders, outgoing: Vec<Outgoing>) {
     let map = senders.lock().await;
     for o in outgoing {
         if let Some(tx) = map.get(&o.to) {

@@ -557,6 +557,7 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
         "# share=~/Public,all",
         "# share=~/Photos,alice,bob",
         "# server_superadmin=somenickname",
+        "# server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub",
     ] {
         assert!(
             contents.contains(example),
@@ -571,6 +572,79 @@ fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_l
     assert_eq!(settings.direct_punch_channels, vec!["direct-punches".to_string()]);
     assert!(settings.server_superadmin.is_empty());
     assert!(settings.shares.is_empty());
+    assert!(settings.server_federation_peers.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// Federation (`server_federation_*`) - off by default, one repeated
+// `server_federation_peer=<peer_id>,<host>,<port>,<public_key_path>` line per
+// peer, same convention as `server_superadmin`/`direct_punch_to`.
+// ---------------------------------------------------------------------
+
+/// @requirement TB-306
+#[test]
+fn federation_is_off_by_default_with_no_peers() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(!settings.server_federation_enabled);
+    assert_eq!(settings.server_federation_id, None);
+    assert!(settings.server_federation_peers.is_empty());
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("server_federation_enabled=off"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-306
+#[test]
+fn federation_peer_lines_parse_and_round_trip() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "server_federation_enabled=on\n\
+         server_federation_id=serverA\n\
+         server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub\n\
+         server_federation_peer=serverC,203.0.113.9,7880,~/.aloo/federation/peerC.pub\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.server_federation_enabled);
+    assert_eq!(settings.server_federation_id.as_deref(), Some("serverA"));
+    assert_eq!(settings.server_federation_peers.len(), 2);
+    assert_eq!(settings.server_federation_peers[0].peer_id, "serverB");
+    assert_eq!(settings.server_federation_peers[0].host, "peerb.example.com");
+    assert_eq!(settings.server_federation_peers[0].port, 7880);
+    assert_eq!(
+        settings.server_federation_peers[1].public_key_path,
+        "~/.aloo/federation/peerC.pub"
+    );
+
+    let saved_path = temp_settings_path();
+    settings.save(&saved_path).unwrap();
+    let reloaded = Settings::load_or_create(&saved_path).unwrap();
+    assert_eq!(reloaded.server_federation_peers, settings.server_federation_peers);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&saved_path).ok();
+}
+
+/// A malformed peer line (missing a field, an invalid host, an empty
+/// public key path) is dropped rather than crashing the load - the same
+/// tolerance every other accumulating key in this file has for a
+/// hand-edit gone wrong.
+/// @requirement TB-306
+#[test]
+fn a_malformed_federation_peer_line_is_dropped() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "server_federation_peer=serverB,peerb.example.com,7880\n\
+         server_federation_peer=serverC, ,7880,~/identity.pub\n\
+         server_federation_peer=serverD,gooddomain.example,7880,~/.aloo/federation/peerD.pub\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.server_federation_peers.len(), 1);
+    assert_eq!(settings.server_federation_peers[0].peer_id, "serverD");
     std::fs::remove_file(&path).ok();
 }
 
@@ -675,7 +749,14 @@ server_smtp_username=\n\
 server_smtp_password=\n\
 server_allow_create_public_channels=on\n\
 server_channel_deletion_unactivity_period=\n\
-# server_superadmin=somenickname\n";
+# server_superadmin=somenickname\n\
+server_federation_enabled=off\n\
+server_federation_id=\n\
+server_federation_bind=0.0.0.0\n\
+server_federation_port=7880\n\
+server_federation_advertise_addr=\n\
+server_federation_identity=~/.aloo/federation/identity\n\
+# server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub\n";
 
 /// The scaffold is only ever *written* once, on first run - but a
 /// mid-session write (`save`/`update`, used by every ordinary action)

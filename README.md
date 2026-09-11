@@ -630,6 +630,24 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout privkey.pem -out fullchain.pem -days 365 -nodes -subj "/CN=localhost"
 ```
 
+### Federating servers
+
+Two or more servers can share one nickname/channel namespace instead of each being its own island — a nickname or channel registered on one is refused as a duplicate on the others, and logging in with a nickname registered elsewhere in the federation tells you which server to use instead of a plain "authentication failed". This is entirely server-side settings, in `~/.aloo/settings` on each server's own machine — there's nothing to configure on the client.
+
+Each server needs its own federation identity — a PQ-hybrid keypair, the same kind a client's `my_key` uses, generated automatically the first time federation starts (no TLS or certificates involved; federation links are mutually authenticated by this identity instead, unlike the client-facing connection) — and a line naming every other server it trusts:
+
+```
+server_federation_enabled=on
+server_federation_id=serverA
+server_federation_port=7880
+server_federation_identity=~/.aloo/federation/identity
+server_federation_peer=serverB,serverb.example.com,7880,~/.aloo/federation/serverB.pub
+```
+
+`server_federation_peer` is one line per trusted peer: its id, host, port, and the public key file to pin its identity to (send it that file out of band, once federation has started and generated `server_federation_identity`'s `.pub` half — federation trusts a specific public key, never a certificate authority). Add the mirror image on `serverB`'s own settings, naming `serverA` and pointing at `serverA`'s public key, and the two link up automatically (only the server whose id sorts first alphabetically actually dials — the other just listens for it).
+
+You can join a channel that lives on a different federated server by name, and send OTP mail to someone registered on one — both are proxied/relayed to the right server automatically. What doesn't work yet is a live chat between two people connected to *different* federated servers, even in a channel they're both members of — direct peer-to-peer links are still only set up between people sharing one server; see `docs/PROTOCOL.md` §18.5.
+
 ## One Time Pad mail
 
 A live `/otp` session needs both of you online at once — One Time Pad mail doesn't. Write someone a whole mail — subject, text, voice recordings, file attachments — and it waits for them:

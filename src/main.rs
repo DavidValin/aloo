@@ -592,6 +592,44 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
         println!("aloo: registration open");
     }
 
+    if settings.server_federation_enabled {
+        let self_id = settings.server_federation_id.clone().ok_or(
+            "server_federation_enabled is on but server_federation_id is not set - a server \
+             needs its own id to be gossiped about",
+        )?;
+        let listen_addr = validation::parse_bind_addr(
+            &settings.server_federation_bind,
+            settings.server_federation_port,
+        )?;
+        let advertise_addr = settings.server_federation_advertise_addr.clone().unwrap_or_else(|| {
+            format!("{}:{}", settings.server_federation_bind, settings.server_federation_port)
+        });
+        let identity_prefix = aloo::platform::expand_tilde(&settings.server_federation_identity);
+        let prefix_str = identity_prefix.to_string_lossy().to_string();
+        let (identity_priv_path, identity_pub_path) = crypto::pq::bundle_paths(&prefix_str);
+        crypto::pq::ensure_bundle_at(&identity_pub_path, &identity_priv_path)
+            .map_err(|e| format!("cannot create federation identity: {e}"))?;
+        let identity = crypto::pq::load_private_bundle(&identity_priv_path).map_err(|e| {
+            format!("cannot read federation identity {}: {e}", identity_priv_path.display())
+        })?;
+        let directory = server::federation::directory::FederationDirectory::open(
+            server::federation::directory::default_dir(),
+        )?;
+        let federation = server::federation::FederationConfig::new(
+            self_id.clone(),
+            listen_addr,
+            advertise_addr,
+            identity,
+            settings.server_federation_peers.clone(),
+            directory,
+        )?;
+        println!(
+            "aloo: federation enabled as '{self_id}', listening on {listen_addr} (public key: {})",
+            identity_pub_path.display()
+        );
+        options = options.with_federation(federation);
+    }
+
     let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;
     println!("aloo: server listening on {addr}");
     server::run(addr, options).await?;
@@ -599,8 +637,34 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
 }
 
 /// `--register-user <nickname> <password>`: straight into the registry
-/// the server reads from, active immediately.
+/// the server reads from, active immediately. Runs as its own one-off
+/// process - typically before the server has even started (`docker-server`'s
+/// entrypoint runs every `ALOO_REGISTER_USERS` entry this way ahead of
+/// `aloo --server`) - so there is no live server, and therefore no live
+/// federation link, to check or gossip through the way `register_account`
+/// does for a `Register` over the wire. When federation is on, this
+/// still checks (and records) directly against the on-disk federation
+/// directory: refusing a nickname a peer already owns before ever writing
+/// the account, and recording this server's own claim on success so the
+/// next peer link that comes up picks it up via `DirectorySnapshot`,
+/// exactly as if it had been gossiped live.
 fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
+    let settings = load_settings();
+    let self_id = if settings.server_federation_enabled {
+        Some(settings.server_federation_id.clone().ok_or(
+            "server_federation_enabled is on but server_federation_id is not set - refusing to \
+             register a nickname federation can't attribute to this server",
+        )?)
+    } else {
+        None
+    };
+    if let Some(self_id) = &self_id {
+        let directory = server::federation::directory::FederationDirectory::open(
+            server::federation::directory::default_dir(),
+        )?;
+        directory.is_registrable_here(nickname, self_id)?;
+    }
+
     let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
     // `main`'s default error printer shows a returned error's `Debug`, not
     // its `Display` - for `RegisterError` that would print the bare enum
@@ -610,6 +674,14 @@ fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
     users
         .register_manual(nickname, password)
         .map_err(|e| e.to_string())?;
+
+    if let Some(self_id) = &self_id {
+        let mut directory = server::federation::directory::FederationDirectory::open(
+            server::federation::directory::default_dir(),
+        )?;
+        directory.record_local_nickname(nickname.to_string(), self_id)?;
+    }
+
     println!(
         "aloo: registered {nickname} in {} (active, no email)",
         users.dir().display()

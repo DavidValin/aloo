@@ -47,6 +47,30 @@ if [ -n "${ALOO_ALLOW_REGISTRATION:-}" ]; then
     [ -n "${ALOO_SMTP_PASSWORD:-}" ] && set_setting server_smtp_password "$ALOO_SMTP_PASSWORD"
 fi
 
+if [ -n "${ALOO_FEDERATION_ENABLED:-}" ]; then
+    set_setting server_federation_enabled "$ALOO_FEDERATION_ENABLED"
+    [ -n "${ALOO_FEDERATION_ID:-}" ] && set_setting server_federation_id "$ALOO_FEDERATION_ID"
+    [ -n "${ALOO_FEDERATION_PORT:-}" ] && set_setting server_federation_port "$ALOO_FEDERATION_PORT"
+    [ -n "${ALOO_FEDERATION_ADVERTISE_ADDR:-}" ] && set_setting server_federation_advertise_addr "$ALOO_FEDERATION_ADVERTISE_ADDR"
+    [ -n "${ALOO_FEDERATION_IDENTITY:-}" ] && set_setting server_federation_identity "$ALOO_FEDERATION_IDENTITY"
+    if [ -n "${ALOO_FEDERATION_PEERS:-}" ]; then
+        touch "$settings_file"
+        # `server_federation_peer` is a repeated key, unlike `set_setting`'s
+        # singular ones above - every existing line is dropped and
+        # rewritten from the env var on each start, so ALOO_FEDERATION_PEERS
+        # stays the one source of truth rather than accumulating a stale
+        # line every restart. One peer per `;`, each itself
+        # `<peer_id>,<host>,<port>,<public_key_path>`.
+        sed -i '/^server_federation_peer=/d' "$settings_file"
+        old_ifs="$IFS"
+        IFS=';'
+        for peer in $ALOO_FEDERATION_PEERS; do
+            [ -n "$peer" ] && printf 'server_federation_peer=%s\n' "$peer" >> "$settings_file"
+        done
+        IFS="$old_ifs"
+    fi
+fi
+
 # One-off accounts, active immediately with no email: "alice:s3cret,bob:hunter2".
 # Idempotent across restarts - registering a name that already exists in
 # the mounted `~/.aloo/users` is refused, and that refusal is expected and
