@@ -503,6 +503,44 @@ impl Registry {
         })
     }
 
+    /// The displayable identity a federated member is shown under here,
+    /// minting their synthetic id if this is the first sight of them -
+    /// what a signal relayed to one of this server's clients names as its
+    /// sender, so it matches the id that member's `UserJoined` used.
+    pub fn remote_user_info(
+        &mut self,
+        identity: &federation::proto::RemoteIdentity,
+    ) -> UserInfo {
+        mint_remote_user_info(&mut self.remote_ids, &mut self.next_remote_id, identity)
+    }
+
+    /// Which federated member a synthetic `UserId` stands for, if it is
+    /// one at all - the reverse of `mint_remote_user_id`.
+    ///
+    /// A client asks for a link, or offers a key rotation, by naming a
+    /// `UserId`, and for a federated member that is an id this server made
+    /// up locally and no other server has ever heard of. Going back the
+    /// other way is what lets the request be addressed to a person on a
+    /// named server instead (`FederationMessage::PeerSignal`).
+    pub fn federated_member_of(&self, id: UserId) -> Option<(String, String)> {
+        self.remote_ids
+            .iter()
+            .find(|(_, minted)| **minted == id)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Whether `id` and the federated member `(server, nickname)` share a
+    /// channel - see `ChannelsRegistry::share_a_channel` for why anything
+    /// relayed between two clients is gated on it.
+    pub fn shares_a_channel_with_federated(
+        &self,
+        id: UserId,
+        server: &str,
+        nickname: &str,
+    ) -> bool {
+        self.channels.share_a_channel(id, server, nickname)
+    }
+
     /// Everyone currently in `channel`, federation-wide - see
     /// `channels_registry::ChannelsRegistry::federated_membership_of`.
     pub fn federated_membership_of(
@@ -1496,6 +1534,49 @@ async fn federation_announce_channel_member(options: &ServerOptions, name: &str,
     .await;
 }
 
+/// Relays one client's signal to a client on another federated server,
+/// when `to` is a federated member rather than one of this server's own
+/// connections (docs/PROTOCOL.md §18.5).
+///
+/// `None` means this was an ordinary local `UserId` after all, and the
+/// caller should route it locally exactly as before - so nothing about a
+/// single-server deployment, or about two clients on the same server,
+/// changes. `Some` is the answer to give the client, which is *nothing*:
+/// there is no acknowledgement to send, the same as a local route, and
+/// the client's own retry covers a signal that goes astray.
+async fn federation_peer_signal(
+    options: &ServerOptions,
+    reg: &mut Registry,
+    from: UserId,
+    to: UserId,
+    payload: federation::proto::PeerSignalPayload,
+) -> Option<Vec<Outgoing>> {
+    let federation = options.federation.as_ref()?;
+    let (to_server, to_nickname) = reg.federated_member_of(to)?;
+    // The gate, applied here as well as on delivery: two clients may only
+    // be introduced to each other if they already share a channel, which
+    // is the same condition two clients on one server meet before
+    // exchanging addresses.
+    if !reg.shares_a_channel_with_federated(from, &to_server, &to_nickname) {
+        return Some(Outgoing::refuse(from, crate::proto::UNKNOWN_RECIPIENT));
+    }
+    let sender = reg.user_info(from)?;
+    federation
+        .send_peer_signal(
+            &to_server,
+            &to_nickname,
+            federation::proto::RemoteIdentity {
+                server: federation.self_id.clone(),
+                nickname: sender.name,
+                public_key_der: sender.public_key_der,
+                key_mode: sender.key_mode,
+            },
+            payload,
+        )
+        .await;
+    Some(Vec::new())
+}
+
 /// Tells every linked peer that a `/ban` just removed a *federated*
 /// member from one of this server's channels, so they stop listing
 /// someone the channel's own admin has thrown out. Reuses
@@ -1823,18 +1904,52 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     to,
                     new_public_key_der,
                     signature,
-                } => match reg.route_key_rotation(id, to, new_public_key_der, signature) {
-                    Ok(o) => vec![o],
-                    Err(reason) => Outgoing::refuse(id, reason),
-                },
+                } => {
+                    if let Some(payload) = federation_peer_signal(
+                        options,
+                        &mut reg,
+                        id,
+                        to,
+                        federation::proto::PeerSignalPayload::KeyRotation {
+                            new_public_key_der: new_public_key_der.clone(),
+                            signature: signature.clone(),
+                        },
+                    )
+                    .await
+                    {
+                        payload
+                    } else {
+                        match reg.route_key_rotation(id, to, new_public_key_der, signature) {
+                            Ok(o) => vec![o],
+                            Err(reason) => Outgoing::refuse(id, reason),
+                        }
+                    }
+                }
                 ClientMessage::RequestPeerLink {
                     peer,
                     candidates,
                     link_nonce,
-                } => match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
-                    Ok(o) => vec![o],
-                    Err(reason) => Outgoing::refuse(id, reason),
-                },
+                } => {
+                    if let Some(relayed) = federation_peer_signal(
+                        options,
+                        &mut reg,
+                        id,
+                        peer,
+                        federation::proto::PeerSignalPayload::Candidates {
+                            candidates: candidates.clone(),
+                            link_nonce,
+                        },
+                    )
+                    .await
+                    {
+                        relayed
+                    } else {
+                        match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
+                            Ok(o) => vec![o],
+                            Err(reason) => Outgoing::refuse(id, reason),
+                        }
+                    }
+                }
                 // Purely a liveness signal - already did its job just by
                 // arriving and resetting the timeout above.
                 ClientMessage::Heartbeat => Vec::new(),

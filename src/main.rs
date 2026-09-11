@@ -709,7 +709,7 @@ fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
     // may write the file in between (see `open_exclusive`).
     let mut directory = match &self_id {
         Some(self_id) => {
-            let mut directory =
+            let directory =
                 server::federation::directory::FederationDirectory::open_exclusive(
                     server::federation::directory::default_dir(),
                 )?

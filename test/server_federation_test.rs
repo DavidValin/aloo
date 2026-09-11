@@ -998,6 +998,202 @@ async fn a_third_servers_member_sees_presence_relayed_through_the_hub() {
     );
 }
 
+/// Reads from `stream` until a `UserJoined` for `nickname` arrives,
+/// returning the `UserId` that client was shown them under. Other traffic
+/// (other people's presence, the joiner's own `Joined`) is skipped: what
+/// arrives between the two is timing, not the subject of the test.
+async fn await_user_joined(
+    stream: &mut ControlEndpoint<tokio::net::TcpStream>,
+    nickname: &str,
+) -> aloo::proto::UserId {
+    for _ in 0..10 {
+        if let ServerMessage::UserJoined { user, .. } = recv_with_timeout(stream).await
+            && user.name == nickname
+        {
+            return user.id;
+        }
+    }
+    panic!("never saw {nickname} join");
+}
+
+/// Two clients on two servers that have **no link to each other** are
+/// introduced through the one server they share, and can then punch a
+/// direct link (docs/PROTOCOL.md §18.5).
+///
+/// This is the whole point of relaying rather than requiring a direct
+/// link: `leafA` and `leafB` are peers of `hub` only, and never speak to
+/// each other. Without the relay their clients can see each other in a
+/// shared channel and nothing more - the candidate exchange that every
+/// direct link starts with has no path to travel. What is asserted here is
+/// exactly that exchange arriving, under the identity the receiving client
+/// already knows the sender by: a server's synthetic id is local to it, so
+/// the relay has to translate, and an untranslated id would name nobody.
+/// @requirement AC-484
+#[tokio::test]
+async fn two_clients_on_unlinked_servers_are_introduced_through_the_one_they_share() {
+    let (hub, leaf_a, leaf_b) = spawn_federated_star("peer-relay").await;
+
+    let mut host = hub.connect().await;
+    hub.handshake(&mut host, "hostess").await;
+    host.send(&ClientMessage::JoinChannel {
+        name: "atrium".to_string(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv_with_timeout(&mut host).await, ServerMessage::Joined { .. }));
+
+    for leaf in [&leaf_a, &leaf_b] {
+        wait_until(Duration::from_secs(10), || async {
+            matches!(
+                leaf.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("atrium"),
+                Some(info) if info.owner == "hub"
+            )
+        })
+        .await;
+    }
+
+    let mut alice = leaf_a.connect().await;
+    leaf_a.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "atrium".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let mut carol = leaf_b.connect().await;
+    leaf_b.handshake(&mut carol, "carol").await;
+    carol
+        .send(&ClientMessage::JoinChannel {
+            name: "atrium".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    // Each sees the other, relayed through the hub - the id each is shown
+    // is minted locally, so the two are *different numbers for the same
+    // person*, which is exactly what the relay has to get right.
+    let alice_as_carol_sees_her = await_user_joined(&mut carol, "alice").await;
+    let carol_as_alice_sees_her = await_user_joined(&mut alice, "carol").await;
+
+    // alice asks to be introduced to carol, naming her by the only id
+    // alice has for her.
+    alice
+        .send(&ClientMessage::RequestPeerLink {
+            peer: carol_as_alice_sees_her,
+            candidates: vec!["203.0.113.7:41234".parse().unwrap()],
+            link_nonce: 4242,
+        })
+        .await
+        .unwrap();
+
+    // ...and it reaches carol, on a server that has never spoken to
+    // alice's, naming alice by the id carol already knows her as.
+    for _ in 0..10 {
+        if let ServerMessage::PeerCandidates { from, candidates, link_nonce } =
+            recv_with_timeout(&mut carol).await
+        {
+            assert_eq!(from, alice_as_carol_sees_her, "the sender must be translated to carol's own id for alice");
+            assert_eq!(link_nonce, 4242);
+            assert_eq!(candidates, vec!["203.0.113.7:41234".parse().unwrap()]);
+            return;
+        }
+    }
+    panic!("carol never received alice's candidates");
+}
+
+/// Being introduced is gated on actually sharing a channel, and the gate
+/// survives knowing the id.
+///
+/// Synthetic ids are minted from a known ceiling downwards, so they are
+/// guessable, and a client keeps ones it has already been told. Without
+/// the check, naming an id would be enough to make a client on another
+/// server hand over its candidate addresses - its real IPs - to someone
+/// with no relationship to it at all. Here alice legitimately learns
+/// carol's id, *then leaves the channel*, and the introduction stops
+/// working the moment the thing that justified it is gone.
+/// @requirement AC-484
+#[tokio::test]
+async fn an_introduction_is_refused_once_the_two_no_longer_share_a_channel() {
+    let (hub, leaf_a, leaf_b) = spawn_federated_star("peer-relay-gate").await;
+
+    let mut host = hub.connect().await;
+    hub.handshake(&mut host, "hostess").await;
+    host.send(&ClientMessage::JoinChannel {
+        name: "foyer".to_string(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv_with_timeout(&mut host).await, ServerMessage::Joined { .. }));
+
+    for leaf in [&leaf_a, &leaf_b] {
+        wait_until(Duration::from_secs(10), || async {
+            matches!(
+                leaf.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("foyer"),
+                Some(info) if info.owner == "hub"
+            )
+        })
+        .await;
+    }
+
+    let mut alice = leaf_a.connect().await;
+    leaf_a.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "foyer".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    let mut carol = leaf_b.connect().await;
+    leaf_b.handshake(&mut carol, "carol").await;
+    carol
+        .send(&ClientMessage::JoinChannel {
+            name: "foyer".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let _alice_as_carol_sees_her = await_user_joined(&mut carol, "alice").await;
+    let carol_as_alice_sees_her = await_user_joined(&mut alice, "carol").await;
+
+    // alice leaves - she keeps carol's id, but no longer has any standing
+    // to be introduced to her.
+    alice.send(&ClientMessage::LeaveChannel { name: "foyer".to_string() }).await.unwrap();
+    alice
+        .send(&ClientMessage::RequestPeerLink {
+            peer: carol_as_alice_sees_her,
+            candidates: vec!["203.0.113.9:41999".parse().unwrap()],
+            link_nonce: 99,
+        })
+        .await
+        .unwrap();
+
+    // carol hears about the departure, and nothing else: no candidates,
+    // and above all not alice's address.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), carol.recv::<ServerMessage>()).await {
+            Ok(Ok(Some(ServerMessage::PeerCandidates { .. }))) => {
+                panic!("candidates were relayed to someone who shares no channel with the sender")
+            }
+            Ok(Ok(Some(_))) => continue,
+            _ => break,
+        }
+    }
+}
+
 /// An idle link keeps itself alive. Nothing else would: a link carrying
 /// no traffic is indistinguishable from a dead one, so the idle timeout
 /// that catches a socket TCP never reports as broken would otherwise tear

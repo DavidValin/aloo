@@ -189,6 +189,36 @@ pub enum FederationMessage {
     /// missing one.
     ChannelMembership { channel: String, members: Vec<RemoteIdentity> },
 
+    /// One client's message to another client on a different federated
+    /// server, routed hop by hop (docs/PROTOCOL.md §18.5).
+    ///
+    /// This is the one federation message whose *purpose* is to reach a
+    /// person rather than a server, and it exists because two clients
+    /// cannot punch a direct link without first swapping addresses, and
+    /// the only path they share runs through their servers. Everything it
+    /// carries is opaque to every server that handles it: candidate
+    /// addresses the two ends will use to find each other, or an already
+    /// signed key rotation. Once the link is up nothing else about their
+    /// conversation ever touches a server again - the doctrine in §1 is
+    /// unchanged, this only arranges the introduction.
+    ///
+    /// Forwarded on to every other linked peer when this server is not
+    /// `to_server` itself, so two servers with no direct link between them
+    /// can still introduce their clients through one they share. `hops_left`
+    /// and `signal_id` are what keep that from circling forever in a mesh.
+    PeerSignal {
+        to_server: String,
+        to_nickname: String,
+        from: RemoteIdentity,
+        payload: PeerSignalPayload,
+        /// Decremented at each relay; dropped at zero.
+        hops_left: u8,
+        /// Random, per signal - a server that has seen it before does not
+        /// forward it again, so a cycle dies immediately rather than
+        /// living out the whole hop budget.
+        signal_id: u64,
+    },
+
     /// Hands an uploaded OTP mail's opaque ciphertext (plus its routing
     /// metadata) to the federated server that owns `mail.to` - the
     /// uploading server keeps its own durable copy until this is
@@ -213,6 +243,22 @@ pub enum FederationMessage {
     /// full on every single reconnect - growing with all-time cross-server
     /// mail volume, and paid again on every link flap.
     MailReceiptAck { mail_id: String },
+}
+
+/// What a `PeerSignal` is actually carrying. Both are things a server
+/// already relays between two of its *own* clients and understands
+/// nothing about: the addresses two ends will try to reach each other on
+/// (§7.1), and a key rotation the sender has already signed (§13.10).
+///
+/// Rotation is here for a reason that is easy to miss: it is normally
+/// routed through the server, and for a federated peer that would simply
+/// be refused - quietly, because messages keep working against the
+/// un-rotated keys and only forward secrecy stops, for exactly the peers
+/// this feature exists to connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerSignalPayload {
+    Candidates { candidates: Vec<std::net::SocketAddr>, link_nonce: u64 },
+    KeyRotation { new_public_key_der: Vec<u8>, signature: Vec<u8> },
 }
 
 /// The home server's answer to a `JoinProxyRequest` - the same five

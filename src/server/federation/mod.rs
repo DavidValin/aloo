@@ -28,17 +28,15 @@
 //! Cross-server private-channel join proxying (this module) lets a client
 //! become a real member of a channel owned by a different federated
 //! server, with that server enforcing its password/ban/allowlist exactly
-//! as it would locally. What it does *not* do is let that client actually
-//! exchange messages with a member connected to a *different* server: two
-//! members of the same federated channel can only punch a direct
-//! peer-to-peer link (`crate::client::p2p`) if they share one server's
-//! `Registry`, since `RequestPeerLink`/`PeerCandidates` are routed purely
-//! by local `UserId` today. Two local clients of the *same* server who
-//! both join a channel homed elsewhere work exactly like an ordinary
-//! local channel - they get real presence and can link to each other -
-//! but a member on a different server is invisible to them and vice
-//! versa, until the peer-link relay itself is federated too (not yet
-//! implemented - see docs/PROTOCOL.md §18.5).
+//! as it would locally. Two members of such a channel connected to
+//! *different* servers both see each other and can talk: the candidate
+//! exchange a direct peer-to-peer link starts with
+//! (`RequestPeerLink`/`PeerCandidates`, routed by local `UserId` and so
+//! meaningless across servers) is relayed as a `PeerSignal`, addressed by
+//! (server, nickname) and translated back to each side's own id for the
+//! other - straight across when two servers are linked, and otherwise
+//! through one they share. Only the introduction crosses a server;
+//! afterwards the link is an ordinary direct one (docs/PROTOCOL.md §18.5).
 
 pub mod directory;
 pub mod handshake;
@@ -144,6 +142,16 @@ pub const MAX_REDIAL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 ///
 /// The timeout is comfortably more than twice the interval, so a single
 /// lost ping (or a slow moment) never tears down a healthy link.
+/// How many servers a `PeerSignal` may be passed through before it is
+/// dropped. Federation is a small, operator-curated set, so a handful of
+/// hops covers any sane topology; the limit is there to bound the damage
+/// of a strange one, not to express a real ceiling on federation size.
+const PEER_SIGNAL_MAX_HOPS: u8 = 4;
+
+/// How many recently-seen signal ids to remember for loop suppression.
+/// Only has to cover the few seconds a signal is in flight.
+const PEER_SIGNAL_MEMORY: usize = 4096;
+
 pub const FEDERATION_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const FEDERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
 
@@ -217,6 +225,11 @@ pub struct FederationConfig {
     /// spending a real minute and a half doing it.
     ping_interval: Duration,
     idle_timeout: Duration,
+    /// Recently-seen `PeerSignal` ids, so one already forwarded is not
+    /// forwarded again - what stops a signal circling a mesh until its hop
+    /// budget runs out. Bounded and deliberately forgetful; see
+    /// `note_signal_seen`.
+    seen_peer_signals: Arc<Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl FederationConfig {
@@ -265,7 +278,63 @@ impl FederationConfig {
             next_link_id: AtomicU64::new(1),
             ping_interval: FEDERATION_PING_INTERVAL,
             idle_timeout: FEDERATION_IDLE_TIMEOUT,
+            seen_peer_signals: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// Sends one client's signal to a client on another federated server -
+    /// candidate addresses, or a signed key rotation - addressed by
+    /// (server, nickname) rather than by any `UserId`, since a synthetic
+    /// id means nothing anywhere but here.
+    ///
+    /// Sent straight to the destination server when there is a link to it,
+    /// and otherwise offered to every linked peer to carry onward: two
+    /// servers with no link between them can still introduce their clients
+    /// through one they share, which is the same path presence already
+    /// takes. Best effort, like every other send here - the client's own
+    /// retry (§7.1) is what makes a lost introduction eventually succeed.
+    pub async fn send_peer_signal(
+        &self,
+        to_server: &str,
+        to_nickname: &str,
+        from: proto::RemoteIdentity,
+        payload: proto::PeerSignalPayload,
+    ) {
+        let signal_id = u64::from_be_bytes(
+            crate::crypto::random_bytes(8).try_into().expect("random_bytes(8) is 8 bytes"),
+        );
+        self.note_signal_seen(signal_id).await;
+        let signal = FederationMessage::PeerSignal {
+            to_server: to_server.to_string(),
+            to_nickname: to_nickname.to_string(),
+            from,
+            payload,
+            hops_left: PEER_SIGNAL_MAX_HOPS,
+            signal_id,
+        };
+        if self.send_to_peer(to_server, signal.clone()).await {
+            return;
+        }
+        broadcast(self, signal, event::PEER_SIGNAL_RELAYED).await;
+    }
+
+    /// Records `signal_id` as seen, answering whether it already was.
+    /// Bounded: the oldest ids are forgotten once the set is full, which
+    /// is all this needs - it exists to break cycles within the few
+    /// seconds a signal is in flight, not to remember anything.
+    async fn note_signal_seen(&self, signal_id: u64) -> bool {
+        let mut seen = self.seen_peer_signals.lock().await;
+        if seen.contains(&signal_id) {
+            return true;
+        }
+        if seen.len() >= PEER_SIGNAL_MEMORY {
+            let oldest = seen.iter().next().copied();
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(signal_id);
+        false
     }
 
     /// Shortens this server's liveness timings, for a test that needs to
@@ -493,6 +562,8 @@ pub mod event {
     pub const OTP_MAIL_FORWARDED: &str = "OTP_MAIL_FORWARDED";
     pub const OTP_MAIL_RECEIVED: &str = "OTP_MAIL_RECEIVED";
     pub const OTP_MAIL_DELIVERED: &str = "OTP_MAIL_DELIVERED";
+    pub const PEER_SIGNAL_RELAYED: &str = "PEER_SIGNAL_RELAYED";
+    pub const PEER_SIGNAL_DELIVERED: &str = "PEER_SIGNAL_DELIVERED";
 }
 
 /// One console line for an operationally-interesting federation event -
@@ -1166,6 +1237,83 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
         }
         FederationMessage::MailForwardAck { mail_id } => {
             ctx.mail_store.forget_after_relay(&mail_id);
+        }
+        FederationMessage::PeerSignal { to_server, to_nickname, from, payload, hops_left, signal_id } => {
+            // Seen before: this came round a cycle, and forwarding it
+            // again is how a small mesh turns one introduction into a
+            // storm. Dropped whether or not it was addressed here - a
+            // duplicate delivery would be harmless but pointless.
+            if ctx.config.note_signal_seen(signal_id).await {
+                return;
+            }
+            if to_server != ctx.config.self_id {
+                // Not for us. Pass it on, if it has hops left - every
+                // linked peer, since this server has no map of who is
+                // linked to whom, and the peer it came from will drop it
+                // as already-seen.
+                if hops_left > 1 {
+                    broadcast(
+                        &ctx.config,
+                        FederationMessage::PeerSignal {
+                            to_server,
+                            to_nickname,
+                            from,
+                            payload,
+                            hops_left: hops_left - 1,
+                            signal_id,
+                        },
+                        event::PEER_SIGNAL_RELAYED,
+                    )
+                    .await;
+                }
+                return;
+            }
+            let outgoing = {
+                let mut reg = ctx.registry.lock().await;
+                let Some(to_id) = reg.id_by_name(&to_nickname) else {
+                    // Addressed to someone not connected here right now.
+                    // Nothing to hold it for: the sender's own retry is
+                    // what makes this eventually land (§7.1).
+                    return;
+                };
+                // The same gate the sending side applied, applied again
+                // here rather than trusted: a peer could name anyone.
+                // Sharing a channel is already what lets two clients on
+                // one server swap addresses, so this asks no more of a
+                // federated pair than of a local one.
+                if !reg.shares_a_channel_with_federated(to_id, &from.server, &from.nickname) {
+                    crate::log_warn!(
+                        "federation peer '{peer_id}' tried to relay a client signal between two \
+                         people who share no channel - ignoring"
+                    );
+                    return;
+                }
+                let from_id = reg.remote_user_info(&from).id;
+                match payload {
+                    proto::PeerSignalPayload::Candidates { candidates, link_nonce } => {
+                        crate::server::Outgoing::new(
+                            to_id,
+                            crate::proto::ServerMessage::PeerCandidates {
+                                from: from_id,
+                                candidates,
+                                link_nonce,
+                            },
+                        )
+                    }
+                    proto::PeerSignalPayload::KeyRotation { new_public_key_der, signature } => {
+                        crate::server::Outgoing::new(
+                            to_id,
+                            crate::proto::ServerMessage::KeyRotated {
+                                from: from_id,
+                                new_public_key_der,
+                                signature,
+                            },
+                        )
+                    }
+                }
+            };
+            log_federation_event(peer_id, event::PEER_SIGNAL_DELIVERED);
+            crate::server::dispatch(&ctx.senders, vec![outgoing]).await;
         }
         FederationMessage::MailReceiptAck { mail_id } => {
             ctx.mail_store.forget_relayed_receipt(&mail_id);

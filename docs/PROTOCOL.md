@@ -119,7 +119,7 @@ falling back to a server relay (§7.1).
   - [18.2 The directory: who owns each nickname and channel](#182-the-directory-who-owns-each-nickname-and-channel)
   - [18.3 Global uniqueness, and what happens on a conflict](#183-global-uniqueness-and-what-happens-on-a-conflict)
   - [18.4 Logging in on the wrong server](#184-logging-in-on-the-wrong-server)
-  - [18.5 What federation does not do yet](#185-what-federation-does-not-do-yet)
+  - [18.5 Introducing two clients on different servers](#185-introducing-two-clients-on-different-servers)
   - [18.6 Joining a channel homed on a different server](#186-joining-a-channel-homed-on-a-different-server)
   - [18.7 OTP mail across servers](#187-otp-mail-across-servers)
   - [18.8 Removing a channel or nickname](#188-removing-a-channel-or-nickname)
@@ -6371,20 +6371,55 @@ which server to use necessarily discloses that the name exists somewhere.
 A nickname unknown anywhere in the federation still gets the ordinary,
 undifferentiated `Rejected`.
 
-### 18.5 What federation does not do yet
+### 18.5 Introducing two clients on different servers
 
-Two clients who are both members of the same federated channel, or who
-have exchanged OTP mail across servers, still cannot exchange a *live*
-message with each other unless they share one server's connection.
-`RequestPeerLink`/`PeerCandidates` (§7.1) are routed purely by local
-`UserId` today, and a member joined via §18.6's proxy has no `UserId` on
-any server but the one it actually connects to. Two members of a shared
-channel connected to *different* federated servers now see each other -
-`UserJoined`/`UserLeft` for a federated member, §18.6 - but still cannot
-punch an ordinary direct link to each other, until the peer-link
-candidate exchange is itself federated: this closes *visibility*, not
-*connectivity*. OTP mail (§18.7) has no such gap, since it was already
-store-and-forward through the server rather than a direct link.
+Two clients cannot punch a direct link (§7.1) without first swapping
+candidate addresses, and the only path they share runs through their
+servers - which is why `RequestPeerLink`/`PeerCandidates` exist at all.
+Within one server that exchange is a lookup in its own connection table.
+Across servers it cannot be: a federated member is shown under a
+synthetic `UserId` its own server minted locally, which names nobody
+anywhere else.
+
+`FederationMessage::PeerSignal` carries that exchange instead, addressed
+by `(server, nickname)` rather than by any id. When a client names a
+federated member, its server translates the id back to the person,
+attaches its own client's identity, and sends it on; the receiving server
+resolves the nickname to its own live connection and delivers an ordinary
+`PeerCandidates`, naming the sender by *its* own synthetic id for them -
+the same one that client already knows them by from `UserJoined`. The
+client needs no knowledge of any of this: it asks for a link exactly as
+it would for someone on its own server.
+
+A signal is sent straight to the destination server when a link to it
+exists, and otherwise offered to every linked peer to pass along, so two
+servers with no link between them can still introduce their clients
+through one they share - the same path presence already takes, and the
+reason a hub topology behaves like a full mesh from a user's point of
+view. `hops_left` and a remembered `signal_id` bound that: a signal is
+never forwarded twice by the same server, and dies after a few hops
+regardless.
+
+Two things ride this relay, both already opaque to any server handling
+them: candidate addresses, and an already-signed key rotation (§13.10).
+Rotation is easy to overlook and matters as much - it is normally routed
+through the server, so for a federated peer it would simply be refused,
+and quietly: messages keep working against the un-rotated keys, and only
+forward secrecy stops, for exactly the peers this exists to connect.
+
+**Relaying is gated on sharing a channel**, checked by the sending server
+and again by the receiving one rather than taken on trust. Synthetic ids
+are minted from a fixed ceiling downwards and so are guessable, and
+clients keep ones they have been told; without the check, naming an id
+would be enough to make a client on another server disclose its candidate
+addresses - its real IPs - to a stranger. Sharing a channel is already
+the condition two clients on one server meet before exchanging those
+addresses, so this asks no more of a federated pair, it just does not
+take the requester's word for it.
+
+Once the link is up, nothing about the conversation touches a server
+again: the introduction is the whole of the server's involvement, and §1's
+doctrine is unchanged.
 
 ### 18.6 Joining a channel homed on a different server
 

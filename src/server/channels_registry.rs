@@ -684,6 +684,24 @@ impl ChannelsRegistry {
             .collect()
     }
 
+    /// Whether local member `id` and the federated member `(server,
+    /// nickname)` are both in at least one of the same channels.
+    ///
+    /// This is the gate on relaying anything between two clients on
+    /// different servers (`FederationMessage::PeerSignal`). Without it,
+    /// asking for a link would be a way to make any client on any
+    /// federated server hand its candidate addresses - its actual IPs - to
+    /// a complete stranger, just by naming them. Sharing a channel is
+    /// already the condition under which two clients on *one* server
+    /// exchange those addresses, so this asks no more than the local case
+    /// does; it just does not take the requester's word for it.
+    pub fn share_a_channel(&self, id: UserId, server: &str, nickname: &str) -> bool {
+        let key = (server.to_string(), nickname.to_string());
+        self.channels
+            .values()
+            .any(|rec| rec.members.contains(&id) && rec.remote_members.contains_key(&key))
+    }
+
     /// Everyone currently in `channel`, as the federation sees them: this
     /// server's own local members (named under `self_id`, their identity
     /// resolved through `user_info_of`) plus every federated member it has

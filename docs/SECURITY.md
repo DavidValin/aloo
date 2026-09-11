@@ -109,7 +109,19 @@ server can name them in the `ChannelMemberJoined` gossip it relays onward
 home server itself, the moment that join is granted; this is the same
 information a client already announces to its own server on connect
 (`Identify`), just now visible to every federated server with a member in
-that channel rather than one. OTP mail relay (§18.7) carries no
+that channel rather than one. Being introduced to a member on another
+server (§18.5) likewise means that client's **candidate addresses** - its
+real IPs, including its local ones - travel through however many servers
+the introduction is relayed by. That exposure is not new in kind: a direct
+link has always meant the two ends learn each other's addresses, and
+within one server those candidates already pass through it. What is new
+is the *set* of parties who see them, which is why relaying is allowed
+only between two people who already share a channel, checked by the
+sending and the receiving server independently rather than taken on
+trust - a synthetic member id is guessable, so without that check naming
+one would be enough to make a stranger's client disclose its addresses.
+A federation you would not trust with that is a federation you should not
+join. OTP mail relay (§18.7) carries no
 equivalent exposure: a relaying server forwards only the opaque
 ciphertext its own client already couldn't read either. Federating with a
 server is choosing to trust its directory (and, for a join-proxy, that
