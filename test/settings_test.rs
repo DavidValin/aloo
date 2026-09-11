@@ -756,6 +756,7 @@ server_federation_bind=0.0.0.0\n\
 server_federation_port=7880\n\
 server_federation_advertise_addr=\n\
 server_federation_identity=~/.aloo/federation/identity\n\
+server_federation_client_addr=\n\
 # server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub\n";
 
 /// The scaffold is only ever *written* once, on first run - but a

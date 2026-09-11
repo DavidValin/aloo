@@ -244,6 +244,21 @@ impl MailStore {
         Some(mail.from)
     }
 
+    /// Forgets a delivery receipt this server only ever held to hand to a
+    /// federated peer, now that the peer has confirmed recording it
+    /// (`FederationMessage::MailReceiptAck`).
+    ///
+    /// Unlike `forget_receipt` below, there is no claimant to check: the
+    /// sender this receipt is *for* is registered on another server and
+    /// can never authenticate here to claim it, which is exactly why the
+    /// ordinary path can never clear it. The peer's ack is the only
+    /// evidence there will ever be that it is safe to drop.
+    pub fn forget_relayed_receipt(&self, mail_id: &str) {
+        if mail_id_is_valid(mail_id) {
+            let _ = std::fs::remove_file(self.delivered_path(mail_id));
+        }
+    }
+
     /// Applies a sender's `OtpMailDeliveredAck`: forgets the receipt if it
     /// exists and genuinely belongs to `claimant`. Returns whether anything
     /// was removed.

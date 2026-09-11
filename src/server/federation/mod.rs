@@ -66,7 +66,58 @@ use proto::{FederationMessage, JoinProxyOutcome};
 /// dialing, or dropped) simply has no entry - `broadcast`/`send_to_peer`
 /// skip it, the same "best effort, not a guaranteed delivery" contract
 /// `Senders` already has for client connections.
-type PeerSenders = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<FederationMessage>>>>;
+type PeerSenders = Arc<Mutex<HashMap<String, LiveLink>>>;
+
+/// One currently-live link to a peer.
+struct LiveLink {
+    /// Distinguishes this link from any other to the same peer, so the
+    /// task that registered it can tell "my entry is still here" from
+    /// "something displaced me and this entry is somebody else's" when it
+    /// comes to tear down. Without that check a displaced task's teardown
+    /// would remove the entry belonging to the link that replaced it.
+    link_id: u64,
+    sender: mpsc::UnboundedSender<FederationMessage>,
+    /// Whether this is the *canonical* direction for this pair - see
+    /// `connection_is_canonical`. A non-canonical link is kept only while
+    /// no canonical one exists, and is displaced the moment one does.
+    canonical: bool,
+    /// Fires when this link has been displaced, so the task holding its
+    /// socket stops promptly instead of reading a connection nothing will
+    /// use again. Both ends displace the same connection (the rule is
+    /// computed from data both of them have), so both drop their halves
+    /// and the socket closes properly. `notify_one` rather than
+    /// `notify_waiters` because it latches: displacement can happen before
+    /// the link's own task reaches the point of waiting, and a missed
+    /// wakeup would leave the socket held until it died of its own accord.
+    /// Correctness does not rest on it arriving, though - `link_id` is
+    /// what keeps a late teardown from touching the wrong entry.
+    displaced: Arc<tokio::sync::Notify>,
+}
+
+/// Whether a connection between `self_id` and `peer_id` is the one the
+/// pair should keep, given which side dialed it: the canonical direction
+/// is "whichever server's id sorts first did the dialing".
+///
+/// Both servers dial each other, so two connections can exist at once -
+/// most likely at startup, when neither has a live link yet to skip the
+/// attempt for. Resolving that by "first one to register wins" is not
+/// enough, because each end races independently: it is entirely possible
+/// for each side to keep the connection *it* dialed and discard the one it
+/// accepted, leaving two half-alive links and no working one. This rule is
+/// computed from `(self_id, peer_id, who dialed)` - which both ends of a
+/// given connection agree on - so both ends always reach the same verdict
+/// about the same socket.
+///
+/// The alternative considered and rejected was to let only the lower-id
+/// server dial at all. That resolves the race just as well but quietly
+/// breaks any deployment where the *higher*-id server is the only publicly
+/// reachable one (the other behind NAT), which an operator can then only
+/// fix by renaming a server - and ids are written into the persisted
+/// nickname directory, so renaming is not free.
+fn connection_is_canonical(self_id: &str, peer_id: &str, i_dialed: bool) -> bool {
+    let dialer_sorts_first = if i_dialed { self_id < peer_id } else { peer_id < self_id };
+    dialer_sorts_first
+}
 
 /// How long a dropped or failed peer link waits before redialing. Fixed
 /// rather than backing off - a small, operator-curated peer set redialing
@@ -96,6 +147,17 @@ pub struct FederationConfig {
     /// perfectly ordinary thing to advertise even though `listen_addr`
     /// itself must be a real bind address.
     pub advertise_addr: String,
+    /// `server_federation_client_addr` - where an ordinary *client*
+    /// should connect for this server, announced to peers in the
+    /// handshake so each one can name it to a user who logged in on the
+    /// wrong server (§18.4). Every other address here is the
+    /// server-to-server port, which no client ever speaks to.
+    pub client_addr: Option<String>,
+    /// What each peer announced as *its* own client-facing address, learned
+    /// at handshake time and kept only while known - the login redirect
+    /// falls back to naming the peer's federation id when a peer's
+    /// operator never configured one.
+    peer_client_addrs: Arc<Mutex<HashMap<String, String>>>,
     /// This server's own durable federation identity - what it signs every
     /// peer-link handshake transcript with (`handshake::handshake`).
     /// Generated once at `server_federation_identity` and never rotated;
@@ -112,11 +174,21 @@ pub struct FederationConfig {
     pub directory: Arc<Mutex<FederationDirectory>>,
     peer_senders: PeerSenders,
     /// Every `JoinProxyRequest` this server is still waiting on an answer
-    /// for, keyed by the id it went out under - `apply_incoming` resolves
-    /// (and removes) one the moment the matching `JoinProxyResponse`
-    /// arrives, on whatever link that happens to be.
-    join_proxy_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<JoinProxyOutcome>>>>,
+    /// for, keyed by the id it went out under, and carrying **which peer
+    /// it went to**: `apply_incoming` resolves (and removes) one only when
+    /// the matching `JoinProxyResponse` arrives on that same peer's link.
+    /// The request id alone is not enough to key on - it is this server's
+    /// own counter from 1, so it is entirely predictable, and without the
+    /// peer check any *other* linked peer could answer a request that was
+    /// never addressed to it and have its verdict believed. A forged
+    /// `Joined` would mirror a channel it does not own into this server
+    /// locally, admitting a client the real owner never checked a
+    /// password, ban or allowlist for.
+    join_proxy_waiters: Arc<Mutex<HashMap<u64, (String, oneshot::Sender<JoinProxyOutcome>)>>>,
     next_request_id: AtomicU64,
+    /// Hands each link a `LiveLink::link_id` - see there for why a link
+    /// needs to be able to recognise its own registration.
+    next_link_id: AtomicU64,
 }
 
 impl FederationConfig {
@@ -130,6 +202,7 @@ impl FederationConfig {
         self_id: String,
         listen_addr: SocketAddr,
         advertise_addr: String,
+        client_addr: Option<String>,
         identity: PqPrivateBundle,
         peers: Vec<FederationPeerConfig>,
         directory: FederationDirectory,
@@ -152,6 +225,8 @@ impl FederationConfig {
             self_id,
             listen_addr,
             advertise_addr,
+            client_addr,
+            peer_client_addrs: Arc::new(Mutex::new(HashMap::new())),
             identity,
             peers,
             peer_keys,
@@ -159,17 +234,23 @@ impl FederationConfig {
             peer_senders: Arc::new(Mutex::new(HashMap::new())),
             join_proxy_waiters: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: AtomicU64::new(1),
+            next_link_id: AtomicU64::new(1),
         })
     }
 
-    /// `<host>:<port>` for the configured peer named `peer_id`, or `None`
-    /// if this server has no such peer configured (it learned of the name
-    /// only through gossip from a third server, or the name is stale).
-    pub fn peer_advertise_addr(&self, peer_id: &str) -> Option<String> {
-        self.peers
-            .iter()
-            .find(|p| p.peer_id == peer_id)
-            .map(|p| format!("{}:{}", p.host, p.port))
+    /// Where an ordinary *client* should be told to connect for peer
+    /// `peer_id` - what a wrong-server login redirect names (§18.4).
+    ///
+    /// Deliberately **not** derived from `server_federation_peer`'s
+    /// host/port: that is the server-to-server port, which no client ever
+    /// speaks to, so naming it sent users somewhere nothing would answer.
+    /// The only address that can be right is the one that peer announces
+    /// for itself (`server_federation_client_addr`, carried in the signed
+    /// part of its `Hello`). `None` when that peer never configured one,
+    /// or has not linked yet - the caller then names the server rather
+    /// than an address it would be guessing at.
+    pub async fn peer_client_addr(&self, peer_id: &str) -> Option<String> {
+        self.peer_client_addrs.lock().await.get(peer_id).cloned()
     }
 
     fn trust(&self) -> FederationTrust<'_> {
@@ -184,7 +265,7 @@ impl FederationConfig {
     /// live link to it right now.
     pub async fn send_to_peer(&self, peer_id: &str, msg: FederationMessage) -> bool {
         let senders = self.peer_senders.lock().await;
-        senders.get(peer_id).is_some_and(|tx| tx.send(msg).is_ok())
+        senders.get(peer_id).is_some_and(|link| link.sender.send(msg).is_ok())
     }
 
     /// Whether a link to `peer_id` is already up - `dial_peer` checks this
@@ -221,7 +302,7 @@ impl FederationConfig {
         };
         let request_id = self.fresh_request_id();
         let (tx, rx) = oneshot::channel();
-        self.join_proxy_waiters.lock().await.insert(request_id, tx);
+        self.join_proxy_waiters.lock().await.insert(request_id, (owner.clone(), tx));
         let sent = self
             .send_to_peer(
                 &owner,
@@ -317,8 +398,8 @@ impl FederationConfig {
 /// actually reached.
 pub async fn broadcast(config: &FederationConfig, msg: FederationMessage, event: &'static str) {
     let senders = config.peer_senders.lock().await;
-    for (peer_id, tx) in senders.iter() {
-        if tx.send(msg.clone()).is_ok() {
+    for (peer_id, link) in senders.iter() {
+        if link.sender.send(msg.clone()).is_ok() {
             log_federation_event(peer_id, event);
         }
     }
@@ -421,7 +502,7 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: FederationContext) ->
         let (tcp, peer_addr) = listener.accept().await?;
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_peer_link(tcp, ctx).await {
+            if let Err(e) = run_peer_link(tcp, ctx, false).await {
                 crate::log_warn!("federation link from {peer_addr} ended: {e}");
             }
         });
@@ -451,9 +532,6 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: FederationContext) ->
 /// has only ever has to break a tie against a genuinely stale link (one
 /// whose peer has not yet noticed its socket died), never a fresh race.
 async fn dial_peer(ctx: FederationContext, peer: FederationPeerConfig) {
-    if ctx.config.self_id >= peer.peer_id {
-        return;
-    }
     loop {
         if !ctx.config.has_live_link(&peer.peer_id).await {
             if let Err(e) = dial_once(&ctx, &peer).await {
@@ -471,7 +549,7 @@ async fn dial_peer(ctx: FederationContext, peer: FederationPeerConfig) {
 
 async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std::io::Result<()> {
     let tcp = TcpStream::connect((peer.host.as_str(), peer.port)).await?;
-    run_peer_link(tcp, ctx.clone()).await
+    run_peer_link(tcp, ctx.clone(), true).await
 }
 
 /// One federation link's lifetime, either direction: runs the PQ-hybrid
@@ -480,15 +558,32 @@ async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std:
 /// link to the same peer, exchanges directory snapshots, reconciles any
 /// mail owed to/from that peer, then relays gossip and proxy traffic until
 /// the link drops.
-async fn run_peer_link(tcp: TcpStream, ctx: FederationContext) -> std::io::Result<()> {
+async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -> std::io::Result<()> {
     let (rd, wr) = tokio::io::split(tcp);
     let mut rd = ControlReader::new(rd);
     let mut wr = ControlWriter::new(wr);
 
-    let peer_id = match handshake::handshake(&mut rd, &mut wr, &ctx.config.trust(), &ctx.config.advertise_addr)
-        .await
+    let peer_id = match handshake::handshake(
+        &mut rd,
+        &mut wr,
+        &ctx.config.trust(),
+        &ctx.config.advertise_addr,
+        ctx.config.client_addr.as_deref(),
+    )
+    .await
     {
-        Ok((peer_id, _advertise_addr)) => peer_id,
+        Ok(announcement) => {
+            // Only now that the signature covering it has been checked is
+            // any of what the peer announced worth believing.
+            if let Some(client_addr) = announcement.client_addr {
+                ctx.config
+                    .peer_client_addrs
+                    .lock()
+                    .await
+                    .insert(announcement.peer_id.clone(), client_addr);
+            }
+            announcement.peer_id
+        }
         Err(HandshakeError::ClaimsSelf(peer_id)) => {
             // Never a link worth keeping: `peer_senders` is keyed by id,
             // and inserting under this server's own id would make
@@ -509,23 +604,57 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext) -> std::io::Resul
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<FederationMessage>();
+    let link_id = ctx.config.next_link_id.fetch_add(1, Ordering::Relaxed);
+    let canonical = connection_is_canonical(&ctx.config.self_id, &peer_id, i_dialed);
+    let displaced = Arc::new(tokio::sync::Notify::new());
     {
+        // One logical link per peer pair. Both sides dial, so two
+        // connections can exist at once; which one survives has to be a
+        // decision both ends of a given socket reach identically, or they
+        // each keep a different one and neither works. That decision is
+        // `connection_is_canonical`, applied here:
+        //
+        // - nothing registered yet: keep this one, canonical or not. A
+        //   single connection is better than none, which is what makes a
+        //   peer reachable in only one direction (NAT, a firewall) work.
+        // - something registered, and this one is canonical while that one
+        //   is not: displace it. The other end of *that* socket reaches the
+        //   same verdict about it, so both sides let it go.
+        // - anything else: this connection is the redundant one, so drop it.
         let mut senders = ctx.config.peer_senders.lock().await;
-        // One logical link per peer pair: if both sides dialed each other
-        // at once, or a stale link hasn't noticed its socket died yet, the
-        // later `Hello` for the same id simply doesn't get a link.
-        if senders.contains_key(&peer_id) {
-            return Ok(());
+        match senders.get(&peer_id) {
+            Some(existing) if existing.canonical || !canonical => return Ok(()),
+            Some(existing) => existing.displaced.notify_one(),
+            None => {}
         }
-        senders.insert(peer_id.clone(), tx);
+        senders.insert(
+            peer_id.clone(),
+            LiveLink { link_id, sender: tx, canonical, displaced: displaced.clone() },
+        );
     }
     log_federation_event(&peer_id, event::LINK_UP);
 
     let (nicknames, channels) = ctx.config.directory.lock().await.snapshot();
+    let owned_channels: Vec<String> = channels
+        .iter()
+        .filter(|info| info.owner == ctx.config.self_id)
+        .map(|info| info.name.clone())
+        .collect();
     let _ = wr.send(&FederationMessage::DirectorySnapshot { nicknames, channels }).await;
+    // Presence gossip is live-only, so a peer linking up now has missed
+    // every join that happened before it - and, if this is a relink, has
+    // deliberately forgotten what it knew. Only the home server can say
+    // who is in one of its channels, so send that here, once, per channel
+    // it owns that anyone is actually in.
+    for channel in owned_channels {
+        let members = ctx.registry.lock().await.federated_membership_of(&channel, &ctx.config.self_id);
+        if !members.is_empty() {
+            let _ = wr.send(&FederationMessage::ChannelMembership { channel, members }).await;
+        }
+    }
     sync_mail_with_peer(&ctx, &peer_id).await;
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if wr.send(&msg).await.is_err() {
                 break;
@@ -533,18 +662,71 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext) -> std::io::Resul
         }
     });
 
+    let mut displaced_by_another_link = false;
     loop {
-        match rd.recv::<FederationMessage>().await {
-            Ok(Some(msg)) => apply_incoming(&ctx, &peer_id, msg).await,
-            Ok(None) => break,
-            Err(e) => {
-                crate::log_warn!("federation link to '{peer_id}' failed: {e}");
+        tokio::select! {
+            incoming = rd.recv::<FederationMessage>() => match incoming {
+                Ok(Some(msg)) => apply_incoming(&ctx, &peer_id, msg).await,
+                Ok(None) => break,
+                Err(e) => {
+                    crate::log_warn!("federation link to '{peer_id}' failed: {e}");
+                    break;
+                }
+            },
+            // The writer gave up - its half of the socket refused a send,
+            // so this link is dead in the send direction and therefore
+            // dead. Without watching for it, only the *reader* ever tears
+            // a link down, and a half-open socket (the peer's host gone,
+            // a NAT dropping its state, a router reboot) never gives the
+            // reader anything: writes fail, reads block forever, and the
+            // now-useless `tx` stays in `peer_senders` - so `has_live_link`
+            // keeps telling `dial_peer` not to redial while every message
+            // routed through it is silently dropped. No `LINK_DOWN`, no
+            // reconnect, no diagnostic, until the process restarts.
+            //
+            // Cancelling the in-flight `rd.recv()` here is safe precisely
+            // because we leave immediately: `ControlReader::recv` is not
+            // cancel-safe (a partially read frame is lost), but nothing
+            // reads this stream again - it is dropped on the way out.
+            _ = &mut writer_task => {
+                crate::log_warn!(
+                    "federation link to '{peer_id}' could not be written to - dropping it so it redials"
+                );
+                break;
+            }
+            // A better connection to the same peer took this one's place
+            // (see the registration above). Stop reading a socket nothing
+            // will use again, rather than parking on it forever.
+            _ = displaced.notified() => {
+                displaced_by_another_link = true;
                 break;
             }
         }
     }
 
-    ctx.config.peer_senders.lock().await.remove(&peer_id);
+    // Only tear down an entry this task still owns. A displaced link's
+    // entry already belongs to the connection that replaced it, and
+    // removing that would take down the working link and strand the pair
+    // until the next redial - the notification above is best effort, so
+    // this check, not that one, is what actually makes it safe.
+    let still_ours = {
+        let mut senders = ctx.config.peer_senders.lock().await;
+        if senders.get(&peer_id).is_some_and(|link| link.link_id == link_id) {
+            senders.remove(&peer_id);
+            true
+        } else {
+            false
+        }
+    };
+    if !still_ours || displaced_by_another_link {
+        writer_task.abort();
+        return Ok(());
+    }
+    // Presence learned from this peer dies with the link - see
+    // `ChannelsRegistry::forget_members_of_server` for why holding onto it
+    // would be worse than forgetting it.
+    let departed = ctx.registry.lock().await.forget_federated_members_of(&peer_id);
+    crate::server::dispatch(&ctx.senders, departed).await;
     log_federation_event(&peer_id, event::LINK_DOWN);
     writer_task.abort();
     Ok(())
@@ -740,8 +922,22 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             }
         }
         FederationMessage::JoinProxyResponse { request_id, outcome } => {
-            if let Some(tx) = ctx.config.join_proxy_waiters.lock().await.remove(&request_id) {
-                let _ = tx.send(outcome);
+            // Only the peer the request actually went to may answer it -
+            // see `join_proxy_waiters`' own doc for what believing anyone
+            // else would let a hostile peer mirror into this server. A
+            // mismatch leaves the waiter in place so the real peer's
+            // answer (or the timeout) still decides.
+            let mut waiters = ctx.config.join_proxy_waiters.lock().await;
+            let answered_by_the_right_peer =
+                waiters.get(&request_id).is_some_and(|(owner, _)| owner == peer_id);
+            if answered_by_the_right_peer {
+                if let Some((_, tx)) = waiters.remove(&request_id) {
+                    let _ = tx.send(outcome);
+                }
+            } else {
+                crate::log_warn!(
+                    "federation peer '{peer_id}' answered a join proxy request it was never sent - ignoring"
+                );
             }
         }
         FederationMessage::LeaveProxyNotice { channel, nickname } => {
@@ -773,6 +969,26 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
                 }
             }
         }
+        FederationMessage::ChannelMembership { channel, members } => {
+            // Authoritative, and only from the server that actually owns
+            // the channel - a peer cannot rewrite the membership of a
+            // channel that is not its to describe.
+            let owned_by_sender = matches!(
+                ctx.config.directory.lock().await.owner_of_channel(&channel),
+                Some(info) if info.owner == peer_id
+            );
+            if owned_by_sender {
+                let outgoing = ctx
+                    .registry
+                    .lock()
+                    .await
+                    .replace_mirrored_members(&channel, &ctx.config.self_id, members);
+                if !outgoing.is_empty() {
+                    log_federation_event(peer_id, event::CHANNEL_MEMBER_JOINED);
+                    crate::server::dispatch(&ctx.senders, outgoing).await;
+                }
+            }
+        }
         FederationMessage::ChannelMemberLeft { channel, server, nickname } => {
             // Mirror of the guard above: a departure naming *this* server
             // is this server's own local client leaving, already handled
@@ -798,6 +1014,18 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             // server's copy survives and `sync_mail_with_peer` retries it
             // on the next reconnect.
             let mail_id = mail.mail_id.clone();
+            // Already delivered here, and the forwarding server simply
+            // never heard the ack (it was lost, or the link dropped before
+            // it arrived - `sync_mail_with_peer` re-forwards everything
+            // still pending on reconnect). Storing it again would
+            // resurrect a `pending/` entry for mail the recipient has had
+            // for days and push the ciphertext at them a second time. The
+            // ack is what it is actually waiting for, so send that and
+            // nothing else.
+            if ctx.mail_store.is_delivered(&mail_id) {
+                ctx.config.send_to_peer(peer_id, FederationMessage::MailForwardAck { mail_id }).await;
+                return;
+            }
             if ctx.mail_store.store(&mail).is_ok() {
                 let outgoing = {
                     let reg = ctx.registry.lock().await;
@@ -811,9 +1039,17 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
         FederationMessage::MailForwardAck { mail_id } => {
             ctx.mail_store.forget_after_relay(&mail_id);
         }
+        FederationMessage::MailReceiptAck { mail_id } => {
+            ctx.mail_store.forget_relayed_receipt(&mail_id);
+        }
         FederationMessage::MailDeliveredReceipt { mail_id, from, to } => {
             let receipt = mail::DeliveredReceipt { mail_id: mail_id.clone(), from: from.clone(), to };
             if ctx.mail_store.record_relayed_receipt(&receipt).is_ok() {
+                // Recorded durably, so the relaying server may forget the
+                // copy it has been re-sending on every reconnect.
+                ctx.config
+                    .send_to_peer(peer_id, FederationMessage::MailReceiptAck { mail_id: mail_id.clone() })
+                    .await;
                 log_federation_event(peer_id, event::OTP_MAIL_DELIVERED);
                 if let Some(sender_id) = ctx.registry.lock().await.id_by_name(&from) {
                     crate::server::dispatch(

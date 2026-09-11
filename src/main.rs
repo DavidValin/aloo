@@ -597,6 +597,17 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
             "server_federation_enabled is on but server_federation_id is not set - a server \
              needs its own id to be gossiped about",
         )?;
+        // Peer ids were validated when `server_federation_peer` was
+        // parsed; this server's own id never was, and it is written into
+        // the persisted nickname directory as an owner.
+        if !server::federation::directory::owner_id_is_storable(&self_id) {
+            return Err(format!(
+                "server_federation_id {self_id:?} cannot be used: it must not be empty or contain \
+                 a tab, newline or comma - those are the separators the federation directory is \
+                 stored with"
+            )
+            .into());
+        }
         let listen_addr = validation::parse_bind_addr(
             &settings.server_federation_bind,
             settings.server_federation_port,
@@ -619,6 +630,7 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
             self_id.clone(),
             listen_addr,
             advertise_addr,
+            settings.server_federation_client_addr.clone(),
             identity,
             settings.server_federation_peers.clone(),
             directory,

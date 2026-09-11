@@ -1025,6 +1025,15 @@ pub struct Settings {
     /// Generated on first use if `<prefix>.priv`/`<prefix>.pub` don't exist
     /// yet; the `.pub` half is what gets copied to peers.
     pub server_federation_identity: String,
+    /// The `host:port` an ordinary *client* should be told to connect to
+    /// for this server - what a peer repeats back to a user who tried to
+    /// log in on the wrong one ("connect to <host:port> instead", §18.4).
+    /// Distinct from every other address here: `server_federation_*` are
+    /// all the server-to-server port, which no client ever speaks to.
+    /// Announced to peers over the link, so it is set once here rather
+    /// than repeated in every other server's peer list. Unset means a
+    /// redirect can only name this server's federation id.
+    pub server_federation_client_addr: Option<String>,
     /// One `server_federation_peer=...` line per trusted peer
     /// (`FederationPeerConfig`) - the complete federation trust set. No
     /// peer here means federation is configured on but has nobody to link
@@ -1267,6 +1276,7 @@ impl Default for Settings {
             server_federation_port: DEFAULT_FEDERATION_PORT,
             server_federation_advertise_addr: None,
             server_federation_identity: DEFAULT_SERVER_FEDERATION_IDENTITY.to_string(),
+            server_federation_client_addr: None,
             server_federation_peers: Vec::new(),
             otp_binary_path: None,
             otp_keypair_size_mb: DEFAULT_OTP_KEYPAIR_SIZE_MB,
@@ -1409,6 +1419,7 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         Key("server_federation_port"),
         Key("server_federation_advertise_addr"),
         Key("server_federation_identity"),
+        Key("server_federation_client_addr"),
         Literal("# server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub"),
     ]
 };
@@ -1576,6 +1587,9 @@ impl Settings {
                 }
                 "server_federation_identity" if !value.is_empty() => {
                     settings.server_federation_identity = value.to_string();
+                }
+                "server_federation_client_addr" if !value.is_empty() => {
+                    settings.server_federation_client_addr = Some(value.to_string());
                 }
                 "server_federation_peer" => {
                     if let Ok(peer) = FederationPeerConfig::parse(value) {
@@ -1797,6 +1811,10 @@ impl Settings {
                 self.server_federation_advertise_addr.as_deref(),
             ),
             always("server_federation_identity", &self.server_federation_identity),
+            always_optional(
+                "server_federation_client_addr",
+                self.server_federation_client_addr.as_deref(),
+            ),
             always("otp_keypair_size_mb", self.otp_keypair_size_mb),
             always("otp_low_key_warn_pct", self.otp_low_key_warn_pct),
             always("otp_status_poll_interval", self.otp_status_poll_interval),

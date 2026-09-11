@@ -234,10 +234,24 @@ impl FederationDirectory {
     /// applied both to each entry of an incoming `DirectorySnapshot` and
     /// to a live `NicknameRegistered` gossip message (and, via
     /// `record_local_nickname`, to this server's own registrations too).
-    /// Never refuses: `Ownership::merge` is what turns a real collision
-    /// into `Conflicted` rather than silently picking a winner, whichever
-    /// side of the race called it.
+    /// Never refuses a *collision*: `Ownership::merge` is what turns a
+    /// real one into `Conflicted` rather than silently picking a winner,
+    /// whichever side of the race called it.
+    ///
+    /// It does refuse a name or owner that could not have been registered
+    /// here in the first place, and that check is not cosmetic: these
+    /// entries are persisted as `"{name}\t{spec}\n"`, with a conflict's
+    /// claimants joined by `,`, so a peer gossiping a nickname containing
+    /// a newline could write whole extra lines of its own choosing into
+    /// this server's directory - marking any name it liked `Conflicted`,
+    /// federation-wide and across restarts - and one containing a tab or a
+    /// comma could forge the owner field. A peer is trusted to say who
+    /// owns what; it is not trusted to write arbitrary bytes into a file
+    /// this server parses on every start.
     pub fn merge_remote_nickname(&mut self, nickname: String, owner: String) -> io::Result<()> {
+        if !crate::validation::nickname_is_registrable(&nickname) || !owner_id_is_storable(&owner) {
+            return Ok(());
+        }
         self.nicknames
             .entry(nickname)
             .and_modify(|o| o.merge(&owner))
@@ -296,7 +310,17 @@ impl FederationDirectory {
     /// a `Conflicted` channel name simply isn't proxy-routable, and
     /// blocks a fresh creation of the same name, until an operator
     /// renames one side.
+    /// A name or owner that could not have been created here is dropped,
+    /// for the same reason `merge_remote_nickname` drops one: a peer says
+    /// who owns what, it does not get to choose the bytes this server
+    /// stores and shows. (The channel directory is in memory only, so
+    /// there is no file to corrupt here - but a name no local client could
+    /// ever type would be permanently unroutable and permanently listed,
+    /// which is its own small denial of service.)
     pub fn merge_remote_channel(&mut self, info: FederatedChannelInfo) {
+        if !crate::validation::channel_name_is_valid(&info.name) || !owner_id_is_storable(&info.owner) {
+            return;
+        }
         self.channels
             .entry(info.name.clone())
             .and_modify(|existing| merge_channel_entry(existing, info.clone()))
@@ -333,6 +357,21 @@ impl FederationDirectory {
             }
         }
     }
+}
+
+/// Whether a `server_federation_id` may be written into this directory as
+/// an owner. Beyond `is_storable`'s tab/newline rule (this file is
+/// tab-separated, one entry per line), a comma is refused too: a
+/// `Conflicted` entry encodes its claimants as a comma-joined list, so an
+/// id containing one would come back from disk as two different servers.
+///
+/// Checked on the way *in* from a peer (`merge_remote_nickname`,
+/// `merge_remote_channel`) and on the way *out* of settings, where
+/// `main.rs` refuses to start a server whose own id fails it - the peer
+/// ids in `server_federation_peer` were already validated when parsed,
+/// but a server's own `server_federation_id` never was.
+pub fn owner_id_is_storable(owner: &str) -> bool {
+    !owner.is_empty() && crate::validation::is_storable(owner) && !owner.contains(',')
 }
 
 fn encode_ownership(ownership: &Ownership) -> String {

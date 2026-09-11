@@ -53,6 +53,7 @@ if [ -n "${ALOO_FEDERATION_ENABLED:-}" ]; then
     [ -n "${ALOO_FEDERATION_PORT:-}" ] && set_setting server_federation_port "$ALOO_FEDERATION_PORT"
     [ -n "${ALOO_FEDERATION_ADVERTISE_ADDR:-}" ] && set_setting server_federation_advertise_addr "$ALOO_FEDERATION_ADVERTISE_ADDR"
     [ -n "${ALOO_FEDERATION_IDENTITY:-}" ] && set_setting server_federation_identity "$ALOO_FEDERATION_IDENTITY"
+    [ -n "${ALOO_FEDERATION_CLIENT_ADDR:-}" ] && set_setting server_federation_client_addr "$ALOO_FEDERATION_CLIENT_ADDR"
     if [ -n "${ALOO_FEDERATION_PEERS:-}" ]; then
         touch "$settings_file"
         # `server_federation_peer` is a repeated key, unlike `set_setting`'s

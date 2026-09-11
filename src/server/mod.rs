@@ -255,12 +255,12 @@ pub struct Registry {
     /// member this server has ever displayed (in a `UserJoined`/`UserLeft`
     /// for a channel it mirrors) - minted lazily the first time a given
     /// (server, nickname) is seen, from `next_remote_id` counting *down*
-    /// from `u64::MAX` rather than `next_id`'s own count up from 1, so the
-    /// two id spaces can never collide regardless of how long either
-    /// server runs. Never forgotten (no cleanup on a departure): the
-    /// reservation is cheap to keep and means the same federated person
-    /// keeps the same id across every channel and every rejoin, for the
-    /// life of this server's process.
+    /// from `FEDERATED_ID_CEILING` rather than `next_id`'s own count up
+    /// from 1, so the two id spaces can never collide regardless of how
+    /// long either server runs. Never forgotten (no cleanup on a
+    /// departure): the reservation is cheap to keep and means the same
+    /// federated person keeps the same id across every channel and every
+    /// rejoin, for the life of this server's process.
     remote_ids: HashMap<(String, String), UserId>,
     next_remote_id: u64,
 }
@@ -270,6 +270,30 @@ impl Default for Registry {
         Self::new()
     }
 }
+
+/// The highest `UserId` a federated member may ever be given, and the one
+/// `mint_remote_user_id` starts counting *down* from.
+///
+/// Deliberately **not** `u64::MAX`, for two independent reasons, both in
+/// the client:
+///
+/// - `client::p2p::direct_peer_id` mints its own synthetic ids for
+///   serverless direct-punch peers as `hash | 0x8000_0000_0000_0000`, and
+///   `is_direct_peer_id` asks nothing more than whether that top bit is
+///   set. An id with the top bit set is therefore read by every client as
+///   "a peer no server has ever heard of", which makes
+///   `p2p::PeerLink::ensure_link` short-circuit to `Pending` forever: the
+///   member would sit permanently yellow in the sidebar and anything sent
+///   to them would queue silently, with no error and no timeout.
+/// - `client::voice_call` uses `UserId(u64::MAX)` itself as its "own id
+///   not known yet" sentinel, which the very first federated member a
+///   server ever displayed would otherwise be handed exactly.
+///
+/// Staying below the top bit keeps both of those distinctions intact while
+/// preserving the only property the counting-down trick needs: a real
+/// local id (counting up from 1) would have to be handed out ~9.2
+/// quintillion times to reach it.
+const FEDERATED_ID_CEILING: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 
 /// The free-function form of `Registry::remote_user_id`/`remote_user_info`,
 /// taking `remote_ids`/`next_remote_id` directly rather than `&mut
@@ -317,7 +341,7 @@ impl Registry {
             next_id: 1,
             channels: channels_registry::ChannelsRegistry::new(None),
             remote_ids: HashMap::new(),
-            next_remote_id: u64::MAX,
+            next_remote_id: FEDERATED_ID_CEILING,
         }
     }
 
@@ -329,7 +353,7 @@ impl Registry {
             next_id: 1,
             channels: channels_registry::ChannelsRegistry::new(period),
             remote_ids: HashMap::new(),
-            next_remote_id: u64::MAX,
+            next_remote_id: FEDERATED_ID_CEILING,
         }
     }
 
@@ -479,6 +503,49 @@ impl Registry {
         })
     }
 
+    /// Everyone currently in `channel`, federation-wide - see
+    /// `channels_registry::ChannelsRegistry::federated_membership_of`.
+    pub fn federated_membership_of(
+        &self,
+        channel: &str,
+        self_id: &str,
+    ) -> Vec<federation::proto::RemoteIdentity> {
+        let clients = &self.clients;
+        self.channels.federated_membership_of(channel, self_id, |uid| {
+            clients.get(&uid).map(|c| UserInfo {
+                id: uid,
+                name: c.name.clone(),
+                public_key_der: c.public_key_der.clone(),
+                key_mode: c.key_mode,
+            })
+        })
+    }
+
+    /// Applies a home server's authoritative membership list - see
+    /// `channels_registry::ChannelsRegistry::replace_mirrored_members`.
+    pub fn replace_mirrored_members(
+        &mut self,
+        channel: &str,
+        self_id: &str,
+        members: Vec<federation::proto::RemoteIdentity>,
+    ) -> Vec<Outgoing> {
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.replace_mirrored_members(channel, self_id, members, |identity| {
+            mint_remote_user_info(remote_ids, next_remote_id, identity)
+        })
+    }
+
+    /// Forgets every federated member connected through `server` - see
+    /// `channels_registry::ChannelsRegistry::forget_members_of_server`.
+    pub fn forget_federated_members_of(&mut self, server: &str) -> Vec<Outgoing> {
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.forget_members_of_server(server, |server, nickname| {
+            mint_remote_user_id(remote_ids, next_remote_id, server, nickname)
+        })
+    }
+
     /// "Fully shared channel list" - see
     /// `channels_registry::ChannelsRegistry::ensure_public_mirror`.
     pub fn ensure_public_channel_known(&mut self, name: &str, kind: ChannelKind) -> bool {
@@ -615,18 +682,26 @@ impl Registry {
     }
 
     /// `/ban <nickname>`: `caller` must currently administer `channel`.
+    /// The `(server, nickname)` pairs alongside the outgoing messages are
+    /// the *federated* members the ban removed - the caller gossips a
+    /// `ChannelMemberLeft` for each so the rest of the federation stops
+    /// listing them (`server::federation_announce_ban`).
     pub fn ban_from_channel(
         &mut self,
         caller: UserId,
         channel: &str,
         target_nickname: &str,
-    ) -> Result<Vec<Outgoing>, String> {
+    ) -> Result<(Vec<Outgoing>, Vec<(String, String)>), String> {
         let caller_name = self
             .user_info(caller)
             .ok_or_else(|| "unknown user".to_string())?
             .name;
         let target_id = self.id_by_name(target_nickname);
-        self.channels.ban(&caller_name, channel, target_nickname, target_id)
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.ban(&caller_name, channel, target_nickname, target_id, |server, nickname| {
+            mint_remote_user_id(remote_ids, next_remote_id, server, nickname)
+        })
     }
 
     /// `/unban <nickname>`: `caller` must currently administer `channel`.
@@ -1209,15 +1284,20 @@ async fn federation_login_precheck(options: &ServerOptions, nickname: &str) -> O
     if options.users.is_registered(nickname) {
         return None;
     }
-    match federation.directory.lock().await.owner_of_nickname(nickname)? {
-        federation::directory::Ownership::Owned(owner) if *owner == federation.self_id => None,
-        federation::directory::Ownership::Owned(owner) => Some(AuthCheck::RegisteredElsewhere {
-            server_addr: federation
-                .peer_advertise_addr(owner)
-                .unwrap_or_else(|| owner.clone()),
-        }),
-        federation::directory::Ownership::Conflicted(_) => Some(AuthCheck::Conflicted),
-    }
+    let owner = match federation.directory.lock().await.owner_of_nickname(nickname)? {
+        federation::directory::Ownership::Owned(owner) if *owner == federation.self_id => return None,
+        federation::directory::Ownership::Owned(owner) => owner.clone(),
+        federation::directory::Ownership::Conflicted(_) => return Some(AuthCheck::Conflicted),
+    };
+    // The address that peer announces for its *clients*, never the
+    // federation address this server dials it on - see
+    // `FederationConfig::peer_client_addr`. Falling back to the server's
+    // federation id rather than guessing at an address keeps the answer
+    // honest: "your account is on serverB" is useful; "connect to
+    // serverb.example.com:7880" is a port nothing would answer on.
+    Some(AuthCheck::RegisteredElsewhere {
+        server_addr: federation.peer_client_addr(&owner).await.unwrap_or(owner),
+    })
 }
 
 /// If `name` is a channel the federation directory says a *different*
@@ -1416,6 +1496,34 @@ async fn federation_announce_channel_member(options: &ServerOptions, name: &str,
     .await;
 }
 
+/// Tells every linked peer that a `/ban` just removed a *federated*
+/// member from one of this server's channels, so they stop listing
+/// someone the channel's own admin has thrown out. Reuses
+/// `ChannelMemberLeft` rather than inventing a ban-specific message:
+/// every other server only mirrors presence, and the ban itself is
+/// enforced where it lives - here, on the home server, at the next
+/// `JoinProxyRequest`.
+async fn federation_announce_ban(
+    options: &ServerOptions,
+    channel: &str,
+    member_server: &str,
+    nickname: &str,
+) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    federation::broadcast(
+        federation,
+        federation::proto::FederationMessage::ChannelMemberLeft {
+            channel: channel.to_string(),
+            server: member_server.to_string(),
+            nickname: nickname.to_string(),
+        },
+        federation::event::CHANNEL_MEMBER_LEFT,
+    )
+    .await;
+}
+
 /// The departure mirror of `federation_announce_channel_member` - see its
 /// doc for why this is a no-op unless `name` is owned by this server.
 async fn federation_announce_channel_member_left(options: &ServerOptions, name: &str, nickname: &str) {
@@ -1580,7 +1688,15 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     or_refuse(id, result)
                 }
                 ClientMessage::BanFromChannel { channel, nickname } => {
-                    or_refuse(id, reg.ban_from_channel(id, &channel, &nickname))
+                    match reg.ban_from_channel(id, &channel, &nickname) {
+                        Ok((outgoing, banned_federated)) => {
+                            for (server, nickname) in banned_federated {
+                                federation_announce_ban(options, &channel, &server, &nickname).await;
+                            }
+                            outgoing
+                        }
+                        Err(reason) => Outgoing::refuse(id, reason),
+                    }
                 }
                 ClientMessage::UnbanFromChannel { channel, nickname } => {
                     or_refuse(id, reg.unban_from_channel(id, &channel, &nickname))

@@ -634,17 +634,28 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 
 Two or more servers can share one nickname/channel namespace instead of each being its own island — a nickname or channel registered on one is refused as a duplicate on the others, and logging in with a nickname registered elsewhere in the federation tells you which server to use instead of a plain "authentication failed". This is entirely server-side settings, in `~/.aloo/settings` on each server's own machine — there's nothing to configure on the client.
 
-Each server needs its own federation identity — a PQ-hybrid keypair, the same kind a client's `my_key` uses, generated automatically the first time federation starts (no TLS or certificates involved; federation links are mutually authenticated by this identity instead, unlike the client-facing connection) — and a line naming every other server it trusts:
+Each server needs its own federation identity — a PQ-hybrid keypair, the same kind a client's `my_key` uses (no TLS or certificates involved; federation links are mutually authenticated by this identity instead, unlike the client-facing connection). Generate it on each server *before* configuring peers, since each side needs the other's public half to start:
+
+```
+aloo --keygen-pq-hybrid ~/.aloo/federation/identity
+```
+
+That writes `identity.priv` and `identity.pub`. Send each server's `.pub` to the other out of band, then configure both:
 
 ```
 server_federation_enabled=on
 server_federation_id=serverA
 server_federation_port=7880
 server_federation_identity=~/.aloo/federation/identity
+server_federation_client_addr=servera.example.com:7878
 server_federation_peer=serverB,serverb.example.com,7880,~/.aloo/federation/serverB.pub
 ```
 
-`server_federation_peer` is one line per trusted peer: its id, host, port, and the public key file to pin its identity to (send it that file out of band, once federation has started and generated `server_federation_identity`'s `.pub` half — federation trusts a specific public key, never a certificate authority). Add the mirror image on `serverB`'s own settings, naming `serverA` and pointing at `serverA`'s public key, and the two link up automatically (only the server whose id sorts first alphabetically actually dials — the other just listens for it).
+`server_federation_peer` is one line per trusted peer: its id, host, federation port, and the public key file to pin its identity to (federation trusts a specific public key, never a certificate authority). Add the mirror image on `serverB`'s own settings, naming `serverA` and pointing at `serverA`'s public key, and the two link up automatically — both dial, and they settle on a single link between them, so it's enough for *either* one to be reachable.
+
+`server_federation_client_addr` is the odd one out: every other address here is the server-to-server port, which no client ever speaks to. This is what a *user* gets told to connect to when they try to log in on the wrong server ("your account is on serverB — connect to servera.example.com:7878 instead"), so it's the ordinary client port. Peers learn it over the link, so you set it once here rather than repeating it in everyone else's config. Leave it out and the redirect just names the server instead of an address.
+
+A server will refuse to start if federation is on and `server_federation_id` is empty or contains a tab, newline or comma — those are the separators its directory file is stored with.
 
 You can join a channel that lives on a different federated server by name, and send OTP mail to someone registered on one — both are proxied/relayed to the right server automatically. What doesn't work yet is a live chat between two people connected to *different* federated servers, even in a channel they're both members of — direct peer-to-peer links are still only set up between people sharing one server; see `docs/PROTOCOL.md` §18.5.
 

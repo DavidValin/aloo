@@ -111,6 +111,10 @@ ENV ALOO_FEDERATION_ID=""
 ENV ALOO_FEDERATION_PORT=""
 ENV ALOO_FEDERATION_ADVERTISE_ADDR=""
 ENV ALOO_FEDERATION_IDENTITY=""
+# Where clients (not peers) should connect for this server - what a peer
+# names when redirecting a user who logged in on the wrong one. The
+# client-facing port, never the federation one.
+ENV ALOO_FEDERATION_CLIENT_ADDR=""
 ENV ALOO_FEDERATION_PEERS=""
 
 # TCP carries client connections; UDP is the rendezvous socket clients use

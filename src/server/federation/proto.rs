@@ -68,6 +68,13 @@ pub enum FederationMessage {
     Hello {
         self_id: String,
         advertise_addr: String,
+        /// Where an ordinary *client* should connect for this server
+        /// (`server_federation_client_addr`), so a peer can name it to a
+        /// user who logged in on the wrong server (§18.4). `None` if its
+        /// operator never configured one. Every other address on a
+        /// federation link is the server-to-server port, which no client
+        /// ever speaks to - which is exactly the bug this closes.
+        client_addr: Option<String>,
         ephemeral_encap: PqEncapKeys,
         nonce: [u8; 32],
     },
@@ -163,6 +170,18 @@ pub enum FederationMessage {
     /// identify the leaving member the same way `RemoteIdentity` does,
     /// without needing to repeat their key material.
     ChannelMemberLeft { channel: String, server: String, nickname: String },
+    /// Who is in `channel` *right now*, in full, sent by its home server
+    /// to a peer whose link has just come up - one message per channel it
+    /// owns that has anyone in it. `ChannelMemberJoined`/`ChannelMemberLeft`
+    /// are live-only: gossip sent while a link was down is never re-sent,
+    /// so without this a peer that linked late (or relinked after a drop,
+    /// having forgotten that peer's members - see
+    /// `ChannelsRegistry::forget_members_of_server`) would show a busy
+    /// channel as empty, forever. The list is authoritative and *replaces*
+    /// what the receiver had for that channel, rather than merging into
+    /// it, which is what lets it correct a stale member as well as a
+    /// missing one.
+    ChannelMembership { channel: String, members: Vec<RemoteIdentity> },
 
     /// Hands an uploaded OTP mail's opaque ciphertext (plus its routing
     /// metadata) to the federated server that owns `mail.to` - the
@@ -178,6 +197,16 @@ pub enum FederationMessage {
     /// mail was delivered, exactly as it would if the sender and
     /// recipient shared one server.
     MailDeliveredReceipt { mail_id: String, from: String, to: String },
+    /// Confirms a `MailDeliveredReceipt` was recorded, so the relaying
+    /// server can drop its own copy - the mirror of `MailForwardAck`, and
+    /// needed for the same reason. A receipt for a *cross-server* sender
+    /// can never be cleared the ordinary way (`MailStore::forget_receipt`
+    /// requires the sender themselves to claim it, and they authenticate
+    /// on a different server entirely), so without this every relayed
+    /// receipt lives forever on the recipient's server and is re-sent in
+    /// full on every single reconnect - growing with all-time cross-server
+    /// mail volume, and paid again on every link flap.
+    MailReceiptAck { mail_id: String },
 }
 
 /// The home server's answer to a `JoinProxyRequest` - the same five

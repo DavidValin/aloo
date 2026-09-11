@@ -6257,6 +6257,16 @@ its own forward secrecy, on top of - not instead of - the durable-identity
 authentication; recording a session and later obtaining a server's
 `server_federation_identity` private key still does not decrypt it.
 
+Everything an *un*authenticated connection can make this server spend is
+bounded, and only here: a handshake must complete within a fixed timeout,
+and until it does, a frame may claim only a small fraction of
+`MAX_FRAME_LEN` (§1.1). Both matter because the length prefix is believed -
+and the buffer allocated - before a single payload byte arrives, so
+without them anyone able to reach the federation port could hold a large
+allocation, a task and a socket per connection simply by naming a big
+frame and then going quiet. The full allowance is restored the moment the
+peer is verified, since a real `MailForward` can be large.
+
 Once the handshake completes, both sides already know and have verified
 who the other is; `Hello`'s `self_id`/`advertise_addr` are consumed inside
 the handshake itself, not re-announced afterward. Exactly one of the two
@@ -6405,7 +6415,11 @@ drops the gossip silently - there is nothing local to update. Because
 this is broadcast to *every* linked peer rather than routed point to
 point, a member becomes visible even to a server with no direct link at
 all to the one they are actually connected to, purely through a shared
-home server relaying it on - which is also why the home server's
+home server relaying it on. A `/ban` that removes a federated member
+gossips a `ChannelMemberLeft` for them too, so the rest of the federation
+stops listing someone the channel's admin has thrown out - the ban itself
+is enforced where it lives, on the home server, at their next
+`JoinProxyRequest` - which is also why the home server's
 broadcast reaches the very peer the joining client connects through: that
 peer recognizes gossip naming its own `server_federation_id` as its own
 already-locally-handled client and ignores it, rather than recording its
@@ -6413,6 +6427,20 @@ own client as one of its "remote" members and telling them about
 themselves. A joiner is told about every member already present - local
 and federated alike - before their own join is confirmed, the same order
 a local join already uses for existing members.
+
+**Presence is live-only, so it is resynchronised rather than replayed.**
+A `ChannelMemberJoined`/`ChannelMemberLeft` sent while a peer's link was
+down is never re-sent. Two things make that converge instead of drifting:
+when a link drops, each side *forgets* every member it learned through
+that peer (with a `UserLeft` to its own local members) - with no link,
+this server genuinely does not know who over there is still present, and
+pretending otherwise leaves ghosts that can never be removed; and when a
+link comes up, the home server sends one `ChannelMembership { channel,
+members }` per channel it owns that anyone is in, which the receiver
+applies as a *replacement* rather than a merge, correcting a stale member
+as readily as a missing one. A `ChannelMembership` is believed only from
+the server the directory says owns that channel - no peer may rewrite the
+membership of a channel that is not its to describe.
 
 ### 18.7 OTP mail across servers
 

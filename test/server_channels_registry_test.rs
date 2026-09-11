@@ -747,9 +747,10 @@ fn the_admin_can_ban_a_member_who_is_then_force_removed_and_notified() {
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
 
-    let out = reg.ban_from_channel(alice, "general", "bob").unwrap();
+    let (out, banned_federated) = reg.ban_from_channel(alice, "general", "bob").unwrap();
     assert!(out.iter().any(|o| o.to == bob
         && matches!(&o.message, ServerMessage::UserBanned { user_id, .. } if *user_id == bob)));
+    assert!(banned_federated.is_empty(), "bob is a local member, not a federated one");
 
     // future joins are refused
     let out = reg
@@ -1201,6 +1202,40 @@ fn join_channel_remote_is_idempotent_for_an_already_granted_member() {
     reg.join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP).unwrap().unwrap();
     let second = reg.join_channel_remote("vault", &bob_identity(), None, TEST_IP).unwrap();
     assert!(second.is_ok(), "an already-granted member needs no password on a repeat request");
+}
+
+/// A ban reaches a *federated* member too. `target_id` only ever names a
+/// local connection, so before this the nickname landed in `banned` while
+/// its owner stayed in `remote_members` - and a `join_remote` for an entry
+/// already there skipped the ban check, so every later proxy-join for them
+/// sailed straight through. A ban has to be enforceable against everyone
+/// in the channel, not only whoever happens to be connected here.
+/// @requirement AC-479, TB-312
+#[test]
+fn a_ban_removes_a_federated_member_and_keeps_them_out() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
+        .unwrap();
+    reg.join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP).unwrap().unwrap();
+
+    let (out, banned_federated) = reg.ban_from_channel(alice, "vault", "bob").unwrap();
+    assert_eq!(
+        banned_federated,
+        vec![("serverB".to_string(), "bob".to_string())],
+        "the caller needs these to gossip a ChannelMemberLeft for them"
+    );
+    assert!(
+        out.iter().any(|o| o.to == alice
+            && matches!(&o.message, ServerMessage::UserBanned { nickname, .. } if nickname == "bob")),
+        "alice, a local member, is told the federated member was thrown out: {out:?}"
+    );
+
+    // ...and a fresh proxy-join with the right password is still refused.
+    let outcome = reg
+        .join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP)
+        .expect("the channel still exists");
+    assert_eq!(outcome, Err(ChannelJoinRejection::UserBanned));
 }
 
 /// `leave_channel_remote` forgets a granted federation member - a later

@@ -320,6 +320,7 @@ async fn a_peer_link_exchanges_a_snapshot_then_gossips_incrementally() {
             "serverA".to_string(),
             addr_a,
             addr_a.to_string(),
+            None,
             identity_a,
             vec![FederationPeerConfig {
                 peer_id: "serverB".to_string(),
@@ -336,6 +337,7 @@ async fn a_peer_link_exchanges_a_snapshot_then_gossips_incrementally() {
             "serverB".to_string(),
             addr_b,
             addr_b.to_string(),
+            None,
             identity_b,
             vec![FederationPeerConfig {
                 peer_id: "serverA".to_string(),
@@ -399,7 +401,10 @@ async fn a_peer_link_exchanges_a_snapshot_then_gossips_incrementally() {
 async fn run_handshake_pair(
     trust_a: FederationTrust<'_>,
     trust_b: FederationTrust<'_>,
-) -> (Result<(String, String), HandshakeError>, Result<(String, String), HandshakeError>) {
+) -> (
+    Result<handshake::PeerAnnouncement, HandshakeError>,
+    Result<handshake::PeerAnnouncement, HandshakeError>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // `tokio::join!` rather than two spawned tasks: `FederationTrust`
@@ -419,8 +424,8 @@ async fn run_handshake_pair(
     let mut dial_wr = ControlWriter::new(dial_wr);
 
     tokio::join!(
-        handshake::handshake(&mut accept_rd, &mut accept_wr, &trust_a, "127.0.0.1:0"),
-        handshake::handshake(&mut dial_rd, &mut dial_wr, &trust_b, "127.0.0.1:0"),
+        handshake::handshake(&mut accept_rd, &mut accept_wr, &trust_a, "127.0.0.1:0", None),
+        handshake::handshake(&mut dial_rd, &mut dial_wr, &trust_b, "127.0.0.1:0", None),
     )
 }
 
@@ -510,6 +515,7 @@ fn lone_federation_config(self_id: &str, directory: FederationDirectory) -> Fede
         self_id.to_string(),
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".to_string(),
+        None,
         identity,
         vec![FederationPeerConfig {
             peer_id: "serverA".to_string(),
@@ -537,7 +543,16 @@ async fn a_login_for_a_nickname_owned_by_a_peer_is_redirected_over_the_wire() {
         panic!("expected a refusal naming the peer server, got {result:?}");
     };
     assert!(reason.contains("federated server"), "{reason}");
-    assert!(reason.contains("127.0.0.1:1"), "{reason}");
+    // That peer has never linked here, so it has never announced a
+    // client-facing address - the refusal names the *server*, and must
+    // not invent an address. Naming `server_federation_peer`'s own
+    // host:port would be actively wrong: that is the server-to-server
+    // port, which no client ever speaks to.
+    assert!(reason.contains("serverA"), "{reason}");
+    assert!(
+        !reason.contains(":1"),
+        "the federation port must never be handed to a client: {reason}"
+    );
 }
 
 /// The same directory state, but for `Register` instead of `Auth`: the
@@ -654,7 +669,8 @@ async fn spawn_federated_pair_with(
         "serverA".to_string(),
         format!("127.0.0.1:{fed_port_a}").parse().unwrap(),
         format!("127.0.0.1:{fed_port_a}"),
-        identity_a,
+        None,
+            identity_a,
         vec![FederationPeerConfig {
             peer_id: "serverB".to_string(),
             host: "127.0.0.1".to_string(),
@@ -668,7 +684,8 @@ async fn spawn_federated_pair_with(
         "serverB".to_string(),
         format!("127.0.0.1:{fed_port_b}").parse().unwrap(),
         format!("127.0.0.1:{fed_port_b}"),
-        identity_b,
+        None,
+            identity_b,
         vec![FederationPeerConfig {
             peer_id: "serverA".to_string(),
             host: "127.0.0.1".to_string(),
@@ -729,7 +746,8 @@ async fn spawn_federated_star(
         "hub".to_string(),
         format!("127.0.0.1:{port_hub}").parse().unwrap(),
         format!("127.0.0.1:{port_hub}"),
-        identity_hub,
+        None,
+            identity_hub,
         vec![
             FederationPeerConfig {
                 peer_id: "leafA".to_string(),
@@ -751,7 +769,8 @@ async fn spawn_federated_star(
         "leafA".to_string(),
         format!("127.0.0.1:{port_a}").parse().unwrap(),
         format!("127.0.0.1:{port_a}"),
-        identity_a,
+        None,
+            identity_a,
         vec![FederationPeerConfig {
             peer_id: "hub".to_string(),
             host: "127.0.0.1".to_string(),
@@ -765,7 +784,8 @@ async fn spawn_federated_star(
         "leafB".to_string(),
         format!("127.0.0.1:{port_b}").parse().unwrap(),
         format!("127.0.0.1:{port_b}"),
-        identity_b,
+        None,
+            identity_b,
         vec![FederationPeerConfig {
             peer_id: "hub".to_string(),
             host: "127.0.0.1".to_string(),
@@ -791,19 +811,23 @@ async fn spawn_federated_star(
     // exists via the hub's snapshot (never directly - they aren't peers
     // of each other), the same "peer's directory finally agrees" signal
     // `spawn_federated_pair_with` uses for a single link.
-    federate_nickname(&hub, "hub", "hub-linkcheck").await;
-    wait_until(Duration::from_secs(5), || async {
-        matches!(
-            leaf_a.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hub-linkcheck"),
+    // Re-announced on every poll rather than once up front: gossip is a
+    // one-shot to whatever links are live *at that moment*, and with both
+    // sides dialing there is no instant at which the harness can know the
+    // links have settled. A real server registers nicknames continuously
+    // over a long-lived link; a test that announces once into a link that
+    // is still coming up is just racing itself.
+    wait_until(Duration::from_secs(15), || async {
+        federate_nickname(&hub, "hub", "hublink").await;
+        let a_knows = matches!(
+            leaf_a.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hublink"),
             Some(Ownership::Owned(owner)) if owner == "hub"
-        )
-    })
-    .await;
-    wait_until(Duration::from_secs(5), || async {
-        matches!(
-            leaf_b.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hub-linkcheck"),
+        );
+        let b_knows = matches!(
+            leaf_b.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hublink"),
             Some(Ownership::Owned(owner)) if owner == "hub"
-        )
+        );
+        a_knows && b_knows
     })
     .await;
 
@@ -895,6 +919,391 @@ async fn a_third_servers_member_sees_presence_relayed_through_the_hub() {
     assert!(
         matches!(&bob_left, ServerMessage::UserLeft { channel, .. } if channel == "plaza"),
         "{bob_left:?}"
+    );
+}
+
+/// Both servers dial each other, so two connections between one pair can
+/// exist at once - and both ends have to converge on the *same* survivor,
+/// or each keeps the one it dialed, discards the one it accepted, and the
+/// pair is left with two half-alive links and nothing working. Both
+/// listeners are already bound here before either `serve` starts, which is
+/// precisely the startup shape that makes a simultaneous connect likely.
+/// @requirement TB-311
+#[tokio::test]
+async fn two_servers_dialing_each_other_at_once_converge_on_one_working_link() {
+    let (listener_a, addr_a) = bind_ephemeral().await;
+    let (listener_b, addr_b) = bind_ephemeral().await;
+    let dir_a = temp_dir("both-dial-a");
+    let dir_b = temp_dir("both-dial-b");
+    let (identity_a, pub_a) = write_identity(&dir_a);
+    let (identity_b, pub_b) = write_identity(&dir_b);
+
+    // "zeta" sorts *after* "alpha", so this also covers the case the old
+    // "only the lower id dials" rule broke: if only the higher-id server
+    // were reachable, that rule left the pair unlinked entirely.
+    let config_a = Arc::new(
+        FederationConfig::new(
+            "alpha".to_string(),
+            addr_a,
+            addr_a.to_string(),
+            None,
+            identity_a,
+            vec![FederationPeerConfig {
+                peer_id: "zeta".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: addr_b.port(),
+                public_key_path: pub_b.display().to_string(),
+            }],
+            FederationDirectory::open(dir_a.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    );
+    let config_b = Arc::new(
+        FederationConfig::new(
+            "zeta".to_string(),
+            addr_b,
+            addr_b.to_string(),
+            None,
+            identity_b,
+            vec![FederationPeerConfig {
+                peer_id: "alpha".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: addr_a.port(),
+                public_key_path: pub_a.display().to_string(),
+            }],
+            FederationDirectory::open(dir_b.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    );
+
+    tokio::spawn(federation::serve(listener_a, test_federation_context(config_a.clone())));
+    tokio::spawn(federation::serve(listener_b, test_federation_context(config_b.clone())));
+
+    // Gossip has to survive in *both* directions on whichever connection
+    // won - a half-alive link shows up as one of these never arriving.
+    config_a.directory.lock().await.record_local_nickname("from-alpha".to_string(), "alpha").unwrap();
+    config_b.directory.lock().await.record_local_nickname("from-zeta".to_string(), "zeta").unwrap();
+    wait_until(Duration::from_secs(10), || async {
+        federation::broadcast(
+            &config_a,
+            FederationMessage::NicknameRegistered {
+                nickname: "from-alpha".to_string(),
+                owner: "alpha".to_string(),
+            },
+            federation::event::NICKS_GOSSIP,
+        )
+        .await;
+        federation::broadcast(
+            &config_b,
+            FederationMessage::NicknameRegistered {
+                nickname: "from-zeta".to_string(),
+                owner: "zeta".to_string(),
+            },
+            federation::event::NICKS_GOSSIP,
+        )
+        .await;
+        let a_knows = matches!(
+            config_a.directory.lock().await.owner_of_nickname("from-zeta"),
+            Some(Ownership::Owned(owner)) if owner == "zeta"
+        );
+        let b_knows = matches!(
+            config_b.directory.lock().await.owner_of_nickname("from-alpha"),
+            Some(Ownership::Owned(owner)) if owner == "alpha"
+        );
+        a_knows && b_knows
+    })
+    .await;
+}
+
+/// Presence gossip is live-only, so a peer that links up *after* people
+/// joined has missed every `ChannelMemberJoined` for them. The home server
+/// therefore sends a full `ChannelMembership` for each of its channels at
+/// link-up, and the receiver replaces what it had with it - which is what
+/// makes a late link, and a relink after a drop (which deliberately
+/// forgets that peer's members), converge instead of showing a busy
+/// channel as empty forever.
+/// @requirement AC-483, TB-311
+#[tokio::test]
+async fn a_peer_linking_up_late_still_learns_who_is_already_in_a_channel() {
+    let dir_hub = temp_dir("resync-hub");
+    let dir_leaf = temp_dir("resync-leaf");
+    let (identity_hub, pub_hub) = write_identity(&dir_hub);
+    let (identity_leaf, pub_leaf) = write_identity(&dir_leaf);
+    let port_hub = reserve_port().await;
+    let port_leaf = reserve_port().await;
+
+    // The hub knows about the leaf; the leaf is started later, so every
+    // join below happens with no link up at all.
+    let config_hub = FederationConfig::new(
+        "hub".to_string(),
+        format!("127.0.0.1:{port_hub}").parse().unwrap(),
+        format!("127.0.0.1:{port_hub}"),
+        None,
+            identity_hub,
+        vec![FederationPeerConfig {
+            peer_id: "leaf".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port_leaf,
+            public_key_path: pub_leaf.display().to_string(),
+        }],
+        FederationDirectory::open(dir_hub.join("directory")).unwrap(),
+    )
+    .unwrap();
+    let hub = server_common::TestServer::spawn(
+        server_common::test_options("resync-hub").with_federation(config_hub),
+    )
+    .await;
+
+    let mut alice = hub.connect().await;
+    hub.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "forum".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(recv_with_timeout(&mut alice).await, ServerMessage::Joined { .. }));
+
+    // Only now does the leaf exist - it never saw alice's join gossip.
+    let config_leaf = FederationConfig::new(
+        "leaf".to_string(),
+        format!("127.0.0.1:{port_leaf}").parse().unwrap(),
+        format!("127.0.0.1:{port_leaf}"),
+        None,
+            identity_leaf,
+        vec![FederationPeerConfig {
+            peer_id: "hub".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port_hub,
+            public_key_path: pub_hub.display().to_string(),
+        }],
+        FederationDirectory::open(dir_leaf.join("directory")).unwrap(),
+    )
+    .unwrap();
+    let leaf = server_common::TestServer::spawn(
+        server_common::test_options("resync-leaf").with_federation(config_leaf),
+    )
+    .await;
+
+    wait_until(Duration::from_secs(15), || async {
+        matches!(
+            leaf.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("forum"),
+            Some(info) if info.owner == "hub"
+        )
+    })
+    .await;
+
+    // A client joining on the leaf must see alice, who was already there
+    // before the two servers had ever spoken.
+    let mut bob = leaf.connect().await;
+    leaf.handshake(&mut bob, "bob").await;
+    bob.send(&ClientMessage::JoinChannel {
+        name: "forum".to_string(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    let alice_presence = recv_with_timeout(&mut bob).await;
+    assert!(
+        matches!(&alice_presence, ServerMessage::UserJoined { channel, user } if channel == "forum" && user.name == "alice"),
+        "a late-linking peer must still learn who was already in the channel, got {alice_presence:?}"
+    );
+}
+
+/// A join-proxy request is answered only by the peer it was actually sent
+/// to. Request ids are this server's own counter from 1, so they are
+/// entirely predictable: without checking *which* link an answer arrived
+/// on, any other linked peer could answer a request never addressed to it
+/// and have its verdict believed - a forged `Joined` mirroring a channel
+/// it does not own into the requesting server, admitting a client the
+/// real owner never checked a password, ban or allowlist for. Here
+/// "aaa" asks "bbb" about a channel, and "ccc" (linked to "aaa", but a
+/// complete stranger to the request) races an answer in.
+/// @requirement TB-312
+#[tokio::test]
+async fn a_join_proxy_answer_from_a_peer_the_request_never_went_to_is_ignored() {
+    let (listener_a, addr_a) = bind_ephemeral().await;
+    let (listener_b, addr_b) = bind_ephemeral().await;
+    let (listener_c, addr_c) = bind_ephemeral().await;
+    let dir_a = temp_dir("forge-a");
+    let dir_b = temp_dir("forge-b");
+    let dir_c = temp_dir("forge-c");
+    let (identity_a, pub_a) = write_identity(&dir_a);
+    let (identity_b, pub_b) = write_identity(&dir_b);
+    let (identity_c, pub_c) = write_identity(&dir_c);
+
+    // "aaa" sorts first, so it is the one that dials both others.
+    let peer = |peer_id: &str, addr: std::net::SocketAddr, key: &PathBuf| FederationPeerConfig {
+        peer_id: peer_id.to_string(),
+        host: "127.0.0.1".to_string(),
+        port: addr.port(),
+        public_key_path: key.display().to_string(),
+    };
+    let mut directory_a = FederationDirectory::open(dir_a.join("directory")).unwrap();
+    // "aaa" believes "bbb" owns the channel - so that is the only peer
+    // whose answer about it may ever count.
+    directory_a.merge_remote_channel(FederatedChannelInfo {
+        name: "vault".to_string(),
+        kind: ChannelKind::Private,
+        owner: "bbb".to_string(),
+    });
+
+    let config_a = Arc::new(
+        FederationConfig::new(
+            "aaa".to_string(),
+            addr_a,
+            addr_a.to_string(),
+            None,
+            identity_a,
+            vec![peer("bbb", addr_b, &pub_b), peer("ccc", addr_c, &pub_c)],
+            directory_a,
+        )
+        .unwrap(),
+    );
+    let config_b = Arc::new(
+        FederationConfig::new(
+            "bbb".to_string(),
+            addr_b,
+            addr_b.to_string(),
+            None,
+            identity_b,
+            vec![peer("aaa", addr_a, &pub_a)],
+            FederationDirectory::open(dir_b.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    );
+    let config_c = Arc::new(
+        FederationConfig::new(
+            "ccc".to_string(),
+            addr_c,
+            addr_c.to_string(),
+            None,
+            identity_c,
+            vec![peer("aaa", addr_a, &pub_a)],
+            FederationDirectory::open(dir_c.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    );
+
+    tokio::spawn(federation::serve(listener_a, test_federation_context(config_a.clone())));
+    tokio::spawn(federation::serve(listener_b, test_federation_context(config_b.clone())));
+    tokio::spawn(federation::serve(listener_c, test_federation_context(config_c.clone())));
+
+    wait_until(Duration::from_secs(5), || async {
+        config_a.send_to_peer("bbb", FederationMessage::NicknameRegistered {
+            nickname: "linkcheck".to_string(),
+            owner: "aaa".to_string(),
+        })
+        .await
+            && config_a
+                .send_to_peer("ccc", FederationMessage::NicknameRegistered {
+                    nickname: "linkcheck".to_string(),
+                    owner: "aaa".to_string(),
+                })
+                .await
+    })
+    .await;
+
+    // "ccc" spams forged grants for the request id "aaa" is about to use
+    // (its first, so 1) while the real request is in flight.
+    let forger = {
+        let config_c = config_c.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                config_c
+                    .send_to_peer(
+                        "aaa",
+                        FederationMessage::JoinProxyResponse {
+                            request_id: 1,
+                            outcome: federation::proto::JoinProxyOutcome::Joined {
+                                kind: ChannelKind::Private,
+                                admin: Some("mallory".to_string()),
+                            },
+                        },
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+
+    // "bbb" has no such channel, so its real answer is `UnknownChannel` -
+    // which is what must decide, however fast the forgery arrives.
+    let outcome = config_a
+        .request_join_proxy("vault", "bob", Some("s3cret!"), Vec::new(), aloo::proto::KeyMode::PqHybrid)
+        .await;
+    forger.abort();
+
+    assert!(
+        matches!(outcome, Ok(federation::proto::JoinProxyOutcome::UnknownChannel)),
+        "only the peer the request went to may answer it, got {outcome:?}"
+    );
+}
+
+/// A federated member's synthetic `UserId` must stay *below* the top bit,
+/// which `client::p2p::direct_peer_id` reserves for the serverless
+/// direct-punch ids `is_direct_peer_id` recognises. An id with that bit
+/// set is read by every client as "a peer no server has ever heard of",
+/// which makes `ensure_link` short-circuit to `Pending` forever: the
+/// member would sit permanently "Connecting" and anything sent to them
+/// would queue silently, with no error and no timeout. `u64::MAX` itself
+/// is doubly wrong - `client::voice_call` uses it as its own "id not
+/// known yet" sentinel, and it is exactly what the first federated member
+/// a server ever showed used to be handed.
+/// @requirement TB-310
+#[tokio::test]
+async fn a_federated_members_synthetic_id_stays_clear_of_the_clients_reserved_id_space() {
+    let (hub, leaf_a, _leaf_b) = spawn_federated_star("id-space").await;
+
+    let mut alice = hub.connect().await;
+    hub.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "atrium".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(recv_with_timeout(&mut alice).await, ServerMessage::Joined { .. }));
+
+    wait_until(Duration::from_secs(5), || async {
+        matches!(
+            leaf_a.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("atrium"),
+            Some(info) if info.owner == "hub"
+        )
+    })
+    .await;
+
+    let mut bob = leaf_a.connect().await;
+    leaf_a.handshake(&mut bob, "bob").await;
+    bob.send(&ClientMessage::JoinChannel {
+        name: "atrium".to_string(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+
+    let alice_presence = recv_with_timeout(&mut bob).await;
+    let ServerMessage::UserJoined { user, .. } = &alice_presence else {
+        panic!("expected bob to be told about alice, got {alice_presence:?}");
+    };
+    assert_eq!(user.name, "alice");
+    assert_eq!(
+        user.id.0 & 0x8000_0000_0000_0000,
+        0,
+        "a federated member's id must leave the top bit clear - {:#x} collides with \
+         client::p2p::direct_peer_id's reserved half",
+        user.id.0
+    );
+    assert_ne!(
+        user.id.0,
+        u64::MAX,
+        "u64::MAX is client::voice_call's 'own id unknown' sentinel"
     );
 }
 
