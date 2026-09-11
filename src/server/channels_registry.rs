@@ -12,12 +12,13 @@
 //! reconnect (TB-020) and a per-`UserId` key would not survive even the
 //! channel's own admin reconnecting.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::crypto;
 use crate::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, ServerMessage, UserId, UserInfo};
+use crate::server::federation::proto::RemoteIdentity;
 use crate::validation;
 
 use super::Outgoing;
@@ -62,14 +63,19 @@ struct ChannelRecord {
     /// inactivity sweep can read, since the server never sees P2P
     /// channel-message content at all.
     last_join_at: Instant,
-    /// Federation only (`crate::server::federation`): every (owning
-    /// server, nickname) pair a join-proxy request has granted entry to,
-    /// for a channel *this* server owns. Never touches `members` - there
-    /// is no `UserId` for a connection to a different server - and stays
-    /// empty forever on a channel this server only *mirrors* (one it
-    /// joined via someone else's proxy), since only the true owner ever
-    /// grants a federation join.
-    remote_members: BTreeSet<(String, String)>,
+    /// Federation only (`crate::server::federation`): every remote member
+    /// currently known to belong to this channel, keyed by (their
+    /// server, their nickname). On the channel's *home* server this is
+    /// authoritative - every (owning server, nickname) pair a join-proxy
+    /// request has granted entry to - and never touches `members`, since
+    /// there is no `UserId` for a connection to a different server. On a
+    /// server that only *mirrors* this channel (joined via someone else's
+    /// proxy, or learned of it from `ChannelRegistered`), it is instead a
+    /// live copy of the home server's membership, kept current by
+    /// `ChannelMemberJoined`/`ChannelMemberLeft` gossip - used purely for
+    /// display (who's in the channel), never for password/ban/allowlist
+    /// decisions, which only the home server ever makes.
+    remote_members: BTreeMap<(String, String), RemoteIdentity>,
 }
 
 /// Brute-force tracking for one (source IP, channel name) pair's wrong
@@ -131,7 +137,7 @@ impl ChannelsRegistry {
                 banned: BTreeSet::new(),
                 join_lock: None,
                 last_join_at: Instant::now(),
-                remote_members: BTreeSet::new(),
+                remote_members: BTreeMap::new(),
             },
         );
         Self {
@@ -173,6 +179,12 @@ impl ChannelsRegistry {
     /// the only thing that can do this, since connection identity lives
     /// there); `all_client_ids` is every currently-connected `UserId`,
     /// needed only to broadcast a genuinely new public channel's creation.
+    /// `remote_user_info` resolves a federated member's `RemoteIdentity`
+    /// to a displayable `UserInfo` (a stable synthetic `UserId` minted for
+    /// them, since there is no real connection here) - only used to tell
+    /// `joiner` about members already present through federation; a
+    /// remote member is never itself sent anything, having no connection
+    /// to this server for it to arrive on.
     #[allow(clippy::too_many_arguments)]
     pub fn join(
         &mut self,
@@ -185,6 +197,7 @@ impl ChannelsRegistry {
         allow_create_public_channels: bool,
         all_client_ids: &[UserId],
         user_info_of: impl Fn(UserId) -> Option<UserInfo>,
+        mut remote_user_info: impl FnMut(&RemoteIdentity) -> UserInfo,
     ) -> Result<Vec<Outgoing>, String> {
         if !validation::channel_name_is_valid(name) {
             return Err(format!(
@@ -211,7 +224,7 @@ impl ChannelsRegistry {
             );
         }
 
-        let (existing_members, channel_kind, channel_password, already_member) = {
+        let (existing_members, existing_remote_members, channel_kind, channel_password, already_member) = {
             let rec = self
                 .channels
                 .entry(name.to_string())
@@ -228,11 +241,12 @@ impl ChannelsRegistry {
                     banned: BTreeSet::new(),
                     join_lock: None,
                     last_join_at: Instant::now(),
-                    remote_members: BTreeSet::new(),
+                    remote_members: BTreeMap::new(),
                 });
             let existing: Vec<UserId> = rec.members.iter().copied().collect();
+            let existing_remote: Vec<RemoteIdentity> = rec.remote_members.values().cloned().collect();
             let already = rec.members.contains(&id);
-            (existing, rec.kind, rec.password.clone(), already)
+            (existing, existing_remote, rec.kind, rec.password.clone(), already)
         };
 
         // A moderation ban and an allowlist lock are checked before the
@@ -281,6 +295,20 @@ impl ChannelsRegistry {
                 ServerMessage::UserJoined {
                     channel: name.to_string(),
                     user: joiner.clone(),
+                },
+            ));
+        }
+        // Federated members are told about `joiner` by their own home
+        // server's `ChannelMemberJoined` gossip, not here (there is no
+        // connection to this server for them to receive it on) - but
+        // `joiner` still needs to be told about *them*, or they would
+        // simply not appear in a channel they are genuinely already in.
+        for identity in &existing_remote_members {
+            outgoing.push(Outgoing::new(
+                id,
+                ServerMessage::UserJoined {
+                    channel: name.to_string(),
+                    user: remote_user_info(identity),
                 },
             ));
         }
@@ -386,32 +414,40 @@ impl ChannelsRegistry {
     /// A federation peer's join-proxy request for `name`, which this
     /// server owns (`crate::server::federation`): the same ban/allowlist/
     /// password gates `join` applies to a local member, applied to
-    /// `joiner_nickname` (a client connected to `remote_server`, not
+    /// `identity.nickname` (a client connected to `identity.server`, not
     /// here) instead. Records the join in `remote_members` on success -
     /// never `members`, since there is no `UserId` for a connection to a
     /// different server - and never stores or exposes the password
     /// itself beyond comparing against it. `None` if this server doesn't
     /// actually have `name` at all (a stale federation directory entry);
     /// the caller answers with `JoinProxyOutcome::UnknownChannel`.
+    ///
+    /// Also returns the `UserJoined` notices this channel's *existing
+    /// local* members need - the caller (`crate::server::federation`)
+    /// dispatches them and, on success, gossips `ChannelMemberJoined` to
+    /// every other linked peer so servers with no local members here yet
+    /// still learn who's in it, `user_info_of` resolves an existing
+    /// member's `UserId` to their `UserInfo`, same as `join`.
     pub fn join_remote(
         &mut self,
         name: &str,
-        remote_server: &str,
-        joiner_nickname: &str,
+        identity: &RemoteIdentity,
         password: Option<&str>,
         source_ip: IpAddr,
-    ) -> Option<Result<(ChannelKind, Option<String>), ChannelJoinRejection>> {
+        user_info_of: impl Fn(UserId) -> Option<UserInfo>,
+        mut remote_user_info: impl FnMut(&RemoteIdentity) -> UserInfo,
+    ) -> Option<Result<(ChannelKind, Option<String>, Vec<Outgoing>), ChannelJoinRejection>> {
         if !self.channels.contains_key(name) {
             return None;
         }
-        let member_key = (remote_server.to_string(), joiner_nickname.to_string());
+        let member_key = (identity.server.clone(), identity.nickname.clone());
         let (channel_password, already_member) = {
             let rec = self.channels.get(name).expect("checked above");
-            (rec.password.clone(), rec.remote_members.contains(&member_key))
+            (rec.password.clone(), rec.remote_members.contains_key(&member_key))
         };
         if !already_member {
             let rec = self.channels.get(name).expect("checked above");
-            if let Err(rejection) = Self::ban_and_allowlist_check(rec, joiner_nickname) {
+            if let Err(rejection) = Self::ban_and_allowlist_check(rec, &identity.nickname) {
                 return Some(Err(rejection));
             }
         }
@@ -421,21 +457,65 @@ impl ChannelsRegistry {
         {
             return Some(Err(rejection));
         }
+        if already_member {
+            let rec = self.channels.get(name).expect("checked above");
+            return Some(Ok((rec.kind, rec.admin.clone(), Vec::new())));
+        }
+        let existing_members: Vec<UserId> = {
+            let rec = self.channels.get(name).expect("checked above");
+            rec.members.iter().copied().collect()
+        };
         let rec = self.channels.get_mut(name).expect("checked above");
-        rec.remote_members.insert(member_key);
+        rec.remote_members.insert(member_key, identity.clone());
         rec.last_join_at = Instant::now();
-        Some(Ok((rec.kind, rec.admin.clone())))
+        let (kind, admin) = (rec.kind, rec.admin.clone());
+        let joiner_info = remote_user_info(identity);
+        let outgoing = existing_members
+            .into_iter()
+            .filter_map(|member_id| {
+                user_info_of(member_id).map(|_| {
+                    Outgoing::new(
+                        member_id,
+                        ServerMessage::UserJoined { channel: name.to_string(), user: joiner_info.clone() },
+                    )
+                })
+            })
+            .collect();
+        Some(Ok((kind, admin, outgoing)))
     }
 
     /// The federation mirror of `leave`: removes `(remote_server,
-    /// nickname)` from `name`'s `remote_members`. A no-op for a channel
-    /// that doesn't exist or wasn't a member - this only ever runs on the
-    /// *home* server, in response to a best-effort `LeaveProxyNotice` that
-    /// nothing else waits on.
-    pub fn leave_remote(&mut self, name: &str, remote_server: &str, nickname: &str) {
-        if let Some(rec) = self.channels.get_mut(name) {
-            rec.remote_members.remove(&(remote_server.to_string(), nickname.to_string()));
+    /// nickname)` from `name`'s `remote_members`, returning the `UserLeft`
+    /// notices this channel's existing local members need (the caller
+    /// gossips `ChannelMemberLeft` on to every other linked peer). A
+    /// no-op for a channel that doesn't exist or wasn't a member - this
+    /// only ever runs on the *home* server, in response to a best-effort
+    /// `LeaveProxyNotice` that nothing else waits on. `remote_user_id`
+    /// resolves the leaving member to the same synthetic `UserId` their
+    /// `UserJoined` used, so a client's own member list stays consistent.
+    pub fn leave_remote(
+        &mut self,
+        name: &str,
+        remote_server: &str,
+        nickname: &str,
+        mut remote_user_id: impl FnMut(&str, &str) -> UserId,
+    ) -> Vec<Outgoing> {
+        let Some(rec) = self.channels.get_mut(name) else {
+            return Vec::new();
+        };
+        if rec.remote_members.remove(&(remote_server.to_string(), nickname.to_string())).is_none() {
+            return Vec::new();
         }
+        let leaving_id = remote_user_id(remote_server, nickname);
+        rec.members
+            .iter()
+            .map(|&member_id| {
+                Outgoing::new(
+                    member_id,
+                    ServerMessage::UserLeft { channel: name.to_string(), user_id: leaving_id },
+                )
+            })
+            .collect()
     }
 
     /// After a federation join-proxy grants `id` (whose own info is
@@ -456,6 +536,7 @@ impl ChannelsRegistry {
         kind: ChannelKind,
         admin: Option<String>,
         user_info_of: impl Fn(UserId) -> Option<UserInfo>,
+        mut remote_user_info: impl FnMut(&RemoteIdentity) -> UserInfo,
     ) -> Vec<Outgoing> {
         let existing_members: Vec<UserId> = self
             .channels
@@ -470,8 +551,15 @@ impl ChannelsRegistry {
             banned: BTreeSet::new(),
             join_lock: None,
             last_join_at: Instant::now(),
-            remote_members: BTreeSet::new(),
+            remote_members: BTreeMap::new(),
         });
+        // A channel that only "fully shared list" visibility
+        // (`ensure_public_mirror`) had created ahead of time has no real
+        // `kind`/`admin` yet - this join is the first time either is
+        // actually known, so it corrects the stub rather than leaving it
+        // permanently `admin: None`.
+        rec.kind = kind;
+        rec.admin = admin.clone();
         if rec.members.contains(&id) {
             return vec![Outgoing::new(
                 id,
@@ -484,6 +572,7 @@ impl ChannelsRegistry {
                 },
             )];
         }
+        let existing_remote_members: Vec<RemoteIdentity> = rec.remote_members.values().cloned().collect();
         rec.members.insert(id);
         rec.last_join_at = Instant::now();
         let channel_kind = rec.kind;
@@ -508,6 +597,15 @@ impl ChannelsRegistry {
                 },
             ));
         }
+        for identity in &existing_remote_members {
+            outgoing.push(Outgoing::new(
+                id,
+                ServerMessage::UserJoined {
+                    channel: name.to_string(),
+                    user: remote_user_info(identity),
+                },
+            ));
+        }
         outgoing.push(Outgoing::new(
             id,
             ServerMessage::Joined {
@@ -519,6 +617,95 @@ impl ChannelsRegistry {
             },
         ));
         outgoing
+    }
+
+    /// Applies third-party `ChannelMemberJoined` gossip: `channel`'s home
+    /// server (never this one - see `join_remote`, which is what runs
+    /// there instead) says `identity` just joined. A no-op, silently
+    /// dropped, for a channel this server has no local record of at all
+    /// (nothing here to update, nobody local to tell); otherwise records
+    /// `identity` in `remote_members` and tells this server's own local
+    /// members about the new arrival, exactly like `join`'s existing
+    /// members are told about a new joiner. Idempotent for a member
+    /// already recorded (a repeat gossip after a reconnect, say).
+    pub fn mirror_member_joined(
+        &mut self,
+        channel: &str,
+        identity: &RemoteIdentity,
+        mut remote_user_info: impl FnMut(&RemoteIdentity) -> UserInfo,
+    ) -> Vec<Outgoing> {
+        let Some(rec) = self.channels.get_mut(channel) else {
+            return Vec::new();
+        };
+        let key = (identity.server.clone(), identity.nickname.clone());
+        if rec.remote_members.contains_key(&key) {
+            rec.remote_members.insert(key, identity.clone());
+            return Vec::new();
+        }
+        rec.remote_members.insert(key, identity.clone());
+        let user = remote_user_info(identity);
+        rec.members
+            .iter()
+            .map(|&member_id| {
+                Outgoing::new(member_id, ServerMessage::UserJoined { channel: channel.to_string(), user: user.clone() })
+            })
+            .collect()
+    }
+
+    /// The departure mirror of `mirror_member_joined`, for `ChannelMemberLeft`
+    /// gossip. Same no-op/idempotency shape.
+    pub fn mirror_member_left(
+        &mut self,
+        channel: &str,
+        server: &str,
+        nickname: &str,
+        mut remote_user_id: impl FnMut(&str, &str) -> UserId,
+    ) -> Vec<Outgoing> {
+        let Some(rec) = self.channels.get_mut(channel) else {
+            return Vec::new();
+        };
+        if rec.remote_members.remove(&(server.to_string(), nickname.to_string())).is_none() {
+            return Vec::new();
+        }
+        let leaving_id = remote_user_id(server, nickname);
+        rec.members
+            .iter()
+            .map(|&member_id| {
+                Outgoing::new(member_id, ServerMessage::UserLeft { channel: channel.to_string(), user_id: leaving_id })
+            })
+            .collect()
+    }
+
+    /// "Fully shared channel list" (docs/PROTOCOL.md §18.2): ensures a
+    /// *public* federated channel this server has just learned about
+    /// (`ChannelRegistered` gossip or a `DirectorySnapshot`, never a
+    /// private one - those stay unadvertised, reachable only by knowing
+    /// their name) has a local stub entry, empty of members, so it shows
+    /// up in this server's own `list()`/`ChannelList` immediately rather
+    /// than only once some local client has joined it. Returns whether it
+    /// was newly created - the caller uses that to decide whether to
+    /// announce `ServerMessage::ChannelCreated` to already-connected local
+    /// clients (a no-op if it was already known, whether as this server's
+    /// own channel, a channel a local client had already joined via
+    /// proxy, or a previous run of this same method).
+    pub fn ensure_public_mirror(&mut self, name: &str, kind: ChannelKind) -> bool {
+        if kind != ChannelKind::Public || self.channels.contains_key(name) {
+            return false;
+        }
+        self.channels.insert(
+            name.to_string(),
+            ChannelRecord {
+                kind,
+                members: BTreeSet::new(),
+                password: None,
+                admin: None,
+                banned: BTreeSet::new(),
+                join_lock: None,
+                last_join_at: Instant::now(),
+                remote_members: BTreeMap::new(),
+            },
+        );
+        true
     }
 
     /// Every channel `id` currently belongs to - read-only, used to
@@ -801,8 +988,15 @@ impl ChannelsRegistry {
         };
         let mut removed = Vec::new();
         self.channels.retain(|name, rec| {
+            // `remote_members` matters here exactly as much as `members`:
+            // a channel this server is home to can have every one of its
+            // members connected through other federated servers, and a
+            // channel this server only mirrors can likewise have real
+            // (federated) presence with zero local members - neither is
+            // "inactive" just because nobody local is in it.
             let keep = name == DEFAULT_CHANNEL_NAME
                 || !rec.members.is_empty()
+                || !rec.remote_members.is_empty()
                 || rec.last_join_at.elapsed() < period;
             if !keep {
                 removed.push(name.clone());

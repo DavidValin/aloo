@@ -6291,6 +6291,17 @@ themselves durable; the channel directory is in-memory only, rebuilt from
 the next `DirectorySnapshot` on every reconnect, matching
 `ChannelsRegistry` itself being entirely in-memory.
 
+A *public* channel does not just update this directory quietly: every
+server that learns of one this way (`ChannelRegistered` gossip, or a
+`DirectorySnapshot` at link-up) mirrors an empty stub of it straight into
+its own `ChannelsRegistry` and announces it live to its own already-
+connected clients (`ServerMessage::ChannelCreated`), exactly as if it had
+just been created locally. The whole federation is meant to present one
+shared public channel list, not one that only grows for a server once a
+local client happens to join something on a peer by name. A private
+channel is never mirrored or announced this way - it stays reachable only
+by knowing its name, exactly like a local one.
+
 ### 18.3 Global uniqueness, and what happens on a conflict
 
 A nickname or channel name is meant to belong to exactly one federated
@@ -6341,41 +6352,67 @@ have exchanged OTP mail across servers, still cannot exchange a *live*
 message with each other unless they share one server's connection.
 `RequestPeerLink`/`PeerCandidates` (§7.1) are routed purely by local
 `UserId` today, and a member joined via §18.6's proxy has no `UserId` on
-any server but the one it actually connects to - so two local clients of
-the *same* requesting server who both mirror a remote-homed channel get
-real presence and can punch an ordinary direct link to each other, but a
-member connected to a *different* federated server is invisible to them
-and vice versa, until the peer-link candidate exchange is itself
-federated. OTP mail (§18.7) has no such gap, since it was already
+any server but the one it actually connects to. Two members of a shared
+channel connected to *different* federated servers now see each other -
+`UserJoined`/`UserLeft` for a federated member, §18.6 - but still cannot
+punch an ordinary direct link to each other, until the peer-link
+candidate exchange is itself federated: this closes *visibility*, not
+*connectivity*. OTP mail (§18.7) has no such gap, since it was already
 store-and-forward through the server rather than a direct link.
 
 ### 18.6 Joining a channel homed on a different server
 
 `JoinChannel` for a channel the directory says a different server owns is
 proxied there rather than refused: `JoinProxyRequest { request_id,
-channel, joiner_nickname, password }` goes out over the federation link
-to the owning server, which runs the *exact* same ban/allowlist/password
-checks a local join would, against the requesting nickname instead of a
-`UserId` (there is none, since that client connects elsewhere). A grant
-is recorded in that server's own `remote_members` (never `members`, which
-stays strictly local) and answered with `JoinProxyResponse { request_id,
-outcome }` - `Joined { kind, admin }` on success, one of
-`ChannelJoinRejection`'s existing reasons on refusal, or `UnknownChannel`
-for a directory entry that has gone stale. The requesting server mirrors
-a grant into its own `ChannelsRegistry` exactly as if the channel had
-been created locally (never storing the password - there is none to
-store), so its own `ChannelList`/membership bookkeeping, and any other
-*local* client who also joins the same remote-homed channel, work like an
-ordinary local channel (§18.5). Leaving - an explicit `LeaveChannel` or a
-disconnect - sends a best-effort `LeaveProxyNotice { channel, nickname }`
-to the home server so its `remote_members` stays accurate; nothing waits
-on it.
+channel, joiner_nickname, password, joiner_public_key_der,
+joiner_key_mode }` goes out over the federation link to the owning
+server, which runs the *exact* same ban/allowlist/password checks a local
+join would, against the requesting nickname instead of a `UserId` (there
+is none, since that client connects elsewhere). A grant is recorded in
+that server's own `remote_members` (never `members`, which stays strictly
+local) and answered with `JoinProxyResponse { request_id, outcome }` -
+`Joined { kind, admin }` on success, one of `ChannelJoinRejection`'s
+existing reasons on refusal, or `UnknownChannel` for a directory entry
+that has gone stale. The requesting server mirrors a grant into its own
+`ChannelsRegistry` exactly as if the channel had been created locally
+(never storing the password - there is none to store), so its own
+`ChannelList`/membership bookkeeping, and any other *local* client who
+also joins the same remote-homed channel, work like an ordinary local
+channel. Leaving - an explicit `LeaveChannel` or a disconnect - sends a
+best-effort `LeaveProxyNotice { channel, nickname }` to the home server so
+its `remote_members` stays accurate; nothing waits on it.
 
 This request-response round trip never blocks the server's own client
 connections or federation link while it is in flight: the `Registry`
 mutex is released for its whole duration, and a peer that is unreachable
 or slow to answer fails the join (naming the reason) rather than hanging
 it, bounded by a fixed timeout.
+
+**Cross-server presence.** The channel's home server - the only one with
+full membership visibility - gossips every join or leave on one of its
+channels, local or proxied alike, to *every* currently linked peer:
+`ChannelMemberJoined { channel, member: RemoteIdentity { server,
+nickname, public_key_der, key_mode } }` and `ChannelMemberLeft { channel,
+server, nickname }`. A peer that mirrors the channel (as home to none of
+it, but with a local client's proxy join already in it, or simply from
+§18.2's fully-shared-list mirroring) records the member and tells its own
+local clients about them (`UserJoined`/`UserLeft`), with a stable
+synthetic `UserId` minted the first time that `(server, nickname)` pair
+is ever shown (counting down from `u64::MAX`, so it can never collide
+with a real local id counting up from 1) and kept for as long as this
+server's process runs. A peer that doesn't mirror the channel at all
+drops the gossip silently - there is nothing local to update. Because
+this is broadcast to *every* linked peer rather than routed point to
+point, a member becomes visible even to a server with no direct link at
+all to the one they are actually connected to, purely through a shared
+home server relaying it on - which is also why the home server's
+broadcast reaches the very peer the joining client connects through: that
+peer recognizes gossip naming its own `server_federation_id` as its own
+already-locally-handled client and ignores it, rather than recording its
+own client as one of its "remote" members and telling them about
+themselves. A joiner is told about every member already present - local
+and federated alike - before their own join is confirmed, the same order
+a local join already uses for existing members.
 
 ### 18.7 OTP mail across servers
 

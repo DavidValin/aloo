@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use aloo::proto::*;
+use aloo::server::federation::proto::RemoteIdentity;
 use aloo::server::{
     CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME, Outgoing,
     Registry,
@@ -1121,6 +1122,18 @@ fn creating_a_private_channel_is_unaffected_by_the_policy() {
 // local mirror of a channel a *different* server owns.
 // ---------------------------------------------------------------------
 
+/// A federated join-proxy's identity, as the requesting server would
+/// send it in a real `JoinProxyRequest` - the shape `join_channel_remote`
+/// takes since it has no connection of its own to resolve one from.
+fn bob_identity() -> RemoteIdentity {
+    RemoteIdentity {
+        server: "serverB".to_string(),
+        nickname: "bob".to_string(),
+        public_key_der: vec![],
+        key_mode: KeyMode::PqHybrid,
+    }
+}
+
 /// @requirement AC-479
 #[test]
 fn join_channel_remote_grants_a_peer_the_right_password_and_records_it() {
@@ -1129,9 +1142,9 @@ fn join_channel_remote_grants_a_peer_the_right_password_and_records_it() {
     reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
         .unwrap();
     let outcome = reg
-        .join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP)
+        .join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP)
         .expect("the channel exists locally");
-    let (kind, admin) = outcome.expect("the right password is granted");
+    let (kind, admin, _outgoing) = outcome.expect("the right password is granted");
     assert_eq!(kind, ChannelKind::Private);
     assert_eq!(admin.as_deref(), Some("alice"));
 }
@@ -1144,7 +1157,7 @@ fn join_channel_remote_rejects_the_wrong_password() {
     reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
         .unwrap();
     let outcome = reg
-        .join_channel_remote("vault", "serverB", "bob", Some("wrong"), TEST_IP)
+        .join_channel_remote("vault", &bob_identity(), Some("wrong"), TEST_IP)
         .unwrap();
     assert_eq!(outcome, Err(ChannelJoinRejection::WrongPassword));
 }
@@ -1159,7 +1172,7 @@ fn join_channel_remote_respects_a_ban() {
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "vault", ChannelKind::Public, None, TEST_IP).unwrap();
     reg.ban_from_channel(alice, "vault", "bob").unwrap();
-    let outcome = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    let outcome = reg.join_channel_remote("vault", &bob_identity(), None, TEST_IP).unwrap();
     assert_eq!(outcome, Err(ChannelJoinRejection::UserBanned));
 }
 
@@ -1171,7 +1184,7 @@ fn join_channel_remote_respects_a_ban() {
 #[test]
 fn join_channel_remote_is_none_for_a_channel_that_does_not_exist_here() {
     let mut reg = Registry::new();
-    assert!(reg.join_channel_remote("nowhere", "serverB", "bob", None, TEST_IP).is_none());
+    assert!(reg.join_channel_remote("nowhere", &bob_identity(), None, TEST_IP).is_none());
 }
 
 /// Two federation join-proxy requests for the same (server, nickname)
@@ -1185,8 +1198,8 @@ fn join_channel_remote_is_idempotent_for_an_already_granted_member() {
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
         .unwrap();
-    reg.join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP).unwrap().unwrap();
-    let second = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    reg.join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP).unwrap().unwrap();
+    let second = reg.join_channel_remote("vault", &bob_identity(), None, TEST_IP).unwrap();
     assert!(second.is_ok(), "an already-granted member needs no password on a repeat request");
 }
 
@@ -1201,9 +1214,9 @@ fn leave_channel_remote_forgets_a_granted_member() {
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
         .unwrap();
-    reg.join_channel_remote("vault", "serverB", "bob", Some("s3cret!"), TEST_IP).unwrap().unwrap();
+    reg.join_channel_remote("vault", &bob_identity(), Some("s3cret!"), TEST_IP).unwrap().unwrap();
     reg.leave_channel_remote("vault", "serverB", "bob");
-    let outcome = reg.join_channel_remote("vault", "serverB", "bob", None, TEST_IP).unwrap();
+    let outcome = reg.join_channel_remote("vault", &bob_identity(), None, TEST_IP).unwrap();
     assert_eq!(outcome, Err(ChannelJoinRejection::PasswordRequired));
 }
 

@@ -102,12 +102,20 @@ without independently verifying it belongs to that peer at all - a
 compromised peer could claim any nickname string for a proxied join, the
 same way it could already lie about directory ownership, and a ban
 targeted at one nickname could in principle be sidestepped by claiming a
-different, unbanned one. OTP mail relay (§18.7) carries no equivalent
-exposure: a relaying server forwards only the opaque ciphertext its own
-client already couldn't read either. Federating with a server is
-choosing to trust its directory (and, for a join-proxy, that
-one password in transit) the same way registering a nickname there is
-choosing to trust it with an account. A federation-known login redirect also
+different, unbanned one. A joiner's public key bundle and key mode -
+`JoinProxyRequest.joiner_public_key_der`/`_key_mode`, carried so the home
+server can name them in the `ChannelMemberJoined` gossip it relays onward
+- similarly reaches every server linked to the home one, not only the
+home server itself, the moment that join is granted; this is the same
+information a client already announces to its own server on connect
+(`Identify`), just now visible to every federated server with a member in
+that channel rather than one. OTP mail relay (§18.7) carries no
+equivalent exposure: a relaying server forwards only the opaque
+ciphertext its own client already couldn't read either. Federating with a
+server is choosing to trust its directory (and, for a join-proxy, that
+one password in transit, and a joiner's public identity relayed onward)
+the same way registering a nickname there is choosing to trust it with an
+account. A federation-known login redirect also
 narrows the anti-enumeration property §5.1's `AuthCheck::Rejected`
 otherwise gives: telling a user "this nickname is on server X" necessarily
 discloses that the nickname exists, which an ordinary refusal does not - a

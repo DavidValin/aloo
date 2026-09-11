@@ -251,11 +251,58 @@ pub struct Registry {
     clients: HashMap<UserId, ClientRecord>,
     next_id: u64,
     channels: channels_registry::ChannelsRegistry,
+    /// Federation only: a stable, made-up `UserId` for each federated
+    /// member this server has ever displayed (in a `UserJoined`/`UserLeft`
+    /// for a channel it mirrors) - minted lazily the first time a given
+    /// (server, nickname) is seen, from `next_remote_id` counting *down*
+    /// from `u64::MAX` rather than `next_id`'s own count up from 1, so the
+    /// two id spaces can never collide regardless of how long either
+    /// server runs. Never forgotten (no cleanup on a departure): the
+    /// reservation is cheap to keep and means the same federated person
+    /// keeps the same id across every channel and every rejoin, for the
+    /// life of this server's process.
+    remote_ids: HashMap<(String, String), UserId>,
+    next_remote_id: u64,
 }
 
 impl Default for Registry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The free-function form of `Registry::remote_user_id`/`remote_user_info`,
+/// taking `remote_ids`/`next_remote_id` directly rather than `&mut
+/// Registry` - what a wrapper method that also needs to borrow
+/// `self.channels` mutably at the same time (`self.channels.join(...)`,
+/// say) calls instead, since Rust can see these as disjoint field borrows
+/// but not through a `self.method()` call on the whole `Registry`.
+fn mint_remote_user_id(
+    remote_ids: &mut HashMap<(String, String), UserId>,
+    next_remote_id: &mut u64,
+    server: &str,
+    nickname: &str,
+) -> UserId {
+    let key = (server.to_string(), nickname.to_string());
+    if let Some(id) = remote_ids.get(&key) {
+        return *id;
+    }
+    let id = UserId(*next_remote_id);
+    *next_remote_id -= 1;
+    remote_ids.insert(key, id);
+    id
+}
+
+fn mint_remote_user_info(
+    remote_ids: &mut HashMap<(String, String), UserId>,
+    next_remote_id: &mut u64,
+    identity: &federation::proto::RemoteIdentity,
+) -> UserInfo {
+    UserInfo {
+        id: mint_remote_user_id(remote_ids, next_remote_id, &identity.server, &identity.nickname),
+        name: identity.nickname.clone(),
+        public_key_der: identity.public_key_der.clone(),
+        key_mode: identity.key_mode,
     }
 }
 
@@ -269,6 +316,8 @@ impl Registry {
             clients: HashMap::new(),
             next_id: 1,
             channels: channels_registry::ChannelsRegistry::new(None),
+            remote_ids: HashMap::new(),
+            next_remote_id: u64::MAX,
         }
     }
 
@@ -279,6 +328,8 @@ impl Registry {
             clients: HashMap::new(),
             next_id: 1,
             channels: channels_registry::ChannelsRegistry::new(period),
+            remote_ids: HashMap::new(),
+            next_remote_id: u64::MAX,
         }
     }
 
@@ -361,22 +412,84 @@ impl Registry {
 
     /// Validates and (on success) records a federation peer's join-proxy
     /// request - see `channels_registry::ChannelsRegistry::join_remote`.
-    /// Only ever called on the server that actually owns `name`.
+    /// Only ever called on the server that actually owns `name`. The
+    /// `Vec<Outgoing>` in a successful result is for this server's own
+    /// *local* members of `name`, who need to be told `identity` just
+    /// joined - the caller (`crate::server::federation`) dispatches them
+    /// and gossips `ChannelMemberJoined` to every other linked peer.
     pub fn join_channel_remote(
         &mut self,
         name: &str,
-        remote_server: &str,
-        joiner_nickname: &str,
+        identity: &federation::proto::RemoteIdentity,
         password: Option<&str>,
         source_ip: IpAddr,
-    ) -> Option<Result<(ChannelKind, Option<String>), proto::ChannelJoinRejection>> {
-        self.channels.join_remote(name, remote_server, joiner_nickname, password, source_ip)
+    ) -> Option<Result<(ChannelKind, Option<String>, Vec<Outgoing>), proto::ChannelJoinRejection>> {
+        let clients = &self.clients;
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.join_remote(
+            name,
+            identity,
+            password,
+            source_ip,
+            |uid| {
+                clients.get(&uid).map(|c| UserInfo {
+                    id: uid,
+                    name: c.name.clone(),
+                    public_key_der: c.public_key_der.clone(),
+                    key_mode: c.key_mode,
+                })
+            },
+            |identity| mint_remote_user_info(remote_ids, next_remote_id, identity),
+        )
     }
 
     /// Applies a federation peer's `LeaveProxyNotice` - see
-    /// `channels_registry::ChannelsRegistry::leave_remote`.
-    pub fn leave_channel_remote(&mut self, name: &str, remote_server: &str, nickname: &str) {
-        self.channels.leave_remote(name, remote_server, nickname);
+    /// `channels_registry::ChannelsRegistry::leave_remote`. The result is
+    /// for this server's own local members of `name` (the caller gossips
+    /// `ChannelMemberLeft` on to every other linked peer).
+    pub fn leave_channel_remote(&mut self, name: &str, remote_server: &str, nickname: &str) -> Vec<Outgoing> {
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.leave_remote(name, remote_server, nickname, |server, nickname| {
+            mint_remote_user_id(remote_ids, next_remote_id, server, nickname)
+        })
+    }
+
+    /// Applies third-party `ChannelMemberJoined` gossip locally - see
+    /// `channels_registry::ChannelsRegistry::mirror_member_joined`.
+    pub fn mirror_channel_member_joined(
+        &mut self,
+        channel: &str,
+        identity: &federation::proto::RemoteIdentity,
+    ) -> Vec<Outgoing> {
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels
+            .mirror_member_joined(channel, identity, |identity| mint_remote_user_info(remote_ids, next_remote_id, identity))
+    }
+
+    /// Applies third-party `ChannelMemberLeft` gossip locally - see
+    /// `channels_registry::ChannelsRegistry::mirror_member_left`.
+    pub fn mirror_channel_member_left(&mut self, channel: &str, server: &str, nickname: &str) -> Vec<Outgoing> {
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        self.channels.mirror_member_left(channel, server, nickname, |server, nickname| {
+            mint_remote_user_id(remote_ids, next_remote_id, server, nickname)
+        })
+    }
+
+    /// "Fully shared channel list" - see
+    /// `channels_registry::ChannelsRegistry::ensure_public_mirror`.
+    pub fn ensure_public_channel_known(&mut self, name: &str, kind: ChannelKind) -> bool {
+        self.channels.ensure_public_mirror(name, kind)
+    }
+
+    /// Every currently-connected client's `UserId` - used to broadcast
+    /// something to everyone, such as a federated public channel's
+    /// `ChannelCreated` the moment this server first learns of it.
+    pub fn all_client_ids(&self) -> Vec<UserId> {
+        self.clients.keys().copied().collect()
     }
 
     /// Mirrors a federation join-proxy's grant locally - see
@@ -390,14 +503,24 @@ impl Registry {
     ) -> Result<Vec<Outgoing>, String> {
         let joiner = self.user_info(id).ok_or_else(|| "unknown user".to_string())?;
         let clients = &self.clients;
-        Ok(self.channels.mirror_remote_join(id, &joiner, name, kind, admin, |uid| {
-            clients.get(&uid).map(|c| UserInfo {
-                id: uid,
-                name: c.name.clone(),
-                public_key_der: c.public_key_der.clone(),
-                key_mode: c.key_mode,
-            })
-        }))
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
+        Ok(self.channels.mirror_remote_join(
+            id,
+            &joiner,
+            name,
+            kind,
+            admin,
+            |uid| {
+                clients.get(&uid).map(|c| UserInfo {
+                    id: uid,
+                    name: c.name.clone(),
+                    public_key_der: c.public_key_der.clone(),
+                    key_mode: c.key_mode,
+                })
+            },
+            |identity| mint_remote_user_info(remote_ids, next_remote_id, identity),
+        ))
     }
 
     /// Joins `id` to `name`, creating the channel (as `kind`) if needed;
@@ -440,6 +563,8 @@ impl Registry {
         // but its creator.
         let all_ids: Vec<UserId> = self.clients.keys().copied().collect();
         let clients = &self.clients;
+        let remote_ids = &mut self.remote_ids;
+        let next_remote_id = &mut self.next_remote_id;
         self.channels.join(
             id,
             &user,
@@ -457,6 +582,7 @@ impl Registry {
                     key_mode: c.key_mode,
                 })
             },
+            |identity| mint_remote_user_info(remote_ids, next_remote_id, identity),
         )
     }
 
@@ -1053,6 +1179,7 @@ async fn handle_connection(
         if let Some(nickname) = nickname {
             for channel in channels {
                 federation.notify_leave_if_remote(&channel, &nickname).await;
+                federation_announce_channel_member_left(&options, &channel, &nickname).await;
             }
         }
     }
@@ -1141,11 +1268,19 @@ async fn federation_proxy_join(
     if already_mirrored {
         return Some(Vec::new());
     }
-    let joiner_nickname = {
+    let joiner_info = {
         let reg = registry.lock().await;
-        reg.user_info(id)?.name
+        reg.user_info(id)?
     };
-    let outcome = federation.request_join_proxy(name, &joiner_nickname, password).await;
+    let outcome = federation
+        .request_join_proxy(
+            name,
+            &joiner_info.name,
+            password,
+            joiner_info.public_key_der.clone(),
+            joiner_info.key_mode,
+        )
+        .await;
     Some(match outcome {
         Ok(federation::proto::JoinProxyOutcome::Joined { kind, admin }) => {
             let mut reg = registry.lock().await;
@@ -1188,7 +1323,7 @@ async fn handle_join_channel(
         return outgoing;
     }
     let name_for_err = name.clone();
-    let (existed_before, result) = {
+    let (existed_before, result, joiner_info) = {
         let mut reg = registry.lock().await;
         let existed_before = reg.channel_exists(&name);
         let result = reg.join_channel_with_policy(
@@ -1199,10 +1334,16 @@ async fn handle_join_channel(
             source_ip,
             options.allow_create_public_channels,
         );
-        (existed_before, result)
+        let joiner_info = reg.user_info(id);
+        (existed_before, result, joiner_info)
     };
     if !existed_before && result.is_ok() {
         federation_announce_channel(options, &name, kind).await;
+    }
+    if result.is_ok()
+        && let Some(joiner_info) = joiner_info
+    {
+        federation_announce_channel_member(options, &name, joiner_info).await;
     }
     result.unwrap_or_else(|reason| {
         vec![Outgoing::new(
@@ -1234,6 +1375,68 @@ async fn federation_announce_channel(options: &ServerOptions, name: &str, kind: 
         federation,
         federation::proto::FederationMessage::ChannelRegistered { channel: info },
         federation::event::CHANNEL_GOSSIP,
+    )
+    .await;
+}
+
+/// Gossips `member`'s (local) join to `name` to every linked peer, so a
+/// server that mirrors this channel - whether as its own home too (never
+/// possible, ownership is exclusive) or because one of its own clients
+/// joined it via proxy - learns of the new member. A no-op unless the
+/// federation directory says *this* server owns `name`: only the home
+/// server ever has full membership visibility, so it is the only one
+/// that ever sends this (a channel this server merely mirrors gossips
+/// nothing on a local join to it - there is no such thing, a local join
+/// to a peer-owned channel is always proxied, never local). Called after
+/// every successful `JoinChannel`, new channel or not - a rejoin to an
+/// already-owned channel is a harmless repeat on the receiving end
+/// (`ChannelsRegistry::mirror_member_joined` is idempotent).
+async fn federation_announce_channel_member(options: &ServerOptions, name: &str, member: UserInfo) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    let owned_by_self = matches!(
+        federation.directory.lock().await.owner_of_channel(name),
+        Some(info) if info.owner == federation.self_id
+    );
+    if !owned_by_self {
+        return;
+    }
+    let identity = federation::proto::RemoteIdentity {
+        server: federation.self_id.clone(),
+        nickname: member.name,
+        public_key_der: member.public_key_der,
+        key_mode: member.key_mode,
+    };
+    federation::broadcast(
+        federation,
+        federation::proto::FederationMessage::ChannelMemberJoined { channel: name.to_string(), member: identity },
+        federation::event::CHANNEL_MEMBER_JOINED,
+    )
+    .await;
+}
+
+/// The departure mirror of `federation_announce_channel_member` - see its
+/// doc for why this is a no-op unless `name` is owned by this server.
+async fn federation_announce_channel_member_left(options: &ServerOptions, name: &str, nickname: &str) {
+    let Some(federation) = &options.federation else {
+        return;
+    };
+    let owned_by_self = matches!(
+        federation.directory.lock().await.owner_of_channel(name),
+        Some(info) if info.owner == federation.self_id
+    );
+    if !owned_by_self {
+        return;
+    }
+    federation::broadcast(
+        federation,
+        federation::proto::FederationMessage::ChannelMemberLeft {
+            channel: name.to_string(),
+            server: federation.self_id.clone(),
+            nickname: nickname.to_string(),
+        },
+        federation::event::CHANNEL_MEMBER_LEFT,
     )
     .await;
 }
@@ -1359,11 +1562,13 @@ async fn client_loop<R: AsyncRead + Unpin>(
             let mut reg = registry.lock().await;
             match msg {
                 ClientMessage::LeaveChannel { name } => {
+                    let nickname = reg.user_info(id).map(|u| u.name);
                     let outgoing = reg.leave_channel(id, &name);
                     if let Some(federation) = &options.federation
-                        && let Some(nickname) = reg.user_info(id).map(|u| u.name)
+                        && let Some(nickname) = &nickname
                     {
-                        federation.notify_leave_if_remote(&name, &nickname).await;
+                        federation.notify_leave_if_remote(&name, nickname).await;
+                        federation_announce_channel_member_left(options, &name, nickname).await;
                     }
                     outgoing
                 }

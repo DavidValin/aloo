@@ -703,6 +703,201 @@ async fn spawn_federated_pair_with(
     (server_a, server_b)
 }
 
+/// Three real, client-facing federated servers in a star: `hub` (whose id
+/// sorts first, so it is the one that dials out to each leaf - see
+/// `dial_peer`) configured with both `leafA` and `leafB` as peers, while
+/// `leafA` and `leafB` are only ever configured with `hub` - they never
+/// link to each other directly at all. What
+/// `a_third_servers_member_sees_presence_relayed_through_the_hub` uses to
+/// prove `ChannelMemberJoined`/`ChannelMemberLeft` gossip reaches a server
+/// with no direct link to the one that actually granted the join - only a
+/// shared home server in common.
+async fn spawn_federated_star(
+    tag: &str,
+) -> (server_common::TestServer, server_common::TestServer, server_common::TestServer) {
+    let dir_hub = temp_dir(&format!("{tag}-hub"));
+    let dir_a = temp_dir(&format!("{tag}-leafa"));
+    let dir_b = temp_dir(&format!("{tag}-leafb"));
+    let (identity_hub, pub_hub) = write_identity(&dir_hub);
+    let (identity_a, pub_a) = write_identity(&dir_a);
+    let (identity_b, pub_b) = write_identity(&dir_b);
+    let port_hub = reserve_port().await;
+    let port_a = reserve_port().await;
+    let port_b = reserve_port().await;
+
+    let config_hub = FederationConfig::new(
+        "hub".to_string(),
+        format!("127.0.0.1:{port_hub}").parse().unwrap(),
+        format!("127.0.0.1:{port_hub}"),
+        identity_hub,
+        vec![
+            FederationPeerConfig {
+                peer_id: "leafA".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: port_a,
+                public_key_path: pub_a.display().to_string(),
+            },
+            FederationPeerConfig {
+                peer_id: "leafB".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: port_b,
+                public_key_path: pub_b.display().to_string(),
+            },
+        ],
+        FederationDirectory::open(dir_hub.join("directory")).unwrap(),
+    )
+    .unwrap();
+    let config_a = FederationConfig::new(
+        "leafA".to_string(),
+        format!("127.0.0.1:{port_a}").parse().unwrap(),
+        format!("127.0.0.1:{port_a}"),
+        identity_a,
+        vec![FederationPeerConfig {
+            peer_id: "hub".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port_hub,
+            public_key_path: pub_hub.display().to_string(),
+        }],
+        FederationDirectory::open(dir_a.join("directory")).unwrap(),
+    )
+    .unwrap();
+    let config_b = FederationConfig::new(
+        "leafB".to_string(),
+        format!("127.0.0.1:{port_b}").parse().unwrap(),
+        format!("127.0.0.1:{port_b}"),
+        identity_b,
+        vec![FederationPeerConfig {
+            peer_id: "hub".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port_hub,
+            public_key_path: pub_hub.display().to_string(),
+        }],
+        FederationDirectory::open(dir_b.join("directory")).unwrap(),
+    )
+    .unwrap();
+
+    let hub = server_common::TestServer::spawn(
+        server_common::test_options(&format!("{tag}-hub")).with_federation(config_hub),
+    )
+    .await;
+    let leaf_a =
+        server_common::TestServer::spawn(server_common::test_options(&format!("{tag}-a")).with_federation(config_a))
+            .await;
+    let leaf_b =
+        server_common::TestServer::spawn(server_common::test_options(&format!("{tag}-b")).with_federation(config_b))
+            .await;
+
+    // Both links up: proven by each leaf's directory learning the other
+    // exists via the hub's snapshot (never directly - they aren't peers
+    // of each other), the same "peer's directory finally agrees" signal
+    // `spawn_federated_pair_with` uses for a single link.
+    federate_nickname(&hub, "hub", "hub-linkcheck").await;
+    wait_until(Duration::from_secs(5), || async {
+        matches!(
+            leaf_a.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hub-linkcheck"),
+            Some(Ownership::Owned(owner)) if owner == "hub"
+        )
+    })
+    .await;
+    wait_until(Duration::from_secs(5), || async {
+        matches!(
+            leaf_b.options.federation.as_ref().unwrap().directory.lock().await.owner_of_nickname("hub-linkcheck"),
+            Some(Ownership::Owned(owner)) if owner == "hub"
+        )
+    })
+    .await;
+
+    (hub, leaf_a, leaf_b)
+}
+
+/// The whole point of gossiping `ChannelMemberJoined`/`ChannelMemberLeft`
+/// to *every* linked peer, not just the one a join-proxy request came
+/// from: a server with no direct link at all to the server whose client
+/// just joined still learns about it, purely through their shared home
+/// server relaying it on. `leafA` and `leafB` are never peers of each
+/// other here - only of `hub`, which owns the channel both their clients
+/// join.
+/// @requirement AC-483, TB-310
+#[tokio::test]
+async fn a_third_servers_member_sees_presence_relayed_through_the_hub() {
+    let (hub, leaf_a, leaf_b) = spawn_federated_star("presence-relay").await;
+
+    let mut alice = hub.connect().await;
+    hub.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "plaza".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(recv_with_timeout(&mut alice).await, ServerMessage::Joined { .. }));
+
+    // The channel reaches leafB (fully shared list) before leafB has any
+    // member in it at all - proof this doesn't depend on leafB having
+    // proxied a join first.
+    wait_until(Duration::from_secs(5), || async {
+        matches!(
+            leaf_b.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("plaza"),
+            Some(info) if info.owner == "hub"
+        )
+    })
+    .await;
+
+    let mut bob = leaf_a.connect().await;
+    leaf_a.handshake(&mut bob, "bob").await;
+    bob.send(&ClientMessage::JoinChannel {
+        name: "plaza".to_string(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    // leafA already knew about alice - relayed the same way "plaza"
+    // itself was - so bob is told about her before his own `Joined`.
+    let alice_presence = recv_with_timeout(&mut bob).await;
+    assert!(
+        matches!(&alice_presence, ServerMessage::UserJoined { channel, user } if channel == "plaza" && user.name == "alice"),
+        "{alice_presence:?}"
+    );
+    assert!(matches!(recv_with_timeout(&mut bob).await, ServerMessage::Joined { .. }));
+
+    // carol, connected to leafB - which has never linked to leafA at all
+    // - joins the same channel and must already see both alice and bob in
+    // it (alice relayed the same way "plaza" itself was, bob purely
+    // through the hub, since leafB has no link of its own to leafA).
+    let mut carol = leaf_b.connect().await;
+    leaf_b.handshake(&mut carol, "carol").await;
+    carol
+        .send(&ClientMessage::JoinChannel {
+            name: "plaza".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    let mut seen_before_joined = Vec::new();
+    loop {
+        match recv_with_timeout(&mut carol).await {
+            ServerMessage::UserJoined { channel, user } if channel == "plaza" => seen_before_joined.push(user.name),
+            ServerMessage::Joined { .. } => break,
+            other => panic!("unexpected message while carol joins: {other:?}"),
+        }
+    }
+    seen_before_joined.sort();
+    assert_eq!(seen_before_joined, vec!["alice".to_string(), "bob".to_string()]);
+
+    // bob leaving reaches carol the same way, purely relayed through the
+    // hub - not because leafA and leafB ever spoke directly.
+    bob.send(&ClientMessage::LeaveChannel { name: "plaza".to_string() }).await.unwrap();
+    let bob_left = recv_with_timeout(&mut carol).await;
+    assert!(
+        matches!(&bob_left, ServerMessage::UserLeft { channel, .. } if channel == "plaza"),
+        "{bob_left:?}"
+    );
+}
+
 /// Records `nickname` as owned by `owner_id` in `server`'s own directory
 /// and gossips it to every linked peer - exactly what `register_account`'s
 /// wire flow does on a real `Register`, reproduced directly here since
@@ -808,6 +1003,102 @@ async fn a_client_on_one_server_joins_a_private_channel_homed_on_another() {
     );
 }
 
+/// "Fully shared channel list" (docs/PROTOCOL.md §18.2): a *public*
+/// channel created on one federated server is announced live
+/// (`ServerMessage::ChannelCreated`) to a client already connected to a
+/// *different* server, who never joined it and never even knew its name -
+/// the same way a local client already learns about a brand-new local
+/// public channel, just across the federation link instead of within one
+/// server. A private channel created the same way stays invisible, exactly
+/// like a local one would.
+/// @requirement AC-482
+#[tokio::test]
+async fn a_public_channel_created_on_one_server_is_announced_live_to_an_already_connected_client_on_another() {
+    let (server_a, server_b) = spawn_federated_pair("shared-list").await;
+
+    // Connected to server B *before* the channel exists anywhere - proof
+    // this is a live announcement, not something picked up from a
+    // connect-time `ChannelList` snapshot that merely happened to be
+    // fresh enough.
+    let mut bob = server_b.connect().await;
+    server_b.handshake(&mut bob, "bob").await;
+
+    let mut alice = server_a.connect().await;
+    server_a.handshake(&mut alice, "alice").await;
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "lobby".to_string(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+        .await
+        .unwrap();
+    let created = recv_with_timeout(&mut alice).await;
+    assert!(matches!(created, ServerMessage::Joined { .. }), "{created:?}");
+
+    let announced = recv_with_timeout(&mut bob).await;
+    assert!(
+        matches!(
+            &announced,
+            ServerMessage::ChannelCreated { channel: ChannelInfo { name, kind: ChannelKind::Public } }
+                if name == "lobby"
+        ),
+        "{announced:?}"
+    );
+
+    // A *private* channel, created the same way, never gets this
+    // treatment - it stays reachable only by knowing its name, exactly
+    // like a local private channel.
+    alice
+        .send(&ClientMessage::JoinChannel {
+            name: "hideout".to_string(),
+            kind: ChannelKind::Private,
+            password: Some("shh".to_string()),
+        })
+        .await
+        .unwrap();
+    let created = recv_with_timeout(&mut alice).await;
+    assert!(matches!(created, ServerMessage::Joined { .. }), "{created:?}");
+
+    wait_until(Duration::from_secs(5), || async {
+        matches!(
+            server_b.options.federation.as_ref().unwrap().directory.lock().await.owner_of_channel("hideout"),
+            Some(info) if info.owner == "serverA"
+        )
+    })
+    .await;
+    // The directory (server B's internal bookkeeping) knows "hideout"
+    // belongs to serverA by now, but that must never surface as a public
+    // listing: a fresh connection to server B gets a `ChannelList` with no
+    // trace of it.
+    let channels = channel_list_via_fresh_connection(&server_b, "carol").await;
+    assert!(
+        !channels.iter().any(|c| c.name == "hideout"),
+        "a private channel must never appear in another server's public channel list: {channels:?}"
+    );
+}
+
+/// Connects `nickname` fresh to `server` and returns exactly the
+/// `ChannelList` it gets right after the handshake - `TestServer::handshake`
+/// only asserts that message's shape, not its content, which is what a
+/// "does a channel show up" test actually needs.
+async fn channel_list_via_fresh_connection(server: &server_common::TestServer, nickname: &str) -> Vec<ChannelInfo> {
+    server.ensure_user(nickname);
+    let mut stream = server.connect().await;
+    let result = server_common::login(&mut stream, nickname, &server_common::password_for(nickname)).await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }), "{result:?}");
+    stream
+        .send(&ClientMessage::Identify { public_key_der: vec![], key_mode: aloo::proto::KeyMode::PqHybrid })
+        .await
+        .unwrap();
+    let identify: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(identify, ServerMessage::IdentifyResult { ok: true, .. }), "{identify:?}");
+    let ServerMessage::ChannelList { channels, .. } = recv_with_timeout(&mut stream).await else {
+        panic!("expected a ChannelList right after IdentifyResult");
+    };
+    channels
+}
+
 /// OTP mail uploaded on `serverB`, addressed to a nickname registered and
 /// connected on `serverA`, is forwarded there and delivered live; the
 /// recipient's ack relays a delivery receipt back to `serverB` so the
@@ -891,7 +1182,7 @@ async fn otp_mail_crosses_servers_and_the_receipt_relays_back() {
 /// own local clients had proxy-joined it) force-deletes its mirror too,
 /// notifying that local client exactly as an ordinary local deletion
 /// would.
-/// @requirement AC-481, TB-309
+/// @requirement AC-481, AC-483, TB-309
 #[tokio::test]
 async fn deleting_a_channel_clears_it_from_every_peer_and_force_deletes_a_mirror() {
     let (server_a, server_b) = spawn_federated_pair("delete-channel").await;
@@ -925,8 +1216,26 @@ async fn deleting_a_channel_clears_it_from_every_peer_and_force_deletes_a_mirror
     })
     .await
     .unwrap();
+    // Bob is told about alice - already a member through federation - via
+    // a `UserJoined` ahead of his own `Joined`, the same order a local
+    // join already tells a joiner about every pre-existing member before
+    // confirming the join itself.
+    let alice_presence = recv_with_timeout(&mut bob).await;
+    assert!(
+        matches!(&alice_presence, ServerMessage::UserJoined { channel, user } if channel == "vault" && user.name == "alice"),
+        "{alice_presence:?}"
+    );
     let joined = recv_with_timeout(&mut bob).await;
     assert!(matches!(joined, ServerMessage::Joined { .. }), "{joined:?}");
+
+    // alice, a genuine local member of "vault" on its home server, was
+    // already told about bob's federated join via `UserJoined` (the same
+    // fix that told bob about alice above, the other direction).
+    let bob_presence = recv_with_timeout(&mut alice).await;
+    assert!(
+        matches!(&bob_presence, ServerMessage::UserJoined { channel, user } if channel == "vault" && user.name == "bob"),
+        "{bob_presence:?}"
+    );
 
     // alice, the channel's own admin, deletes it on its home server.
     alice.send(&ClientMessage::DeleteChannel { name: "vault".to_string() }).await.unwrap();

@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::pq::PqEncapKeys;
-use crate::proto::{ChannelJoinRejection, ChannelKind};
+use crate::proto::{ChannelJoinRejection, ChannelKind, KeyMode};
 use crate::server::mail::StoredMail;
 
 /// One channel's federation-visible metadata - deliberately not
@@ -34,6 +34,22 @@ pub struct FederatedChannelInfo {
     /// The `server_federation_id` of whichever server this channel was
     /// created on - the only server that ever holds its password.
     pub owner: String,
+}
+
+/// Enough of a federated member's identity to show them in a channel's
+/// member list on a server they have no live connection to: which server
+/// they actually are connected to, their nickname there, and the public
+/// bundle peers would seal to if federated peer-to-peer linking existed
+/// (it does not yet - see docs/PROTOCOL.md §18.5 - so this is carried
+/// forward for when it does, and meanwhile just lets a receiving server
+/// build a `UserInfo` good enough to display). Never carries a password
+/// or anything membership-unrelated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIdentity {
+    pub server: String,
+    pub nickname: String,
+    pub public_key_der: Vec<u8>,
+    pub key_mode: KeyMode,
 }
 
 /// Server-to-server messages. The first two variants, `Hello` and
@@ -85,7 +101,15 @@ pub enum FederationMessage {
     /// of the federation's directories stay current without waiting for
     /// the next full snapshot.
     NicknameRegistered { nickname: String, owner: String },
-    /// Gossip: `channel` was just created on its `owner`.
+    /// Gossip: `channel` was just created on its `owner`. For a *public*
+    /// channel, every receiving server also mirrors it into its own local
+    /// channel registry right away (empty of members) and tells its own
+    /// connected clients about it (`ServerMessage::ChannelCreated`) - the
+    /// whole federation is meant to see one shared public channel list,
+    /// not just whichever servers a client happens to have joined
+    /// something on already. A private channel is never mirrored this
+    /// way; it stays reachable only by knowing its name, exactly like a
+    /// local one.
     ChannelRegistered { channel: FederatedChannelInfo },
     /// Gossip: a channel owned by `owner` was removed (`/delete-channel`,
     /// a superadmin's removal, or the inactivity sweep) - clears `owner`'s
@@ -103,11 +127,18 @@ pub enum FederationMessage {
     /// that ever checks `password`, since it is the only one that ever
     /// holds it. `request_id` is unique per requester (not global), and
     /// only ever echoed back on the same link it went out on.
+    /// `joiner_public_key_der`/`joiner_key_mode` carry the requester's own
+    /// identity forward so the home server can name it in the
+    /// `ChannelMemberJoined` gossip it sends on to every other linked
+    /// peer - the home server has no other way to learn it, since this
+    /// joiner has no connection to it at all.
     JoinProxyRequest {
         request_id: u64,
         channel: String,
         joiner_nickname: String,
         password: Option<String>,
+        joiner_public_key_der: Vec<u8>,
+        joiner_key_mode: KeyMode,
     },
     /// The home server's answer to one `JoinProxyRequest`.
     JoinProxyResponse { request_id: u64, outcome: JoinProxyOutcome },
@@ -115,6 +146,23 @@ pub enum FederationMessage {
     /// from) `channel`, owned by the recipient - nothing waits on this,
     /// so there is no response.
     LeaveProxyNotice { channel: String, nickname: String },
+
+    /// Gossiped by a channel's *home* server every time anyone - a local
+    /// client of its own, or a federation peer's, via `JoinProxyRequest` -
+    /// joins one of its channels, to every currently-linked peer (whether
+    /// or not that peer has any members in this channel itself - a peer
+    /// with none simply merges and does nothing with it). Only the home
+    /// server ever sends this: it is the only server with full visibility
+    /// of a channel's real membership. A receiving server that already
+    /// mirrors `channel` (as its own home, or because one of its own
+    /// clients joined it via proxy) records `member` and tells its local
+    /// members about the new arrival; one that doesn't mirror it at all
+    /// has nothing to update and drops this silently.
+    ChannelMemberJoined { channel: String, member: RemoteIdentity },
+    /// The departure mirror of `ChannelMemberJoined` - `server`/`nickname`
+    /// identify the leaving member the same way `RemoteIdentity` does,
+    /// without needing to repeat their key material.
+    ChannelMemberLeft { channel: String, server: String, nickname: String },
 
     /// Hands an uploaded OTP mail's opaque ciphertext (plus its routing
     /// metadata) to the federated server that owns `mail.to` - the

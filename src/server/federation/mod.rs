@@ -212,6 +212,8 @@ impl FederationConfig {
         channel: &str,
         joiner_nickname: &str,
         password: Option<&str>,
+        joiner_public_key_der: Vec<u8>,
+        joiner_key_mode: crate::proto::KeyMode,
     ) -> Result<JoinProxyOutcome, String> {
         let owner = match self.directory.lock().await.owner_of_channel(channel) {
             Some(info) if info.owner != self.self_id => info.owner.clone(),
@@ -228,6 +230,8 @@ impl FederationConfig {
                     channel: channel.to_string(),
                     joiner_nickname: joiner_nickname.to_string(),
                     password: password.map(str::to_string),
+                    joiner_public_key_der,
+                    joiner_key_mode,
                 },
             )
             .await;
@@ -361,6 +365,8 @@ pub mod event {
     pub const NICK_DELETED: &str = "NICK_DELETED";
     pub const CHANNEL_GOSSIP: &str = "CHANNEL_GOSSIP";
     pub const CHANNEL_DELETED: &str = "CHANNEL_DELETED";
+    pub const CHANNEL_MEMBER_JOINED: &str = "CHANNEL_MEMBER_JOINED";
+    pub const CHANNEL_MEMBER_LEFT: &str = "CHANNEL_MEMBER_LEFT";
     pub const PROXIED_JOIN_CHANNEL_TO_SERVER: &str = "PROXIED_JOIN_CHANNEL_TO_SERVER";
     pub const PROXIED_JOIN_CHANNEL_FROM_SERVER: &str = "PROXIED_JOIN_CHANNEL_FROM_SERVER";
     pub const OTP_MAIL_FORWARDED: &str = "OTP_MAIL_FORWARDED";
@@ -598,6 +604,43 @@ fn synthetic_source_ip(peer_id: &str) -> std::net::IpAddr {
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(h[0], h[1], h[2], h[3]))
 }
 
+/// "Fully shared channel list" (docs/PROTOCOL.md §18.2): mirrors `channel`
+/// into this server's own local channel registry the moment it is learned
+/// about, whether from live `ChannelRegistered` gossip or a peer link's
+/// initial `DirectorySnapshot`, and tells this server's own connected
+/// clients right away (`ServerMessage::ChannelCreated`) rather than
+/// leaving it invisible until someone here happens to join it by name. A
+/// no-op for a private channel (stays discoverable only by knowing its
+/// name, exactly like a local one), for a channel this server owns itself
+/// (it already has full local knowledge - this can happen when a peer's
+/// snapshot reflects back something it originally learned from us), or
+/// for one already known here (whether as this server's own, a mirror
+/// from an earlier join, or a previous call to this same function).
+async fn ensure_public_channel_and_announce(ctx: &FederationContext, channel: &proto::FederatedChannelInfo) {
+    if channel.kind != crate::proto::ChannelKind::Public || channel.owner == ctx.config.self_id {
+        return;
+    }
+    let newly_known = ctx.registry.lock().await.ensure_public_channel_known(&channel.name, channel.kind);
+    if newly_known {
+        let outgoing = ctx
+            .registry
+            .lock()
+            .await
+            .all_client_ids()
+            .into_iter()
+            .map(|to| {
+                crate::server::Outgoing::new(
+                    to,
+                    crate::proto::ServerMessage::ChannelCreated {
+                        channel: crate::proto::ChannelInfo { name: channel.name.clone(), kind: channel.kind },
+                    },
+                )
+            })
+            .collect();
+        crate::server::dispatch(&ctx.senders, outgoing).await;
+    }
+}
+
 /// Applies one message received over an established federation link from
 /// `peer_id` - directory gossip, a join/leave proxy, or a mail relay.
 async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationMessage) {
@@ -608,12 +651,17 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             // this even starts; a repeat of either is nothing to act on.
         }
         FederationMessage::DirectorySnapshot { nicknames, channels } => {
-            let mut dir = ctx.config.directory.lock().await;
-            for (nickname, owner) in nicknames {
-                let _ = dir.merge_remote_nickname(nickname, owner);
+            {
+                let mut dir = ctx.config.directory.lock().await;
+                for (nickname, owner) in nicknames {
+                    let _ = dir.merge_remote_nickname(nickname, owner);
+                }
+                for channel in &channels {
+                    dir.merge_remote_channel(channel.clone());
+                }
             }
             for channel in channels {
-                dir.merge_remote_channel(channel);
+                ensure_public_channel_and_announce(ctx, &channel).await;
             }
         }
         FederationMessage::NicknameRegistered { nickname, owner } => {
@@ -621,8 +669,9 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             log_federation_event(peer_id, event::NICKS_GOSSIP);
         }
         FederationMessage::ChannelRegistered { channel } => {
-            ctx.config.directory.lock().await.merge_remote_channel(channel);
+            ctx.config.directory.lock().await.merge_remote_channel(channel.clone());
             log_federation_event(peer_id, event::CHANNEL_GOSSIP);
+            ensure_public_channel_and_announce(ctx, &channel).await;
         }
         FederationMessage::ChannelRemoved { name, owner } => {
             // If this server mirrors *that exact* channel (its directory
@@ -658,25 +707,37 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             channel,
             joiner_nickname,
             password,
+            joiner_public_key_der,
+            joiner_key_mode,
         } => {
-            let outcome = {
+            let identity = proto::RemoteIdentity {
+                server: peer_id.to_string(),
+                nickname: joiner_nickname,
+                public_key_der: joiner_public_key_der,
+                key_mode: joiner_key_mode,
+            };
+            let (outcome, member_outgoing) = {
                 let mut reg = ctx.registry.lock().await;
-                match reg.join_channel_remote(
-                    &channel,
-                    peer_id,
-                    &joiner_nickname,
-                    password.as_deref(),
-                    synthetic_source_ip(peer_id),
-                ) {
-                    Some(Ok((kind, admin))) => JoinProxyOutcome::Joined { kind, admin },
-                    Some(Err(rejection)) => JoinProxyOutcome::Rejected(rejection),
-                    None => JoinProxyOutcome::UnknownChannel,
+                match reg.join_channel_remote(&channel, &identity, password.as_deref(), synthetic_source_ip(peer_id)) {
+                    Some(Ok((kind, admin, outgoing))) => (JoinProxyOutcome::Joined { kind, admin }, outgoing),
+                    Some(Err(rejection)) => (JoinProxyOutcome::Rejected(rejection), Vec::new()),
+                    None => (JoinProxyOutcome::UnknownChannel, Vec::new()),
                 }
             };
             log_federation_event(peer_id, event::PROXIED_JOIN_CHANNEL_FROM_SERVER);
+            let granted = matches!(outcome, JoinProxyOutcome::Joined { .. });
             ctx.config
                 .send_to_peer(peer_id, FederationMessage::JoinProxyResponse { request_id, outcome })
                 .await;
+            if granted {
+                crate::server::dispatch(&ctx.senders, member_outgoing).await;
+                broadcast(
+                    &ctx.config,
+                    FederationMessage::ChannelMemberJoined { channel, member: identity },
+                    event::CHANNEL_MEMBER_JOINED,
+                )
+                .await;
+            }
         }
         FederationMessage::JoinProxyResponse { request_id, outcome } => {
             if let Some(tx) = ctx.config.join_proxy_waiters.lock().await.remove(&request_id) {
@@ -684,7 +745,45 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             }
         }
         FederationMessage::LeaveProxyNotice { channel, nickname } => {
-            ctx.registry.lock().await.leave_channel_remote(&channel, peer_id, &nickname);
+            let outgoing =
+                ctx.registry.lock().await.leave_channel_remote(&channel, peer_id, &nickname);
+            crate::server::dispatch(&ctx.senders, outgoing).await;
+            broadcast(
+                &ctx.config,
+                FederationMessage::ChannelMemberLeft { channel, server: peer_id.to_string(), nickname },
+                event::CHANNEL_MEMBER_LEFT,
+            )
+            .await;
+        }
+        FederationMessage::ChannelMemberJoined { channel, member } => {
+            // The home server broadcasts this to every linked peer,
+            // including whichever one the member actually connects
+            // through - naming *this* server. That case is not a remote
+            // member at all: it is this server's own local client, whose
+            // `mirror_remote_join`/`join`-driven `UserJoined`s already
+            // went out through the ordinary local path the moment the
+            // join itself completed. Treating it as remote too would
+            // double-record it in `remote_members` and, worse, tell that
+            // very client a `UserJoined` about themselves.
+            if member.server != ctx.config.self_id {
+                let outgoing = ctx.registry.lock().await.mirror_channel_member_joined(&channel, &member);
+                if !outgoing.is_empty() {
+                    log_federation_event(peer_id, event::CHANNEL_MEMBER_JOINED);
+                    crate::server::dispatch(&ctx.senders, outgoing).await;
+                }
+            }
+        }
+        FederationMessage::ChannelMemberLeft { channel, server, nickname } => {
+            // Mirror of the guard above: a departure naming *this* server
+            // is this server's own local client leaving, already handled
+            // by the ordinary local `leave`/disconnect path.
+            if server != ctx.config.self_id {
+                let outgoing = ctx.registry.lock().await.mirror_channel_member_left(&channel, &server, &nickname);
+                if !outgoing.is_empty() {
+                    log_federation_event(peer_id, event::CHANNEL_MEMBER_LEFT);
+                    crate::server::dispatch(&ctx.senders, outgoing).await;
+                }
+            }
         }
         FederationMessage::MailForward { mail } => {
             // The ack is only ever sent once `store` genuinely succeeded -
