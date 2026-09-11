@@ -119,12 +119,33 @@ fn connection_is_canonical(self_id: &str, peer_id: &str, i_dialed: bool) -> bool
     dialer_sorts_first
 }
 
-/// How long a dropped or failed peer link waits before redialing. Fixed
-/// rather than backing off - a small, operator-curated peer set redialing
-/// every 10s is cheap, and a fixed interval is simpler to reason about
-/// than exponential backoff for what is expected to be a handful of
-/// long-lived links.
-const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a dropped link waits before redialing, and the starting point
+/// `dial_peer` backs off from while a peer stays unreachable. Short,
+/// because a link that has just ended is usually a peer restarting and
+/// should be picked straight back up.
+pub const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The ceiling `dial_peer` backs off to for a peer that stays unreachable.
+/// A peer that is down for a weekend should not be dialed - or logged
+/// about - 8,000 times a day, but it should still come back on its own
+/// within a few minutes of returning, with no operator action.
+pub const MAX_REDIAL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How often an otherwise-idle link sends a `Ping`, and how long a link
+/// may hear *nothing at all* before it is assumed dead.
+///
+/// Without this, a link that stops carrying traffic in a way TCP never
+/// reports - the peer's host vanishing, a NAT or firewall quietly dropping
+/// its state, a router rebooted mid-session - is indistinguishable from a
+/// link that simply has nothing to say. The reader parks forever, the
+/// sender looks live, and every message routed through it is dropped in
+/// silence. The client-facing protocol has had exactly this for the same
+/// reason since §4.1; the federation link had nothing.
+///
+/// The timeout is comfortably more than twice the interval, so a single
+/// lost ping (or a slow moment) never tears down a healthy link.
+pub const FEDERATION_PING_INTERVAL: Duration = Duration::from_secs(30);
+pub const FEDERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// How long a client waits for a federation peer to answer a
 /// `JoinProxyRequest` before giving up - a peer link that is down, or a
@@ -189,6 +210,13 @@ pub struct FederationConfig {
     /// Hands each link a `LiveLink::link_id` - see there for why a link
     /// needs to be able to recognise its own registration.
     next_link_id: AtomicU64,
+    /// How often an idle link pings, and how long it may hear nothing
+    /// before being torn down - `FEDERATION_PING_INTERVAL`/
+    /// `FEDERATION_IDLE_TIMEOUT` in production. Adjustable only so a test
+    /// can watch a link stay up across several ping cycles without
+    /// spending a real minute and a half doing it.
+    ping_interval: Duration,
+    idle_timeout: Duration,
 }
 
 impl FederationConfig {
@@ -235,7 +263,19 @@ impl FederationConfig {
             join_proxy_waiters: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: AtomicU64::new(1),
             next_link_id: AtomicU64::new(1),
+            ping_interval: FEDERATION_PING_INTERVAL,
+            idle_timeout: FEDERATION_IDLE_TIMEOUT,
         })
+    }
+
+    /// Shortens this server's liveness timings, for a test that needs to
+    /// observe several ping cycles without waiting out the real ones.
+    /// `idle_timeout` must stay comfortably more than twice
+    /// `ping_interval`, or a single slow moment tears down a healthy link.
+    pub fn with_liveness(mut self, ping_interval: Duration, idle_timeout: Duration) -> Self {
+        self.ping_interval = ping_interval;
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     /// Where an ordinary *client* should be told to connect for peer
@@ -532,19 +572,57 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: FederationContext) ->
 /// has only ever has to break a tie against a genuinely stale link (one
 /// whose peer has not yet noticed its socket died), never a fresh race.
 async fn dial_peer(ctx: FederationContext, peer: FederationPeerConfig) {
+    let mut wait = REDIAL_INTERVAL;
     loop {
-        if !ctx.config.has_live_link(&peer.peer_id).await {
-            if let Err(e) = dial_once(&ctx, &peer).await {
-                crate::log_warn!(
-                    "could not reach federation peer '{}' at {}:{}: {e}",
-                    peer.peer_id,
-                    peer.host,
-                    peer.port
-                );
+        if ctx.config.has_live_link(&peer.peer_id).await {
+            // Linked - nothing to do, and nothing to back off from.
+            wait = REDIAL_INTERVAL;
+        } else {
+            match dial_once(&ctx, &peer).await {
+                // A link that came up and later ended is not a failure to
+                // reach the peer: start the next attempt at the short
+                // interval rather than wherever the backoff had climbed to.
+                Ok(()) => wait = REDIAL_INTERVAL,
+                Err(e) => {
+                    // Only the first failure of a run is worth a line. A
+                    // peer that is simply down otherwise fills the log with
+                    // thousands of identical warnings a day, which is how a
+                    // log stops being read at all.
+                    if wait == REDIAL_INTERVAL {
+                        crate::log_warn!(
+                            "could not reach federation peer '{}' at {}:{}: {e} (retrying, \
+                             quietly, until it answers)",
+                            peer.peer_id,
+                            peer.host,
+                            peer.port
+                        );
+                    }
+                    wait = next_redial_wait(wait);
+                }
             }
         }
-        tokio::time::sleep(REDIAL_INTERVAL).await;
+        // Jitter, so a set of servers restarted together (one host
+        // rebooting, a compose stack coming up) does not settle into
+        // dialing each other in lockstep forever.
+        tokio::time::sleep(with_jitter(wait)).await;
     }
+}
+
+/// The next delay to wait after a failed dial: doubling, up to a ceiling.
+pub fn next_redial_wait(current: Duration) -> Duration {
+    (current * 2).min(MAX_REDIAL_INTERVAL)
+}
+
+/// Spreads a redial delay by up to a quarter either way.
+pub fn with_jitter(base: Duration) -> Duration {
+    let span = base.as_millis() as u64 / 2;
+    if span == 0 {
+        return base;
+    }
+    let offset = u64::from_be_bytes(
+        crate::crypto::random_bytes(8).try_into().expect("random_bytes(8) is 8 bytes"),
+    ) % span;
+    base.saturating_sub(Duration::from_millis(span / 2)) + Duration::from_millis(offset)
 }
 
 async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std::io::Result<()> {
@@ -596,7 +674,20 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
             );
             return Ok(());
         }
-        Err(HandshakeError::Closed) => return Ok(()),
+        Err(HandshakeError::Closed) => {
+            // The peer hung up mid-handshake. On a connection *we* dialed
+            // that is worth saying out loud: much the likeliest cause is
+            // asymmetric configuration - we list them, they do not list
+            // us, so their side refuses us as an unknown peer and closes.
+            // Silence here left an operator with a federation that simply
+            // never linked and nothing at all in either log to say why.
+            if i_dialed {
+                crate::log_warn!(
+                    "federation peer closed the connection during the handshake - check that it                      lists this server in its own server_federation_peer lines, with this                      server's public key"
+                );
+            }
+            return Ok(());
+        }
         Err(e) => {
             crate::log_warn!("federation handshake failed: {e}");
             return Ok(());
@@ -604,6 +695,10 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<FederationMessage>();
+    // Kept by this task so it can send its own keepalives without going
+    // back through the senders map (whose entry may already belong to a
+    // link that displaced this one).
+    let ping_tx = tx.clone();
     let link_id = ctx.config.next_link_id.fetch_add(1, Ordering::Relaxed);
     let canonical = connection_is_canonical(&ctx.config.self_id, &peer_id, i_dialed);
     let displaced = Arc::new(tokio::sync::Notify::new());
@@ -663,16 +758,44 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
     });
 
     let mut displaced_by_another_link = false;
+    let mut last_heard = std::time::Instant::now();
+    let mut ping = tokio::time::interval(ctx.config.ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // the first tick is immediate; skip it
     loop {
         tokio::select! {
+            // Any message at all - a `Ping` included - proves the link is
+            // alive, which is what `last_heard` records.
             incoming = rd.recv::<FederationMessage>() => match incoming {
-                Ok(Some(msg)) => apply_incoming(&ctx, &peer_id, msg).await,
+                Ok(Some(msg)) => {
+                    last_heard = std::time::Instant::now();
+                    apply_incoming(&ctx, &peer_id, msg).await;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     crate::log_warn!("federation link to '{peer_id}' failed: {e}");
                     break;
                 }
             },
+            _ = ping.tick() => {
+                // Silence is measured from the last thing *received*, not
+                // from the last time round this loop. Wrapping the read in
+                // a timeout instead looks equivalent and is not: `select!`
+                // drops and rebuilds the branches it did not take, so this
+                // timer's own ticks would restart the read timeout every
+                // interval and it could never elapse - the link would be
+                // declared healthy precisely because *we* were still
+                // talking, which is the one thing that proves nothing.
+                if last_heard.elapsed() > ctx.config.idle_timeout {
+                    crate::log_warn!(
+                        "federation link to '{peer_id}' went silent - dropping it so it redials"
+                    );
+                    break;
+                }
+                // Best effort, exactly like every other send here: if the
+                // peer is gone, the check above is what notices.
+                let _ = ping_tx.send(FederationMessage::Ping);
+            }
             // The writer gave up - its half of the socket refused a send,
             // so this link is dead in the send direction and therefore
             // dead. Without watching for it, only the *reader* ever tears
@@ -827,6 +950,10 @@ async fn ensure_public_channel_and_announce(ctx: &FederationContext, channel: &p
 /// `peer_id` - directory gossip, a join/leave proxy, or a mail relay.
 async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationMessage) {
     match msg {
+        FederationMessage::Ping => {
+            // Liveness only - it did its whole job by arriving and
+            // resetting the idle timeout in `run_peer_link`.
+        }
         FederationMessage::Hello { .. } | FederationMessage::KeyExchange { .. } => {
             // Only ever the handshake's own two messages, fully consumed
             // by `handshake::handshake` before the message loop that calls
@@ -834,10 +961,11 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
         }
         FederationMessage::DirectorySnapshot { nicknames, channels } => {
             {
+                // One save for the whole snapshot, not one per entry -
+                // see `merge_remote_nicknames` for what the difference
+                // costs while this lock is held.
                 let mut dir = ctx.config.directory.lock().await;
-                for (nickname, owner) in nicknames {
-                    let _ = dir.merge_remote_nickname(nickname, owner);
-                }
+                let _ = dir.merge_remote_nicknames(nicknames);
                 for channel in &channels {
                     dir.merge_remote_channel(channel.clone());
                 }

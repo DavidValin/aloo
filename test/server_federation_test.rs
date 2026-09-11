@@ -82,6 +82,82 @@ fn nickname_ownership_persists_across_a_reopen() {
     );
 }
 
+/// An unreadable-but-present directory file is an error, never an empty
+/// start. This file is the only record of which nicknames the federation
+/// has already handed out, so quietly starting empty is the exact failure
+/// it exists to prevent: another server then registers a name this one
+/// already owns, with no conflict detected on the forgetful side. (A file
+/// that simply isn't there yet is an ordinary first run, and does start
+/// empty - asserted here too, so the two cases can't be conflated again.)
+/// @requirement TB-313
+#[test]
+fn a_present_but_unreadable_directory_refuses_to_start_empty() {
+    let path = temp_dir("unreadable");
+    assert!(
+        FederationDirectory::open(path.clone()).is_ok(),
+        "a directory with no file yet is an ordinary first run"
+    );
+
+    // A directory where the nicknames file is itself a directory: present,
+    // and impossible to read as a file.
+    let blocked = temp_dir("unreadable-blocked");
+    std::fs::create_dir_all(blocked.join("nicknames")).unwrap();
+    assert!(
+        FederationDirectory::open(blocked).is_err(),
+        "a present-but-unreadable directory must not silently start empty"
+    );
+}
+
+/// Every write replaces the file atomically, so a crash can never leave a
+/// half-written directory - the tail of which would be nicknames silently
+/// freed for another server to claim.
+/// @requirement TB-313
+#[test]
+fn the_directory_is_never_left_half_written() {
+    let path = temp_dir("atomic");
+    let mut dir = FederationDirectory::open(path.clone()).unwrap();
+    dir.record_local_nickname("alice".to_string(), "serverA").unwrap();
+    dir.record_local_nickname("bob".to_string(), "serverA").unwrap();
+
+    // Nothing is left behind beside the real file: a temporary that
+    // survived would mean a write that wasn't a rename.
+    let leftovers: Vec<String> = std::fs::read_dir(&path)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "nicknames")
+        .collect();
+    assert!(leftovers.is_empty(), "unexpected files beside the directory: {leftovers:?}");
+}
+
+/// A decommissioned peer's claims are released only when an operator says
+/// so, and releasing them leaves any *other* server's claim on a shared
+/// name intact.
+/// @requirement TB-313
+#[test]
+fn forgetting_a_peer_releases_only_that_peers_claims() {
+    let mut dir = FederationDirectory::open(temp_dir("forget-owner")).unwrap();
+    dir.merge_remote_nickname("alice".to_string(), "gone".to_string()).unwrap();
+    dir.merge_remote_nickname("bob".to_string(), "staying".to_string()).unwrap();
+    // A name both of them claimed - an unresolved conflict.
+    dir.merge_remote_nickname("carol".to_string(), "gone".to_string()).unwrap();
+    dir.merge_remote_nickname("carol".to_string(), "staying".to_string()).unwrap();
+
+    let freed = dir.forget_owner("gone").unwrap();
+    assert_eq!(freed, 2, "alice and carol were both claimed by the departing server");
+    assert!(dir.owner_of_nickname("alice").is_none(), "freed for anyone to register");
+    assert_eq!(
+        dir.owner_of_nickname("bob"),
+        Some(&Ownership::Owned("staying".to_string())),
+        "another server's claim is untouched"
+    );
+    assert_eq!(
+        dir.owner_of_nickname("carol"),
+        Some(&Ownership::Owned("staying".to_string())),
+        "a shared name resolves to whoever is left, not to nobody"
+    );
+}
+
 /// Two servers claiming the same nickname (a bootstrap collision, or an
 /// unresolved race) become `Conflicted` rather than one silently winning
 /// - and a conflicted name is refused for any *new* registration.
@@ -920,6 +996,111 @@ async fn a_third_servers_member_sees_presence_relayed_through_the_hub() {
         matches!(&bob_left, ServerMessage::UserLeft { channel, .. } if channel == "plaza"),
         "{bob_left:?}"
     );
+}
+
+/// An idle link keeps itself alive. Nothing else would: a link carrying
+/// no traffic is indistinguishable from a dead one, so the idle timeout
+/// that catches a socket TCP never reports as broken would otherwise tear
+/// down every quiet link too. Run here with the timings shortened, so
+/// several ping cycles pass in a second rather than a minute and a half.
+/// @requirement TB-314
+#[tokio::test]
+async fn an_idle_link_stays_up_across_several_ping_cycles() {
+    let (listener_a, addr_a) = bind_ephemeral().await;
+    let (listener_b, addr_b) = bind_ephemeral().await;
+    let dir_a = temp_dir("ping-a");
+    let dir_b = temp_dir("ping-b");
+    let (identity_a, pub_a) = write_identity(&dir_a);
+    let (identity_b, pub_b) = write_identity(&dir_b);
+
+    let quick = |config: FederationConfig| {
+        config.with_liveness(Duration::from_millis(60), Duration::from_millis(250))
+    };
+    let config_a = Arc::new(quick(
+        FederationConfig::new(
+            "serverA".to_string(),
+            addr_a,
+            addr_a.to_string(),
+            None,
+            identity_a,
+            vec![FederationPeerConfig {
+                peer_id: "serverB".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: addr_b.port(),
+                public_key_path: pub_b.display().to_string(),
+            }],
+            FederationDirectory::open(dir_a.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    ));
+    let config_b = Arc::new(quick(
+        FederationConfig::new(
+            "serverB".to_string(),
+            addr_b,
+            addr_b.to_string(),
+            None,
+            identity_b,
+            vec![FederationPeerConfig {
+                peer_id: "serverA".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: addr_a.port(),
+                public_key_path: pub_a.display().to_string(),
+            }],
+            FederationDirectory::open(dir_b.join("directory")).unwrap(),
+        )
+        .unwrap(),
+    ));
+
+    tokio::spawn(federation::serve(listener_a, test_federation_context(config_a.clone())));
+    tokio::spawn(federation::serve(listener_b, test_federation_context(config_b.clone())));
+
+    wait_until(Duration::from_secs(5), || async {
+        config_a.send_to_peer("serverB", FederationMessage::Ping).await
+    })
+    .await;
+
+    // Well past the idle timeout, several ping intervals over, with no
+    // real traffic at all: without the keepalive this link would be gone.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        config_a.send_to_peer("serverB", FederationMessage::Ping).await,
+        "an idle link must be kept alive by its own pings, not torn down as silent"
+    );
+}
+
+/// The tunables around that, checked directly - the relationship between
+/// them is the part that matters, and it is easy to break by adjusting one
+/// number in isolation.
+/// @requirement TB-314
+#[test]
+fn the_liveness_and_redial_timings_hold_their_invariants() {
+    // A single lost ping (or one slow moment) must never be enough to tear
+    // down a healthy link.
+    assert!(
+        federation::FEDERATION_IDLE_TIMEOUT > federation::FEDERATION_PING_INTERVAL * 2,
+        "the idle timeout has to allow for more than one missed ping"
+    );
+
+    // Backoff climbs, and stops climbing.
+    let mut wait = federation::REDIAL_INTERVAL;
+    for _ in 0..20 {
+        let next = federation::next_redial_wait(wait);
+        assert!(next >= wait, "backoff must not go backwards");
+        assert!(next <= federation::MAX_REDIAL_INTERVAL, "backoff must respect its ceiling");
+        wait = next;
+    }
+    assert_eq!(wait, federation::MAX_REDIAL_INTERVAL, "backoff should reach the ceiling");
+
+    // Jitter stays near its base and never panics on small values.
+    for base in [Duration::ZERO, Duration::from_millis(1), federation::REDIAL_INTERVAL] {
+        for _ in 0..50 {
+            let jittered = federation::with_jitter(base);
+            assert!(
+                jittered <= base + base / 2,
+                "jitter must stay near its base: {jittered:?} for {base:?}"
+            );
+        }
+    }
 }
 
 /// Both servers dial each other, so two connections between one pair can

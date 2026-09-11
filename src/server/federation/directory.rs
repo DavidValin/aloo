@@ -115,27 +115,133 @@ pub struct FederationDirectory {
     nicknames: HashMap<String, Ownership>,
     channels: HashMap<String, ChannelOwnership>,
     dir: PathBuf,
+    /// Held for as long as this handle lives, when it was opened with
+    /// `open_exclusive` - see there for what it is protecting against.
+    _lock: Option<std::fs::File>,
 }
 
 impl FederationDirectory {
     /// Opens (creating if needed) the directory rooted at `dir`, loading
-    /// whatever nickname ownership was persisted from a previous run. A
-    /// missing or corrupt file starts empty rather than failing - the
-    /// directory rebuilds from a peer's next `DirectorySnapshot` either
-    /// way, so losing a stale copy is never fatal, only a brief window
-    /// with less to check against.
+    /// whatever nickname ownership was persisted from a previous run.
+    ///
+    /// A file that isn't there yet starts empty - an ordinary first run.
+    /// A file that *is* there but cannot be read is an error, not an
+    /// empty start: this file is the only record of which nicknames this
+    /// federation has already handed out, and quietly forgetting it is
+    /// precisely the failure it exists to prevent (another server then
+    /// registers a name this one already owns, with no conflict detected
+    /// on the forgetful side). Individual unparseable *lines* are still
+    /// skipped - one damaged line should not cost the whole file - and
+    /// every write is atomic, so a half-written file is not a state that
+    /// can be reached in the first place.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let nicknames = std::fs::read_to_string(nicknames_path(&dir))
-            .map(|contents| parse_nicknames(&contents))
-            .unwrap_or_default();
+        let nicknames = match std::fs::read_to_string(nicknames_path(&dir)) {
+            Ok(contents) => parse_nicknames(&contents),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             nicknames,
             channels: HashMap::new(),
             dir,
+            _lock: None,
         })
     }
 
+    /// `open`, claiming the directory exclusively for as long as the
+    /// returned handle lives. `Ok(None)` means another process already
+    /// holds it.
+    ///
+    /// Two processes genuinely do write this file: a running server, and
+    /// `aloo --register-user`, which `docker-server`'s entrypoint runs for
+    /// each `ALOO_REGISTER_USERS` entry. Each writes it *whole*, from its
+    /// own in-memory copy, so without this the later write silently drops
+    /// everything the other did in between - the CLI reading before a
+    /// registration and writing after it is enough to erase a nickname the
+    /// server had just gossiped in. Holding the lock across a whole
+    /// read-modify-write also removes the CLI's own check-then-record
+    /// window, where a name could be claimed by a peer between being
+    /// judged free and being written.
+    ///
+    /// The intended usage is exactly what the docs already describe:
+    /// register accounts *before* starting the server. A CLI run against a
+    /// live server is refused with a message saying so, rather than
+    /// quietly corrupting the directory.
+    pub fn open_exclusive(dir: PathBuf) -> io::Result<Option<Self>> {
+        std::fs::create_dir_all(&dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(".lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let mut directory = Self::open(dir)?;
+        directory._lock = Some(lock);
+        Ok(Some(directory))
+    }
+
+    /// Drops every claim `owner` holds, for a peer that is gone for good
+    /// (`aloo --forget-federation-peer`), and says how many names that
+    /// freed. A name that peer *shared* with another server keeps the
+    /// other server's claim - `Conflicted` minus one claimant is a clean
+    /// `Owned` for whoever is left, exactly as a removal gossiped over a
+    /// live link would have left it.
+    ///
+    /// Deliberately an explicit operator action rather than something
+    /// derived from the peer list: a server legitimately knows about
+    /// names owned by servers it does not itself peer with, learned
+    /// through one they share (a hub topology is entirely normal here), so
+    /// "not in my `server_federation_peer` lines" does not mean "gone".
+    pub fn forget_owner(&mut self, owner: &str) -> io::Result<usize> {
+        let claimed: Vec<String> = self
+            .nicknames
+            .iter()
+            .filter(|(_, ownership)| match ownership {
+                Ownership::Owned(o) => o == owner,
+                Ownership::Conflicted(owners) => owners.iter().any(|o| o == owner),
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let freed = claimed.len();
+        for nickname in claimed {
+            self.remove_nickname(&nickname, owner)?;
+        }
+        let channels: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|(_, ownership)| match ownership {
+                ChannelOwnership::Owned(info) => info.owner == owner,
+                ChannelOwnership::Conflicted(infos) => infos.iter().any(|i| i.owner == owner),
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for channel in channels {
+            self.remove_channel(&channel, owner);
+        }
+        Ok(freed)
+    }
+
+    /// The refusal shown when `open_exclusive` finds the directory taken.
+    pub fn busy_message() -> String {
+        "the federation directory is in use by another aloo process (a running server, most \
+         likely) - stop it first, or register accounts before starting it"
+            .to_string()
+    }
+
+    /// Writes the nickname directory out whole, atomically: to a temporary
+    /// file first, then renamed over the real one.
+    ///
+    /// A plain `write` truncates and refills in place, so a crash, a full
+    /// disk or a container stopped at the wrong moment leaves a *partial*
+    /// file - the tail of the directory silently gone, and every nickname
+    /// in it free for another server to claim. `rename` within one
+    /// directory is atomic on every platform this runs on: a reader sees
+    /// either the whole previous file or the whole new one.
     fn save_nicknames(&self) -> io::Result<()> {
         let mut lines: Vec<(&String, &Ownership)> = self.nicknames.iter().collect();
         lines.sort_by_key(|(name, _)| (*name).clone());
@@ -143,7 +249,10 @@ impl FederationDirectory {
             .into_iter()
             .map(|(name, ownership)| format!("{name}\t{}\n", encode_ownership(ownership)))
             .collect();
-        std::fs::write(nicknames_path(&self.dir), contents)
+        let final_path = nicknames_path(&self.dir);
+        let temp_path = self.dir.join("nicknames.writing");
+        std::fs::write(&temp_path, contents)?;
+        std::fs::rename(&temp_path, &final_path)
     }
 
     pub fn owner_of_nickname(&self, nickname: &str) -> Option<&Ownership> {
@@ -249,14 +358,36 @@ impl FederationDirectory {
     /// owns what; it is not trusted to write arbitrary bytes into a file
     /// this server parses on every start.
     pub fn merge_remote_nickname(&mut self, nickname: String, owner: String) -> io::Result<()> {
-        if !crate::validation::nickname_is_registrable(&nickname) || !owner_id_is_storable(&owner) {
-            return Ok(());
+        self.merge_remote_nicknames(std::iter::once((nickname, owner)))
+    }
+
+    /// `merge_remote_nickname` for many at once, saving **once** at the
+    /// end rather than per entry - what a `DirectorySnapshot` applies.
+    ///
+    /// The difference is not a micro-optimisation: each save rewrites the
+    /// whole file, and the snapshot arm holds the directory lock across
+    /// the loop, so per-entry saving made one link-up cost N full-file
+    /// writes serialised against every login check and registration on
+    /// this server. At a few hundred nicknames that is a visible stall; at
+    /// tens of thousands it is minutes of disk and a locked-out server,
+    /// reachable by an honest large federation and trivially forced by a
+    /// peer sending a large snapshot.
+    pub fn merge_remote_nicknames(
+        &mut self,
+        entries: impl IntoIterator<Item = (String, String)>,
+    ) -> io::Result<()> {
+        let mut changed = false;
+        for (nickname, owner) in entries {
+            if !crate::validation::nickname_is_registrable(&nickname) || !owner_id_is_storable(&owner) {
+                continue;
+            }
+            self.nicknames
+                .entry(nickname)
+                .and_modify(|o| o.merge(&owner))
+                .or_insert_with(|| Ownership::Owned(owner));
+            changed = true;
         }
-        self.nicknames
-            .entry(nickname)
-            .and_modify(|o| o.merge(&owner))
-            .or_insert_with(|| Ownership::Owned(owner));
-        self.save_nicknames()
+        if changed { self.save_nicknames() } else { Ok(()) }
     }
 
     /// Removes `owner`'s claim on `nickname` - the mirror of

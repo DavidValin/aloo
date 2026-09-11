@@ -94,6 +94,12 @@ pub enum FederationMessage {
         /// output over the handshake transcript.
         sig: (Vec<u8>, Vec<u8>),
     },
+    /// Liveness, nothing more: sent on a link that has been idle, and
+    /// acted on purely by arriving. A link that hears nothing at all for
+    /// long enough is torn down and redialed, which is the only way to
+    /// notice a socket that TCP will never report as broken - a vanished
+    /// host, a NAT that dropped its state, a rebooted router.
+    Ping,
     /// Sent once, right after the handshake, by whichever side just connected:
     /// every nickname/channel this server's directory currently knows
     /// about (its own registrations and whatever it already learned from

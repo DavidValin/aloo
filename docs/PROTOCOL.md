@@ -6257,6 +6257,16 @@ its own forward secrecy, on top of - not instead of - the durable-identity
 authentication; recording a session and later obtaining a server's
 `server_federation_identity` private key still does not decrypt it.
 
+An established link proves it is alive rather than assuming it: when it
+has nothing else to say it sends a `Ping`, and a link that hears nothing
+at all for appreciably longer than that is torn down and redialed.
+Nothing else notices a socket TCP will never report as broken - a
+vanished host, a NAT that dropped its state, a rebooted router - which
+otherwise leaves one side reading forever while the other still believes
+it can send, with every message routed through it dropped in silence.
+Redialing an unreachable peer backs off to a ceiling, with jitter, and
+says so only once per outage rather than on every attempt.
+
 Everything an *un*authenticated connection can make this server spend is
 bounded, and only here: a handshake must complete within a fixed timeout,
 and until it does, a frame may claim only a small fraction of
@@ -6297,7 +6307,13 @@ A channel's federation-visible metadata (`FederatedChannelInfo`) is only
 its name, kind, and owning server - never its members, password, admin,
 bans, or join-lock. The nickname directory is persisted to disk
 (`~/.aloo/federation_directory/nicknames`), since nicknames are
-themselves durable; the channel directory is in-memory only, rebuilt from
+themselves durable - written atomically (a temporary file, then renamed)
+so a crash cannot leave a truncated file whose missing tail is nicknames
+silently freed for another server to claim, read back as an error rather
+than as an empty start for the same reason, and claimed exclusively for
+as long as a process holds it so a running server and `aloo
+--register-user` cannot overwrite each other. A whole snapshot is applied
+with one save rather than one per entry; the channel directory is in-memory only, rebuilt from
 the next `DirectorySnapshot` on every reconnect, matching
 `ChannelsRegistry` itself being entirely in-memory.
 
