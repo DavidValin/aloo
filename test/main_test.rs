@@ -287,3 +287,69 @@ fn register_user_and_change_password_edit_the_users_registry_directly() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// `--register-user` runs as its own one-off process, typically before
+/// any server (and so any live federation link) exists at all - it still
+/// checks the on-disk federation directory directly when
+/// `server_federation_enabled` is on, refusing a nickname a peer already
+/// owns exactly as a live `Register` over the wire would.
+/// @requirement AC-475
+#[test]
+fn register_user_refuses_a_nickname_a_federation_peer_already_owns() {
+    let home = temp_home("register-federation-refuse");
+    let aloo_dir = home.join(".aloo");
+    std::fs::create_dir_all(&aloo_dir).unwrap();
+    std::fs::write(
+        aloo_dir.join("settings"),
+        "server_federation_enabled=on\nserver_federation_id=serverA\n",
+    )
+    .unwrap();
+    let directory_dir = aloo_dir.join("federation_directory");
+    std::fs::create_dir_all(&directory_dir).unwrap();
+    std::fs::write(directory_dir.join("nicknames"), "alice\towned:serverB\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["--register-user", "alice", "pw"])
+        .env("HOME", &home)
+        .output()
+        .expect("run register");
+    assert!(!output.status.success(), "a nickname a peer owns must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("serverB"), "{stderr}");
+    assert!(
+        !aloo_dir.join("users").join("alice").exists(),
+        "a refused registration must never touch the local users registry"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A successful `--register-user` with federation on is recorded into the
+/// on-disk federation directory as owned by this server, so the next peer
+/// link that comes up learns of it via `DirectorySnapshot` with no live
+/// link needed at registration time.
+/// @requirement AC-475
+#[test]
+fn register_user_records_a_free_nickname_into_the_federation_directory() {
+    let home = temp_home("register-federation-record");
+    let aloo_dir = home.join(".aloo");
+    std::fs::create_dir_all(&aloo_dir).unwrap();
+    std::fs::write(
+        aloo_dir.join("settings"),
+        "server_federation_enabled=on\nserver_federation_id=serverA\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args(["--register-user", "carol", "pw"])
+        .env("HOME", &home)
+        .output()
+        .expect("run register");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(aloo_dir.join("users").join("carol").exists());
+    let nicknames =
+        std::fs::read_to_string(aloo_dir.join("federation_directory").join("nicknames")).unwrap();
+    assert!(nicknames.contains("carol\towned:serverA"), "{nicknames}");
+
+    std::fs::remove_dir_all(&home).ok();
+}

@@ -692,8 +692,11 @@ async fn told_channel_removed(w: &mut AlooWorld, who: String, channel: String) {
 #[when(expr = "{word} bans {word} from {string}")]
 async fn bans_from_channel(w: &mut AlooWorld, admin: String, target: String, channel: String) {
     let admin_id = w.id_of(&admin);
+    // The second half is the federated members the ban removed, which a
+    // real server gossips a `ChannelMemberLeft` for - no federation here,
+    // so it is always empty.
     match w.registry_mut().ban_from_channel(admin_id, &channel, &target) {
-        Ok(emitted) => {
+        Ok((emitted, _banned_federated)) => {
             w.emitted = emitted;
             w.route_error = None;
         }

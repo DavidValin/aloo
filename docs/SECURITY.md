@@ -81,6 +81,68 @@ link, with timing. It never sees content, filenames, or how much is said
 once a link is up. Traffic analysis of the direct links themselves is not
 addressed at all.
 
+**Federation trusts every peer's directory claims.** A federated server
+(`docs/PROTOCOL.md` §18) accepts the nickname/channel ownership another
+federated server announces without independently verifying it - the
+whole trust boundary is the federation handshake itself (only a server
+whose durable PQ-hybrid identity an operator explicitly pinned, by public
+key, can ever gossip anything - no TLS or certificates involved). A
+compromised or misconfigured peer can therefore claim ownership of a
+nickname it does not really control, refuse a login for one it does
+control by lying about a conflict, or falsely claim a channel exists on
+it, but it can never reach message content (federation never carries
+any). A channel's password is checked only by its home server, but
+joining one from a different federated server (§18.6) does mean the
+server the client is actually connected to sees the plaintext password
+too, in order to relay it in a `JoinProxyRequest` - it never stores or
+reuses it, but it is a real, new party that sees it in transit, unlike
+joining a channel homed locally. The home server also trusts a peer's
+claim of *which* nickname is asking to join (`JoinProxyRequest.joiner_nickname`)
+without independently verifying it belongs to that peer at all - a
+compromised peer could claim any nickname string for a proxied join, the
+same way it could already lie about directory ownership, and a ban
+targeted at one nickname could in principle be sidestepped by claiming a
+different, unbanned one. A joiner's public key bundle and key mode -
+`JoinProxyRequest.joiner_public_key_der`/`_key_mode`, carried so the home
+server can name them in the `ChannelMemberJoined` gossip it relays onward
+- similarly reaches every server linked to the home one, not only the
+home server itself, the moment that join is granted; this is the same
+information a client already announces to its own server on connect
+(`Identify`), just now visible to every federated server with a member in
+that channel rather than one. Being introduced to a member on another
+server (§18.5) likewise means that client's **candidate addresses** - its
+real IPs, including its local ones - travel through however many servers
+the introduction is relayed by. That exposure is not new in kind: a direct
+link has always meant the two ends learn each other's addresses, and
+within one server those candidates already pass through it. What is new
+is the *set* of parties who see them, which is why relaying is allowed
+only between two people who already share a channel, checked by the
+sending and the receiving server independently rather than taken on
+trust - a synthetic member id is guessable, so without that check naming
+one would be enough to make a stranger's client disclose its addresses.
+A federation you would not trust with that is a federation you should not
+join. OTP mail relay (§18.7) carries no
+equivalent exposure: a relaying server forwards only the opaque
+ciphertext its own client already couldn't read either. Federating with a
+server is choosing to trust its directory (and, for a join-proxy, that
+one password in transit, and a joiner's public identity relayed onward)
+the same way registering a nickname there is choosing to trust it with an
+account. A federation-known login redirect also
+narrows the anti-enumeration property §5.1's `AuthCheck::Rejected`
+otherwise gives: telling a user "this nickname is on server X" necessarily
+discloses that the nickname exists, which an ordinary refusal does not - a
+deliberate,
+minimal exception, scoped to exactly the names the federation directory
+already knows about. Unlike an earlier, mTLS-based design this app
+considered, a peer's `Hello.self_id` *is* cryptographically bound to its
+identity: the handshake's `KeyExchange` signature is checked against the
+`PqPublicBundle` pinned specifically for the claimed `self_id`, so a
+connection cannot claim to be a *different* configured peer without that
+peer's private key - misattributing gossip/logs (`Federated server <id> -
+<EVENT>`) to the wrong configured peer is not possible the way it would
+be with a certificate whose presented identity and claimed label are
+checked separately.
+
 **No deniability.** Messages are signed, so a recipient can prove to a
 third party who sent them. This is a deliberate trade for
 authenticity — the opposite choice from OTR-style protocols.

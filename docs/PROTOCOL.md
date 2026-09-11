@@ -114,6 +114,15 @@ falling back to a server relay (§7.1).
   - [17.2 Uploading: the mail's pad spend, and the storage acknowledgement](#172-uploading-the-mails-pad-spend-and-the-storage-acknowledgement)
   - [17.3 Delivery: fetch, decrypt, acknowledge, notify](#173-delivery-fetch-decrypt-acknowledge-notify)
   - [17.4 Two pads, two transports: mail and live sends never interleave](#174-two-pads-two-transports-mail-and-live-sends-never-interleave)
+- [18. Server federation](#18-server-federation)
+  - [18.1 The federation link: PQ-hybrid mutual authentication, no TLS](#181-the-federation-link-pq-hybrid-mutual-authentication-no-tls)
+  - [18.2 The directory: who owns each nickname and channel](#182-the-directory-who-owns-each-nickname-and-channel)
+  - [18.3 Global uniqueness, and what happens on a conflict](#183-global-uniqueness-and-what-happens-on-a-conflict)
+  - [18.4 Logging in on the wrong server](#184-logging-in-on-the-wrong-server)
+  - [18.5 Introducing two clients on different servers](#185-introducing-two-clients-on-different-servers)
+  - [18.6 Joining a channel homed on a different server](#186-joining-a-channel-homed-on-a-different-server)
+  - [18.7 OTP mail across servers](#187-otp-mail-across-servers)
+  - [18.8 Removing a channel or nickname](#188-removing-a-channel-or-nickname)
 
 ## Overview: the connections, and what travels on each
 
@@ -6183,3 +6192,363 @@ its storage acknowledgement (§16.6) - not because the pads are shared, but
 because the mail's confirmation arrives from the server on its own
 schedule and the user is asked to wait for it rather than end a session
 with a mail of theirs still in flight.
+
+## 18. Server federation
+
+Two or more independently-run servers can be linked into one federation:
+a small, operator-curated set that shares a single nickname/channel
+namespace. `server_federation_enabled=on` in `~/.aloo/settings`, this
+server's own `server_federation_id` and `server_federation_identity` (a
+PQ-hybrid keybundle prefix, §13's identity shape), and one
+`server_federation_peer=<peer_id>,<host>,<port>,<public_key_path>` line
+per trusted peer are the whole of it - there is no client-facing
+configuration for this at all. Federation carries only identity and
+routing metadata between servers, never message content: the same
+"purely a medium of connection setup" doctrine §1 states for the
+client-facing protocol applies here too.
+
+### 18.1 The federation link: PQ-hybrid mutual authentication, no TLS
+
+A federation link is server-to-server, over its own listener
+(`server_federation_bind`/`_port`, independent of the client-facing
+port), authenticated by a dedicated handshake
+(`crate::server::federation::handshake`) built entirely from §13's
+PQ-hybrid primitives - no TLS and no certificates anywhere in it. Each
+server generates one durable identity at `server_federation_identity`
+(an ML-DSA-87+RSA-4096 signing keypair, exactly the shape a client's
+`my_key` uses) the first time federation starts; an operator copies the
+`.pub` half to every peer out of band, named there by
+`server_federation_peer`'s `public_key_path`.
+
+The handshake is symmetric - the same function runs on both the dialing
+and the accepting end - and unauthenticated only for the few bytes it
+takes to become authenticated:
+
+1. Each side generates a **fresh, per-connection** ML-KEM-1024+X25519
+   encryption keypair and a random nonce, and sends both in `Hello
+   { self_id, advertise_addr, ephemeral_encap, nonce }`.
+2. Having seen the peer's `Hello`, each side wraps a fresh random secret
+   for the *peer's* `ephemeral_encap` (the identical `wrap_key_for`
+   construction §13.2 uses for a message send), and signs the *entire*
+   transcript - both `Hello`s' key material, in a canonical order both
+   ends compute identically - with its own durable identity
+   (`sign_with_identity`, ML-DSA-87 + RSA-4096). Both go out together as
+   `KeyExchange { kem_ciphertext, wrapped_key, eph_x25519_pub, sig }`.
+3. Each side looks up the `PqPublicBundle` pinned for the `self_id` the
+   peer's `Hello` claimed. A `self_id` naming no configured peer is
+   refused before any signature is even checked - the closed-set property
+   that replaces mTLS's root-of-trust check. Otherwise, the peer's
+   `KeyExchange` signature is verified against that pinned bundle; failure
+   (a spoofed `self_id`, a stale or rotated key, tampering) refuses the
+   link. Unlike the mTLS design this replaces, `self_id` is therefore
+   never just an unverified label carried alongside a separately-checked
+   certificate: it is exactly what the signature is checked against.
+4. Each side decapsulates the peer's wrap and combines its own
+   contribution with the peer's (via the same HKDF combiner §13.2 uses)
+   into one shared secret neither side alone controls, then derives two
+   directional AES-256-GCM keys from it (labelled by which id sorts
+   first, not by dialer/acceptor) and switches the link to sealed -
+   `crate::control::{ControlReader, ControlWriter}`'s own "starts clear,
+   then `enable()`" framing, reused here exactly as the client control
+   channel uses it.
+
+Fresh ephemeral keys and a fresh nonce every connection give each link
+its own forward secrecy, on top of - not instead of - the durable-identity
+authentication; recording a session and later obtaining a server's
+`server_federation_identity` private key still does not decrypt it.
+
+An established link proves it is alive rather than assuming it: when it
+has nothing else to say it sends a `Ping`, and a link that hears nothing
+at all for appreciably longer than that is torn down and redialed.
+Nothing else notices a socket TCP will never report as broken - a
+vanished host, a NAT that dropped its state, a rebooted router - which
+otherwise leaves one side reading forever while the other still believes
+it can send, with every message routed through it dropped in silence.
+Redialing an unreachable peer backs off to a ceiling, with jitter, and
+says so only once per outage rather than on every attempt.
+
+Everything an *un*authenticated connection can make this server spend is
+bounded, and only here: a handshake must complete within a fixed timeout,
+and until it does, a frame may claim only a small fraction of
+`MAX_FRAME_LEN` (§1.1). Both matter because the length prefix is believed -
+and the buffer allocated - before a single payload byte arrives, so
+without them anyone able to reach the federation port could hold a large
+allocation, a task and a socket per connection simply by naming a big
+frame and then going quiet. The full allowance is restored the moment the
+peer is verified, since a real `MailForward` can be large.
+
+Once the handshake completes, both sides already know and have verified
+who the other is; `Hello`'s `self_id`/`advertise_addr` are consumed inside
+the handshake itself, not re-announced afterward. Exactly one of the two
+configured peers ever dials the other - whichever server's own
+`server_federation_id` sorts lexicographically first - the other only
+accepts; comparing ids is exactly what the handshake's own transcript
+already does, applied one layer up, and it is what stops both sides
+racing to dial each other at once from ever opening two connections for
+one logical link in the first place (rather than opening both and relying
+on `senders`-map dedup to close one afterward, which cannot reliably
+choose the *same* survivor on both ends of two independent sockets). A
+stale link whose peer has not yet noticed its socket died is still
+possible and is what that dedup remains for: the later `Hello` for an
+already-linked peer id simply gets no link.
+
+### 18.2 The directory: who owns each nickname and channel
+
+Every federated server keeps a directory mapping each nickname and
+channel name it has ever heard of to the `server_federation_id` that owns
+it. Right after `Hello`, whichever side just connected sends a
+`DirectorySnapshot` - every nickname/channel entry it currently knows,
+own and learned-from-others alike - so a newly linked peer's directory
+starts complete rather than growing one message at a time. After that,
+each new local registration or channel creation is gossiped immediately
+(`NicknameRegistered`/`ChannelRegistered`) to every currently-linked peer.
+
+A channel's federation-visible metadata (`FederatedChannelInfo`) is only
+its name, kind, and owning server - never its members, password, admin,
+bans, or join-lock. The nickname directory is persisted to disk
+(`~/.aloo/federation_directory/nicknames`), since nicknames are
+themselves durable - written atomically (a temporary file, then renamed)
+so a crash cannot leave a truncated file whose missing tail is nicknames
+silently freed for another server to claim, read back as an error rather
+than as an empty start for the same reason, and claimed exclusively for
+as long as a process holds it so a running server and `aloo
+--register-user` cannot overwrite each other. A whole snapshot is applied
+with one save rather than one per entry; the channel directory is in-memory only, rebuilt from
+the next `DirectorySnapshot` on every reconnect, matching
+`ChannelsRegistry` itself being entirely in-memory.
+
+A *public* channel does not just update this directory quietly: every
+server that learns of one this way (`ChannelRegistered` gossip, or a
+`DirectorySnapshot` at link-up) mirrors an empty stub of it straight into
+its own `ChannelsRegistry` and announces it live to its own already-
+connected clients (`ServerMessage::ChannelCreated`), exactly as if it had
+just been created locally. The whole federation is meant to present one
+shared public channel list, not one that only grows for a server once a
+local client happens to join something on a peer by name. A private
+channel is never mirrored or announced this way - it stays reachable only
+by knowing its name, exactly like a local one.
+
+### 18.3 Global uniqueness, and what happens on a conflict
+
+A nickname or channel name is meant to belong to exactly one federated
+server. `Register` and a new channel's `JoinChannel` both check the
+directory first: a name already owned by a peer is refused, naming that
+peer; a name already `Conflicted` (below) is refused outright, so a third
+server can never add a further conflicting claim on top of an unresolved
+one. Two servers independently claiming the same name - federating two
+previously-separate servers whose namespaces happened to overlap, or a
+race between a local registration/creation and a peer's gossip for the
+same name arriving at nearly the same moment - become `Conflicted` rather
+than one silently winning: a conflicted nickname is refused for any *new*
+login or registration federation-wide ("this nickname exists on multiple
+federated servers and needs administrator resolution"), but **no
+already-connected session is ever dropped and no account is ever removed
+automatically** - resolving a conflict (renaming or removing one side) is
+a manual operator action. A conflicted channel name is unroutable
+(refused for both a proxied join and a fresh local creation) until an
+operator resolves it the same way. Every directory mutation - a local
+registration/creation exactly as much as a peer's gossip - goes through
+this same merge logic, so the race is closed symmetrically: it does not
+matter which side's claim was recorded first. Removing one claimant from
+a `Conflicted` entry (§18.8) downgrades it back to a clean single owner
+for whichever side remains, rather than requiring every side to resolve
+before any of it clears.
+
+### 18.4 Logging in on the wrong server
+
+A nickname's password is checked only by the server that registered it.
+If a client's `Auth` names a nickname this server has no local account
+for, but the federation directory says a peer owns it, the server answers
+before ever running the (deliberately slow) credential check: `AuthResult
+{ ok: false, reason: Some("this nickname is registered on a different
+federated server - connect to <host:port> instead") }`. A nickname marked
+`Conflicted` answers with its own reason instead, naming the situation
+rather than a server. Both of these are a narrow, deliberate relaxation of
+§5.1's anti-enumeration property (an ordinary `Rejected` is one answer for
+"no such account" and "wrong password" precisely so a login attempt can't
+be used to enumerate nicknames) - unavoidable here, since telling a user
+which server to use necessarily discloses that the name exists somewhere.
+A nickname unknown anywhere in the federation still gets the ordinary,
+undifferentiated `Rejected`.
+
+### 18.5 Introducing two clients on different servers
+
+Two clients cannot punch a direct link (§7.1) without first swapping
+candidate addresses, and the only path they share runs through their
+servers - which is why `RequestPeerLink`/`PeerCandidates` exist at all.
+Within one server that exchange is a lookup in its own connection table.
+Across servers it cannot be: a federated member is shown under a
+synthetic `UserId` its own server minted locally, which names nobody
+anywhere else.
+
+`FederationMessage::PeerSignal` carries that exchange instead, addressed
+by `(server, nickname)` rather than by any id. When a client names a
+federated member, its server translates the id back to the person,
+attaches its own client's identity, and sends it on; the receiving server
+resolves the nickname to its own live connection and delivers an ordinary
+`PeerCandidates`, naming the sender by *its* own synthetic id for them -
+the same one that client already knows them by from `UserJoined`. The
+client needs no knowledge of any of this: it asks for a link exactly as
+it would for someone on its own server.
+
+A signal is sent straight to the destination server when a link to it
+exists, and otherwise offered to every linked peer to pass along, so two
+servers with no link between them can still introduce their clients
+through one they share - the same path presence already takes, and the
+reason a hub topology behaves like a full mesh from a user's point of
+view. `hops_left` and a remembered `signal_id` bound that: a signal is
+never forwarded twice by the same server, and dies after a few hops
+regardless.
+
+Two things ride this relay, both already opaque to any server handling
+them: candidate addresses, and an already-signed key rotation (§13.10).
+Rotation is easy to overlook and matters as much - it is normally routed
+through the server, so for a federated peer it would simply be refused,
+and quietly: messages keep working against the un-rotated keys, and only
+forward secrecy stops, for exactly the peers this exists to connect.
+
+**Relaying is gated on sharing a channel**, checked by the sending server
+and again by the receiving one rather than taken on trust. Synthetic ids
+are minted from a fixed ceiling downwards and so are guessable, and
+clients keep ones they have been told; without the check, naming an id
+would be enough to make a client on another server disclose its candidate
+addresses - its real IPs - to a stranger. Sharing a channel is already
+the condition two clients on one server meet before exchanging those
+addresses, so this asks no more of a federated pair, it just does not
+take the requester's word for it.
+
+Once the link is up, nothing about the conversation touches a server
+again: the introduction is the whole of the server's involvement, and §1's
+doctrine is unchanged.
+
+### 18.6 Joining a channel homed on a different server
+
+`JoinChannel` for a channel the directory says a different server owns is
+proxied there rather than refused: `JoinProxyRequest { request_id,
+channel, joiner_nickname, password, joiner_public_key_der,
+joiner_key_mode }` goes out over the federation link to the owning
+server, which runs the *exact* same ban/allowlist/password checks a local
+join would, against the requesting nickname instead of a `UserId` (there
+is none, since that client connects elsewhere). A grant is recorded in
+that server's own `remote_members` (never `members`, which stays strictly
+local) and answered with `JoinProxyResponse { request_id, outcome }` -
+`Joined { kind, admin }` on success, one of `ChannelJoinRejection`'s
+existing reasons on refusal, or `UnknownChannel` for a directory entry
+that has gone stale. The requesting server mirrors a grant into its own
+`ChannelsRegistry` exactly as if the channel had been created locally
+(never storing the password - there is none to store), so its own
+`ChannelList`/membership bookkeeping, and any other *local* client who
+also joins the same remote-homed channel, work like an ordinary local
+channel. Leaving - an explicit `LeaveChannel` or a disconnect - sends a
+best-effort `LeaveProxyNotice { channel, nickname }` to the home server so
+its `remote_members` stays accurate; nothing waits on it.
+
+This request-response round trip never blocks the server's own client
+connections or federation link while it is in flight: the `Registry`
+mutex is released for its whole duration, and a peer that is unreachable
+or slow to answer fails the join (naming the reason) rather than hanging
+it, bounded by a fixed timeout.
+
+**Cross-server presence.** The channel's home server - the only one with
+full membership visibility - gossips every join or leave on one of its
+channels, local or proxied alike, to *every* currently linked peer:
+`ChannelMemberJoined { channel, member: RemoteIdentity { server,
+nickname, public_key_der, key_mode } }` and `ChannelMemberLeft { channel,
+server, nickname }`. A peer that mirrors the channel (as home to none of
+it, but with a local client's proxy join already in it, or simply from
+§18.2's fully-shared-list mirroring) records the member and tells its own
+local clients about them (`UserJoined`/`UserLeft`), with a stable
+synthetic `UserId` minted the first time that `(server, nickname)` pair
+is ever shown (counting down from `u64::MAX`, so it can never collide
+with a real local id counting up from 1) and kept for as long as this
+server's process runs. A peer that doesn't mirror the channel at all
+drops the gossip silently - there is nothing local to update. Because
+this is broadcast to *every* linked peer rather than routed point to
+point, a member becomes visible even to a server with no direct link at
+all to the one they are actually connected to, purely through a shared
+home server relaying it on. A `/ban` that removes a federated member
+gossips a `ChannelMemberLeft` for them too, so the rest of the federation
+stops listing someone the channel's admin has thrown out - the ban itself
+is enforced where it lives, on the home server, at their next
+`JoinProxyRequest` - which is also why the home server's
+broadcast reaches the very peer the joining client connects through: that
+peer recognizes gossip naming its own `server_federation_id` as its own
+already-locally-handled client and ignores it, rather than recording its
+own client as one of its "remote" members and telling them about
+themselves. A joiner is told about every member already present - local
+and federated alike - before their own join is confirmed, the same order
+a local join already uses for existing members.
+
+**Presence is live-only, so it is resynchronised rather than replayed.**
+A `ChannelMemberJoined`/`ChannelMemberLeft` sent while a peer's link was
+down is never re-sent. Two things make that converge instead of drifting:
+when a link drops, each side *forgets* every member it learned through
+that peer (with a `UserLeft` to its own local members) - with no link,
+this server genuinely does not know who over there is still present, and
+pretending otherwise leaves ghosts that can never be removed; and when a
+link comes up, the home server sends one `ChannelMembership { channel,
+members }` per channel it owns that anyone is in, which the receiver
+applies as a *replacement* rather than a merge, correcting a stale member
+as readily as a missing one. A `ChannelMembership` is believed only from
+the server the directory says owns that channel - no peer may rewrite the
+membership of a channel that is not its to describe.
+
+### 18.7 OTP mail across servers
+
+`OtpMailSend` stores locally exactly as before, then - if the directory
+says a *different* server owns the recipient - forwards the same
+`StoredMail` shape as `MailForward { mail }` over the federation link.
+The owning server stores it in its own `MailStore` and, if the recipient
+happens to be connected there, pushes it immediately, exactly as an
+ordinary local `OtpMailSend` would; only once that store genuinely
+succeeds does it answer `MailForwardAck { mail_id }`, on which the
+forwarding server forgets its own now-redundant local copy. A storage
+failure on the owning server (a transient disk error - `store`'s own
+validation should never itself fail for a mail its uploader already
+accepted) gets no ack at all, so the forwarding server's copy survives
+rather than being forgotten for mail that, in fact, was never durably
+stored anywhere. Until an ack arrives, the mail stays in the forwarding
+server's own `pending/` - so a peer link that is briefly down never
+loses it, only delays it - and every server sweeps its own store for
+anything owed to a peer the moment that peer's link comes up
+(`MailForward`/`MailDeliveredReceipt` are both idempotent on the
+receiving end, so a redundant resend after a reconnect is harmless).
+
+The recipient's `OtpMailAck` triggers `MailDeliveredReceipt { mail_id,
+from, to }` back to whichever server owns the sender, if it isn't this
+one; that server records it exactly as `mark_delivered` would locally, so
+the sender's own `OtpMailFetch`/live-notify path picks it up with no
+client-visible difference from an ordinary same-server delivery. The
+server never touches anything but the opaque ciphertext and its routing
+metadata at any point in this relay - the same "content never crosses the
+server" boundary §17 already draws for a single server applies unchanged
+across a federation link. Unlike `MailForward`, this relay has no
+acknowledgement of its own: the receipt stays in the *relaying* server's
+own `delivered/` indefinitely and is re-sent, harmlessly, on every future
+reconnect to that peer (`sync_mail_with_peer`) - a small, known amount of
+disk and traffic overhead for a long-lived federated pair with many mail
+exchanges, traded for not needing a second acknowledgement round trip on
+top of `MailForwardAck`'s.
+
+### 18.8 Removing a channel or nickname
+
+A channel's removal - `/delete-channel`, a superadmin's `/remove-channel`
+(directly, or by removing the account that administers it), or the
+inactivity sweep - gossips `ChannelRemoved { name, owner }` to every
+linked peer, clearing `owner`'s claim from each one's directory. A peer
+that had mirrored that exact channel (one of its own local clients had
+proxy-joined it, per §18.6) force-deletes its mirror too, the moment the
+message arrives, notifying that local client with the same
+`ServerMessage::ChannelRemoved` a local deletion would send - a channel
+this server owns *itself* is never touched by someone else's removal
+message, even if the name happens to collide, since `owner_of_channel`
+already answers `None` rather than naming either side while a conflict is
+still unresolved (§18.3). A superadmin's `/remove-account` gossips
+`NicknameRemoved { nickname, owner }` the same way, as does an account
+removed for exhausting its activation-code attempts
+(`ActivationOutcome::TooManyWrongCodesAccountRemoved`) - in both cases
+because the nickname staying claimed by a server that no longer has it
+would otherwise block it from ever being registered anywhere in the
+federation again. Removing a channel or nickname that was `Conflicted`
+only ever drops the one claimant named, leaving the other side's
+legitimate claim intact.

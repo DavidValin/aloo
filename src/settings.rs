@@ -34,6 +34,15 @@
 //! password and a daemon's login password are persisted as plaintext like
 //! every other field - anyone who can read `~/.aloo/settings` already
 //! controls this user's account on this machine.
+//!
+//! Also holds this server's optional federation configuration
+//! (`server_federation_*`, `crate::server::federation`) - a separate,
+//! mutually-authenticated trust domain from `server_ssl*` above, linking
+//! this server to a small, operator-curated set of peer servers that share
+//! one nickname/channel namespace. Off unless `server_federation_enabled`
+//! says `on`. Peer authentication is by durable `crypto::pq` identity
+//! (the same ML-DSA-87+RSA-4096/ML-KEM-1024+X25519 PQ-hybrid keys a client
+//! uses), pinned per peer by public key - never TLS/certificates.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -50,6 +59,12 @@ pub const DEFAULT_GLOBAL_PTT_SHORTCUT: &str = "ctrl+alt+p";
 pub const DEFAULT_BIND: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 7878;
 
+/// The default federation listener port - deliberately distinct from
+/// `DEFAULT_PORT` (the client-facing port) and `DEFAULT_DIRECT_PUNCH_PORT`,
+/// since all three can be running on the same host at once
+/// (`crate::server::federation`).
+pub const DEFAULT_FEDERATION_PORT: u16 = 7880;
+
 /// Resolves the settings file path: `~/.aloo/settings`, same home
 /// resolution as every other store in this app (`crate::platform`).
 pub fn default_path() -> PathBuf {
@@ -62,6 +77,16 @@ pub fn default_path() -> PathBuf {
 /// `crate::platform::expand_tilde` resolves it at load time.
 pub const DEFAULT_SERVER_SSL_FULLCHAIN: &str = "~/.aloo/certs/fullchain.pem";
 pub const DEFAULT_SERVER_SSL_PRIVKEY: &str = "~/.aloo/certs/privkey.pem";
+
+/// Where this server's own federation identity keybundle prefix is looked
+/// for - `<prefix>.priv`/`<prefix>.pub` (`crypto::pq::bundle_paths`),
+/// generated on first use if missing (`crypto::pq::ensure_bundle_at`), the
+/// same PQ-hybrid identity shape a client's `my_key` uses. Separate from
+/// `server_ssl*` above: the federation link
+/// (`crate::server::federation::handshake`) is a distinct,
+/// mutually-authenticated trust domain from the one-way client-facing TLS
+/// those keys serve, and does not use TLS at all.
+pub const DEFAULT_SERVER_FEDERATION_IDENTITY: &str = "~/.aloo/federation/identity";
 
 /// `on`/`true`/`yes`/`1` - the spelling every `on`/`off` setting in this
 /// file accepts, so no spelling is a silent no-op.
@@ -514,6 +539,78 @@ impl DirectPunchTarget {
     }
 }
 
+/// One `server_federation_peer=<peer_id>,<host>,<port>,<public_key_path>`
+/// line - a federated peer server this server trusts, and the pinned
+/// PQ-hybrid public key file (`crypto::pq::PqPublicBundle`, the peer's
+/// `<identity_prefix>.pub`) its `Hello` is checked against over the
+/// federation link (`crate::server::federation::handshake` - entirely
+/// separate from `server_ssl`'s one-way client-facing TLS, and does not use
+/// TLS at all). Trust is by pinned public key, not a shared CA: federation
+/// is meant to be a small, operator-curated set of servers, so pinning each
+/// peer's own key is simpler to audit than running a private CA just to add
+/// a peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationPeerConfig {
+    /// The peer's own `server_federation_id` - how gossip and directory
+    /// entries name which server owns a nickname or channel.
+    pub peer_id: String,
+    pub host: String,
+    pub port: u16,
+    /// Path (`~`-relative as written) to that peer's federation public key
+    /// bundle - the `.pub` half of their `server_federation_identity`,
+    /// copied here out of band (the same way a contact's identity card is
+    /// shared) before this server can link to them.
+    pub public_key_path: String,
+}
+
+impl FederationPeerConfig {
+    /// Parses one settings value. Unlike `DirectPunchTarget`'s `<where>`
+    /// field, host and port are always separate here - a federation peer's
+    /// address is operator-typed once and rarely edited, so there is no
+    /// value in the compact combined-or-bracketed spelling that field
+    /// needs for frequently hand-edited direct-punch lines.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+        let [peer_id, host, port, public_key_path] = parts.as_slice() else {
+            return Err(format!(
+                "expected <peer_id>,<host>,<port>,<public_key_path>, got {value:?}"
+            ));
+        };
+        if peer_id.is_empty() || !crate::validation::is_storable(peer_id) {
+            return Err(format!("not a valid peer id: {peer_id:?}"));
+        }
+        if !host_is_valid(host) {
+            return Err(format!(
+                "not a valid IPv4 address, IPv6 address or hostname: {host:?}"
+            ));
+        }
+        if public_key_path.is_empty() {
+            return Err("empty public key path".to_string());
+        }
+        // Not `parse_port` above: that helper's range is specific to
+        // `direct_punch_to`'s ephemeral-port convention
+        // (`DIRECT_PUNCH_PORT_MIN`-`DIRECT_PUNCH_PORT_MAX`), which would
+        // wrongly refuse an ordinary low port a federation listener is
+        // just as likely to use (`DEFAULT_FEDERATION_PORT` itself is
+        // below that range).
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("not a valid port: {port:?}"))?;
+        Ok(Self {
+            peer_id: peer_id.to_string(),
+            host: host.to_string(),
+            port,
+            public_key_path: public_key_path.to_string(),
+        })
+    }
+
+    /// `<peer_id>,<host>,<port>,<public_key_path>` - the exact spelling
+    /// `parse` accepts, so a load/save round trip is lossless.
+    pub fn to_setting_value(&self) -> String {
+        format!("{},{},{},{}", self.peer_id, self.host, self.port, self.public_key_path)
+    }
+}
+
 /// The default for `transfers_shortcut` - the key that opens the global
 /// transfers popup (`client::tui::transfers_popup`).
 pub const DEFAULT_TRANSFERS_SHORTCUT: &str = "ctrl+d";
@@ -907,6 +1004,41 @@ pub struct Settings {
     /// contain a comma but a joined list still reads worse than repeating
     /// the key.
     pub server_superadmin: BTreeSet<String>,
+    /// Whether this server links into a federation of peer servers
+    /// (`crate::server::federation`) - off by default, so every existing
+    /// server behaves exactly as before unless an operator opts in.
+    pub server_federation_enabled: bool,
+    /// This server's own stable label in the federation (how peers'
+    /// directories name it as a nickname/channel owner). Required for
+    /// `server_federation_enabled=on` to actually start the federation
+    /// listener - a server with no id of its own cannot be gossiped about.
+    pub server_federation_id: Option<String>,
+    pub server_federation_bind: String,
+    pub server_federation_port: u16,
+    /// The `host:port` peers should dial to reach this server - distinct
+    /// from `server_federation_bind`/`_port` because a bind address like
+    /// `0.0.0.0` is never itself dialable.
+    pub server_federation_advertise_addr: Option<String>,
+    /// This server's own federation identity keybundle prefix - a
+    /// PQ-hybrid identity (`crypto::pq`) it signs peer-link handshakes
+    /// with, `~`-relative as written (`DEFAULT_SERVER_FEDERATION_IDENTITY`).
+    /// Generated on first use if `<prefix>.priv`/`<prefix>.pub` don't exist
+    /// yet; the `.pub` half is what gets copied to peers.
+    pub server_federation_identity: String,
+    /// The `host:port` an ordinary *client* should be told to connect to
+    /// for this server - what a peer repeats back to a user who tried to
+    /// log in on the wrong one ("connect to <host:port> instead", §18.4).
+    /// Distinct from every other address here: `server_federation_*` are
+    /// all the server-to-server port, which no client ever speaks to.
+    /// Announced to peers over the link, so it is set once here rather
+    /// than repeated in every other server's peer list. Unset means a
+    /// redirect can only name this server's federation id.
+    pub server_federation_client_addr: Option<String>,
+    /// One `server_federation_peer=...` line per trusted peer
+    /// (`FederationPeerConfig`) - the complete federation trust set. No
+    /// peer here means federation is configured on but has nobody to link
+    /// to yet.
+    pub server_federation_peers: Vec<FederationPeerConfig>,
     /// Overrides the `otp` binary aloo spawns for the OTP encryption layer
     /// (`client::otp_cli::OtpCliConfig::resolve`) - `None` resolves against
     /// `PATH` (or `ALOO_OTP_BIN`, which always wins over this). aloo never
@@ -1138,6 +1270,14 @@ impl Default for Settings {
             server_allow_create_public_channels: true,
             server_channel_deletion_unactivity_period: None,
             server_superadmin: BTreeSet::new(),
+            server_federation_enabled: false,
+            server_federation_id: None,
+            server_federation_bind: DEFAULT_BIND.to_string(),
+            server_federation_port: DEFAULT_FEDERATION_PORT,
+            server_federation_advertise_addr: None,
+            server_federation_identity: DEFAULT_SERVER_FEDERATION_IDENTITY.to_string(),
+            server_federation_client_addr: None,
+            server_federation_peers: Vec::new(),
             otp_binary_path: None,
             otp_keypair_size_mb: DEFAULT_OTP_KEYPAIR_SIZE_MB,
             otp_low_key_warn_pct: DEFAULT_OTP_LOW_KEY_WARN_PCT,
@@ -1273,6 +1413,14 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         Key("server_allow_create_public_channels"),
         Key("server_channel_deletion_unactivity_period"),
         Literal("# server_superadmin=somenickname"),
+        Key("server_federation_enabled"),
+        Key("server_federation_id"),
+        Key("server_federation_bind"),
+        Key("server_federation_port"),
+        Key("server_federation_advertise_addr"),
+        Key("server_federation_identity"),
+        Key("server_federation_client_addr"),
+        Literal("# server_federation_peer=serverB,peerb.example.com,7880,~/.aloo/federation/peerB.pub"),
     ]
 };
 
@@ -1421,6 +1569,32 @@ impl Settings {
                 // value that couldn't be a real nickname can't name anyone.
                 "server_superadmin" if crate::validation::nickname_is_registrable(value) => {
                     settings.server_superadmin.insert(value.to_string());
+                }
+                "server_federation_enabled" => {
+                    settings.server_federation_enabled = parse_switch(value);
+                }
+                "server_federation_id" if !value.is_empty() => {
+                    settings.server_federation_id = Some(value.to_string());
+                }
+                "server_federation_bind" if !value.is_empty() => {
+                    settings.server_federation_bind = value.to_string();
+                }
+                "server_federation_port" => {
+                    set_parsed(&mut settings.server_federation_port, value);
+                }
+                "server_federation_advertise_addr" if !value.is_empty() => {
+                    settings.server_federation_advertise_addr = Some(value.to_string());
+                }
+                "server_federation_identity" if !value.is_empty() => {
+                    settings.server_federation_identity = value.to_string();
+                }
+                "server_federation_client_addr" if !value.is_empty() => {
+                    settings.server_federation_client_addr = Some(value.to_string());
+                }
+                "server_federation_peer" => {
+                    if let Ok(peer) = FederationPeerConfig::parse(value) {
+                        settings.server_federation_peers.push(peer);
+                    }
                 }
                 "otp_binary_path" if !value.is_empty() => {
                     settings.otp_binary_path = Some(value.to_string());
@@ -1628,6 +1802,19 @@ impl Settings {
                 "server_channel_deletion_unactivity_period",
                 self.server_channel_deletion_unactivity_period,
             ),
+            always_switch("server_federation_enabled", self.server_federation_enabled),
+            always_optional("server_federation_id", self.server_federation_id.as_deref()),
+            always("server_federation_bind", &self.server_federation_bind),
+            always("server_federation_port", self.server_federation_port),
+            always_optional(
+                "server_federation_advertise_addr",
+                self.server_federation_advertise_addr.as_deref(),
+            ),
+            always("server_federation_identity", &self.server_federation_identity),
+            always_optional(
+                "server_federation_client_addr",
+                self.server_federation_client_addr.as_deref(),
+            ),
             always("otp_keypair_size_mb", self.otp_keypair_size_mb),
             always("otp_low_key_warn_pct", self.otp_low_key_warn_pct),
             always("otp_status_poll_interval", self.otp_status_poll_interval),
@@ -1702,6 +1889,13 @@ impl Settings {
                     .iter()
                     .filter(|n| crate::validation::is_storable(n))
                     .cloned()
+                    .collect(),
+            ),
+            (
+                "server_federation_peer",
+                self.server_federation_peers
+                    .iter()
+                    .map(FederationPeerConfig::to_setting_value)
                     .collect(),
             ),
             (

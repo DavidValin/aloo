@@ -98,11 +98,35 @@ ENV ALOO_SMTP_PORT=""
 ENV ALOO_SMTP_USERNAME=""
 ENV ALOO_SMTP_PASSWORD=""
 
+# Server federation (docs/PROTOCOL.md §18) - off unless ALOO_FEDERATION_ENABLED
+# is set. No TLS/certificates: peers authenticate each other with a durable
+# PQ-hybrid identity instead (ALOO_FEDERATION_IDENTITY names this server's
+# own keybundle prefix, generated automatically on first start if missing).
+# ALOO_FEDERATION_PEERS is one peer per `;`, each itself
+# `<peer_id>,<host>,<port>,<public_key_path>` - the public key path must
+# resolve inside the container, so a peer's pinned public key needs its own
+# bind mount alongside the ~/.aloo volume.
+ENV ALOO_FEDERATION_ENABLED=""
+ENV ALOO_FEDERATION_ID=""
+ENV ALOO_FEDERATION_PORT=""
+ENV ALOO_FEDERATION_ADVERTISE_ADDR=""
+ENV ALOO_FEDERATION_IDENTITY=""
+# Where clients (not peers) should connect for this server - what a peer
+# names when redirecting a user who logged in on the wrong one. The
+# client-facing port, never the federation one.
+ENV ALOO_FEDERATION_CLIENT_ADDR=""
+ENV ALOO_FEDERATION_PEERS=""
+
 # TCP carries client connections; UDP is the rendezvous socket clients use
 # to discover their own public address for hole punching (docs/PROTOCOL.md
 # 7.1). Publishing only TCP leaves clients able to connect and see each
 # other while nothing they send ever arrives - see docs/SERVER_ON_DOCKER.md.
 EXPOSE 7878/tcp
 EXPOSE 7878/udp
+
+# The federation listener (docs/PROTOCOL.md §18.1) - only reachable to, and
+# needed by, other federated servers, never an ordinary client. Only
+# relevant when ALOO_FEDERATION_ENABLED is on.
+EXPOSE 7880/tcp
 
 ENTRYPOINT ["/usr/local/bin/aloo-server-entrypoint.sh"]
