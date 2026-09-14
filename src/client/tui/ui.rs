@@ -1051,6 +1051,12 @@ pub struct UiState {
     /// about it.
     pub(crate) last_opened_url: Option<(usize, usize)>,
     pub input: String,
+    /// Char index (not byte offset) into `input` where the next typed
+    /// character lands, Backspace removes from, and the blinking cursor is
+    /// drawn (`render_input_bar`). Always clamped to `input`'s current
+    /// length at the point it's read, so a value left over past a shorter
+    /// `input` is read back as simply "the end".
+    pub input_cursor: usize,
     pub mode: Mode,
     pub join_popup_input: String,
     /// Ctrl+J popup's Public/Private selector - defaults to `Private`,
@@ -1525,6 +1531,7 @@ impl UiState {
             message_selected: 0,
             last_opened_url: None,
             input: String::new(),
+            input_cursor: 0,
             mode: Mode::Normal,
             join_popup_input: String::new(),
             join_popup_kind: ChannelKind::Private,

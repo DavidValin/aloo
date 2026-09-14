@@ -754,7 +754,7 @@ impl UiState {
         }
 
         match self.focus {
-            Focus::Input => self.handle_input_key(code),
+            Focus::Input => self.handle_input_key(code, modifiers),
             Focus::Sidebar => self.handle_sidebar_key(code),
             Focus::Messages => self.handle_messages_key(code),
         }
@@ -1150,7 +1150,7 @@ impl UiState {
         };
     }
 
-    fn handle_input_key(&mut self, code: KeyCode) -> Option<UiAction> {
+    fn handle_input_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<UiAction> {
         // Reading back history is the one thing the compose bar hands
         // straight to the log: focus starts here and stays here while
         // typing, so requiring a Tab round-trip to scroll would leave the
@@ -1178,9 +1178,63 @@ impl UiState {
         if self.active_dm_peer_trust_gated() {
             return None;
         }
+        // A stale cursor (left over from before the buffer was last
+        // cleared - see the field's own doc) is never acted on past the
+        // end of what's actually there.
+        let len = self.input.chars().count();
+        self.input_cursor = self.input_cursor.min(len);
+        // Either modifier moves/deletes a whole word at once: Ctrl is the
+        // common GUI-terminal convention, Alt is readline's - both honored
+        // since terminals disagree on which they send.
+        let word_wise = modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match code {
+            KeyCode::Left => {
+                self.input_cursor = if word_wise {
+                    self.input_word_start_before(self.input_cursor)
+                } else {
+                    self.input_cursor.saturating_sub(1)
+                };
+                None
+            }
+            KeyCode::Right => {
+                self.input_cursor = if word_wise {
+                    self.input_word_end_after(self.input_cursor)
+                } else {
+                    (self.input_cursor + 1).min(len)
+                };
+                None
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.input_cursor = len;
+                None
+            }
             KeyCode::Backspace => {
-                self.input.pop();
+                if self.input_cursor == 0 {
+                    return None;
+                }
+                let start = if word_wise {
+                    self.input_word_start_before(self.input_cursor)
+                } else {
+                    self.input_cursor - 1
+                };
+                self.remove_input_char_range(start, self.input_cursor);
+                self.input_cursor = start;
+                None
+            }
+            KeyCode::Delete => {
+                if self.input_cursor >= len {
+                    return None;
+                }
+                let end = if word_wise {
+                    self.input_word_end_after(self.input_cursor)
+                } else {
+                    self.input_cursor + 1
+                };
+                self.remove_input_char_range(self.input_cursor, end);
                 None
             }
             KeyCode::Char(c) => {
@@ -1189,14 +1243,75 @@ impl UiState {
                 // long enough to matter here is always diverted to a file
                 // first (`handle_paste`), so this only ever bites manually
                 // typed text.
-                if self.input.chars().count() < crate::proto::TEXT_MESSAGE_MAX_LEN {
-                    self.input.push(c);
+                if len < crate::proto::TEXT_MESSAGE_MAX_LEN {
+                    self.insert_input_char_at_cursor(c);
                 }
                 None
             }
             KeyCode::Enter => self.submit_input(),
             _ => None,
         }
+    }
+
+    /// The char index one word back from `from` - readline's `Alt+B`/`Ctrl+Left`:
+    /// skip any whitespace immediately behind the cursor, then skip the
+    /// run of non-whitespace behind that. Operates on `input`'s chars, not
+    /// bytes, so it lands cleanly between multi-byte characters.
+    fn input_word_start_before(&self, from: usize) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = from.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// `input_word_start_before`'s mirror: the char index one word ahead of
+    /// `from` - readline's `Alt+F`/`Ctrl+Right`.
+    fn input_word_end_after(&self, from: usize) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let len = chars.len();
+        let mut i = from.min(len);
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    /// Inserts `c` at `input_cursor`'s position and advances the cursor
+    /// past it.
+    fn insert_input_char_at_cursor(&mut self, c: char) {
+        let byte_at = self.input_byte_index(self.input_cursor);
+        self.input.insert(byte_at, c);
+        self.input_cursor += 1;
+    }
+
+    /// Removes the chars in `[start, end)` (char indices) from `input` -
+    /// `handle_input_key`'s single point of "delete this stretch" for both
+    /// a plain Backspace/Delete (one char) and their word-wise siblings.
+    fn remove_input_char_range(&mut self, start: usize, end: usize) {
+        let byte_start = self.input_byte_index(start);
+        let byte_end = self.input_byte_index(end);
+        self.input.replace_range(byte_start..byte_end, "");
+    }
+
+    /// `input`'s byte offset for a char index - `String` is UTF-8 and only
+    /// takes byte offsets, but every position this module tracks is a char
+    /// index (what "one cursor step" means to the user). A char index at or
+    /// past the end resolves to `input.len()`, the one byte offset always
+    /// valid for both `insert` and as the open end of `replace_range`.
+    fn input_byte_index(&self, char_index: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_index)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
     }
 
     /// Only clears `input` once we know the message can actually be
