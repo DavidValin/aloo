@@ -1635,10 +1635,12 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         && !dm_peer_trust_gated
         && (!dm_peer_offline || !state.input.is_empty())
     {
-        // Past the pad marker, when there is one - the cursor belongs
-        // where the next character will actually land.
-        let offset = pad_prefix.as_deref().map(display_width).unwrap_or(0)
-            + state.input.chars().count() as u16;
+        // Past the pad marker, when there is one - the cursor belongs at
+        // `input_cursor`'s position (Left/Right/Home/End move it), clamped
+        // to what's actually there so a value left over past a shorter
+        // `input` reads back as simply "the end".
+        let cursor_chars = state.input_cursor.min(state.input.chars().count()) as u16;
+        let offset = pad_prefix.as_deref().map(display_width).unwrap_or(0) + cursor_chars;
         let cursor_x = inner.x + offset.min(inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, inner.y));
     }

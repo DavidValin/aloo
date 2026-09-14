@@ -720,6 +720,11 @@ async fn serve_one(
                         crossterm::event::KeyEvent::new_with_kind(code, modifiers, kind),
                     )));
                 }
+                // Lands on the same `SessionInput::Key(Event::Paste)` arm a
+                // terminal-owning session's own bracketed paste does.
+                AttachMessage::Paste(text) => {
+                    let _ = input_tx.send(SessionInput::Key(crossterm::event::Event::Paste(text)));
+                }
                 AttachMessage::Resize { cols, rows } => {
                     let _ = input_tx.send(SessionInput::Resized(TerminalSize::new(cols, rows)));
                 }
@@ -870,6 +875,16 @@ async fn pump_attach(
                             rows,
                         })?)
                         .await?;
+                        continue;
+                    }
+                    // The viewer's terminal has bracketed paste on
+                    // (`tui::terminal::setup`), so a paste arrives whole
+                    // here and must travel whole: dropping it with the
+                    // other unforwardable events (mouse, focus) is what
+                    // used to make Ctrl+Shift+V do nothing while attached.
+                    crossterm::event::Event::Paste(text) => {
+                        wr.write_all(&daemon_ipc::encode_frame(&AttachMessage::Paste(text))?)
+                            .await?;
                         continue;
                     }
                     _ => continue,
