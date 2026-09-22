@@ -401,3 +401,140 @@ fn on_mail_delivered_ack_forgets_the_receipt() {
     assert!(out.is_empty(), "nothing to send back");
     assert!(!t.store.is_delivered(&m.mail_id), "receipt forgotten");
 }
+
+// ---------------------------------------------------------------------
+// Federation relay (`crate::server::federation`): the store methods and
+// `on_mail_send`/`on_mail_ack` wrappers a cross-server forward/receipt
+// relay is built on.
+// ---------------------------------------------------------------------
+
+/// @requirement TB-308
+#[test]
+fn on_mail_send_with_relay_info_hands_back_the_stored_mail() {
+    let t = TempStore::new("relay-send");
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![1], KeyMode::PqHybrid);
+    let m = mail(0x10, "IGNORED-CLAIM", "carol", 0);
+    let (outgoing, relay) = mail::on_mail_send_with_relay_info(
+        &reg,
+        &t.store,
+        alice,
+        m.mail_id.clone(),
+        m.to.clone(),
+        m.contact_name.clone(),
+        m.seq,
+        m.sent_at_utc,
+        m.ciphertext.clone(),
+    );
+    assert!(matches!(outgoing[0].message, ServerMessage::OtpMailResult { ok: true, .. }));
+    let relay = relay.expect("a real sender always gets a mail back");
+    assert_eq!(relay.from, "alice");
+    assert_eq!(relay.to, "carol");
+    assert_eq!(relay.ciphertext, m.ciphertext);
+}
+
+/// @requirement TB-308
+#[test]
+fn on_mail_send_with_relay_info_is_none_for_an_unknown_sender() {
+    let t = TempStore::new("relay-send-unknown");
+    let reg = Registry::new();
+    let (outgoing, relay) = mail::on_mail_send_with_relay_info(
+        &reg,
+        &t.store,
+        aloo::proto::UserId(999_999),
+        "a".repeat(32),
+        "carol".into(),
+        "abc-def".into(),
+        0,
+        0,
+        vec![1],
+    );
+    assert!(outgoing.is_empty());
+    assert!(relay.is_none());
+}
+
+/// @requirement TB-308
+#[test]
+fn on_mail_ack_with_relay_info_hands_back_the_full_receipt() {
+    let t = TempStore::new("relay-ack");
+    let mut reg = Registry::new();
+    // The sender ("dave") is never connected here - the whole point of
+    // the relay is reaching a sender who is only connected to a
+    // *different* server.
+    let carol = reg.register("carol".into(), vec![1], KeyMode::PqHybrid);
+    let m = mail(0x13, "dave", "carol", 0);
+    t.store.store(&m).unwrap();
+    let (outgoing, receipt) = mail::on_mail_ack_with_relay_info(&reg, &t.store, carol, m.mail_id.clone());
+    assert!(outgoing.is_empty(), "dave is not connected here to notify locally");
+    let receipt = receipt.expect("the ack genuinely applied");
+    assert_eq!(receipt.mail_id, m.mail_id);
+    assert_eq!(receipt.from, "dave");
+    assert_eq!(receipt.to, "carol");
+}
+
+/// An ack that does not actually apply (wrong claimant, unknown id)
+/// reports no receipt at all - a relay must never invent one for a no-op.
+/// @requirement TB-308
+#[test]
+fn on_mail_ack_with_relay_info_is_none_when_the_ack_is_a_no_op() {
+    let t = TempStore::new("relay-ack-noop");
+    let mut reg = Registry::new();
+    let mallory = reg.register("mallory".into(), vec![1], KeyMode::PqHybrid);
+    let m = mail(0x14, "dave", "carol", 0);
+    t.store.store(&m).unwrap();
+    let (outgoing, receipt) = mail::on_mail_ack_with_relay_info(&reg, &t.store, mallory, m.mail_id.clone());
+    assert!(outgoing.is_empty());
+    assert!(receipt.is_none(), "mallory is not the addressee - the ack must not apply");
+}
+
+/// @requirement TB-308
+#[test]
+fn record_relayed_receipt_writes_it_and_forgets_any_local_pending_copy() {
+    let t = TempStore::new("relayed-receipt");
+    let m = mail(0x15, "dave", "carol", 0);
+    t.store.store(&m).unwrap();
+    let receipt = mail::DeliveredReceipt {
+        mail_id: m.mail_id.clone(),
+        from: "dave".to_string(),
+        to: "carol".to_string(),
+    };
+    t.store.record_relayed_receipt(&receipt).unwrap();
+    assert_eq!(t.store.receipt_for(&m.mail_id), Some(receipt));
+    assert!(t.store.pending_for("carol").is_empty(), "the relayed receipt closes out any local copy too");
+}
+
+/// @requirement TB-308
+#[test]
+fn forget_after_relay_removes_only_the_pending_copy() {
+    let t = TempStore::new("forget-after-relay");
+    let m = mail(0x16, "dave", "carol", 0);
+    t.store.store(&m).unwrap();
+    t.store.forget_after_relay(&m.mail_id);
+    assert!(t.store.pending_for("carol").is_empty());
+    assert!(!t.store.is_delivered(&m.mail_id), "forgetting a relay is not a delivery");
+}
+
+/// @requirement TB-308
+#[test]
+fn pending_all_and_receipts_all_list_everything_regardless_of_addressee() {
+    let t = TempStore::new("all");
+    let m1 = mail(0x17, "alice", "bob", 0);
+    let m2 = mail(0x18, "carol", "dave", 0);
+    t.store.store(&m1).unwrap();
+    t.store.store(&m2).unwrap();
+    let mut pending = t.store.pending_all();
+    pending.sort_by(|a, b| a.mail_id.cmp(&b.mail_id));
+    assert_eq!(pending, {
+        let mut v = vec![m1.clone(), m2.clone()];
+        v.sort_by(|a, b| a.mail_id.cmp(&b.mail_id));
+        v
+    });
+
+    t.store.mark_delivered(&m1.mail_id, "bob").unwrap();
+    t.store.mark_delivered(&m2.mail_id, "dave").unwrap();
+    let mut receipts = t.store.receipts_all();
+    receipts.sort_by(|a, b| a.mail_id.cmp(&b.mail_id));
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().any(|r| r.from == "alice"));
+    assert!(receipts.iter().any(|r| r.from == "carol"));
+}

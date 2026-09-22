@@ -162,3 +162,7 @@ async fn a_client_with_the_wrong_trust_root_refuses_the_handshake() {
     assert!(result.is_err(), "an untrusted certificate must not be accepted");
     let _ = server.await;
 }
+
+// Federation (`crate::server::federation`) does not use TLS at all - see
+// `server_federation_test.rs` for its PQ-hybrid mutual authentication
+// handshake tests.

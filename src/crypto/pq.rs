@@ -697,6 +697,59 @@ pub fn verify_rotation(
     bincode_decode(rotation_bytes).ok()
 }
 
+/// Domain-separated signature over caller-supplied bytes, using this
+/// identity's durable signing keys (ML-DSA-87 + RSA-4096) - the same dual
+/// signature every other identity statement in this module carries, as a
+/// generic escape hatch for a caller whose commitment shape does not
+/// otherwise fit one of the dedicated functions above (`server::federation`'s
+/// peer-link handshake transcript, notably - servers authenticating each
+/// other with the same durable identities a client uses, no TLS involved).
+/// `domain` must be unique to the caller so a signature produced here can
+/// never verify in a different context.
+pub fn sign_with_identity(
+    signing: &PqPrivateBundle,
+    domain: &[u8],
+    data: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut commitment = Vec::with_capacity(domain.len() + data.len());
+    commitment.extend_from_slice(domain);
+    commitment.extend_from_slice(data);
+    let mldsa_sig = {
+        let sk = decode_mldsa_signing(signing)?;
+        sk.sign(&commitment).encode().as_slice().to_vec()
+    };
+    let rsa_sk = super::private_key_from_der(&signing.rsa_sign_private_der)?;
+    let rsa_sig = super::sign(&rsa_sk, &commitment)?;
+    Ok((mldsa_sig, rsa_sig))
+}
+
+/// Verifies a `sign_with_identity` signature against the signer's public
+/// bundle. `false` - fail closed - on any malformed input or a signature
+/// that does not verify against `domain`/`data` exactly as signed.
+pub fn verify_with_identity(
+    public: &PqPublicBundle,
+    domain: &[u8],
+    data: &[u8],
+    sig: &(Vec<u8>, Vec<u8>),
+) -> bool {
+    let mut commitment = Vec::with_capacity(domain.len() + data.len());
+    commitment.extend_from_slice(domain);
+    commitment.extend_from_slice(data);
+    let Ok(vk) = decode_mldsa_verifying(public) else {
+        return false;
+    };
+    let Ok(mldsa_sig) = MlDsaSignature::<MlDsa87>::try_from(sig.0.as_slice()) else {
+        return false;
+    };
+    if vk.verify(&commitment, &mldsa_sig).is_err() {
+        return false;
+    }
+    let Ok(rsa_pk) = super::public_key_from_der(&public.rsa_sign_public_der) else {
+        return false;
+    };
+    super::verify(&rsa_pk, &commitment, &sig.1)
+}
+
 fn bincode_encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     crate::proto::encode(v).map_err(|e| CryptoError::Encrypt(e.to_string()))
 }

@@ -310,6 +310,10 @@ name = "server_ssl_test"
 path = "test/server_ssl_test.rs"
 
 [[test]]
+name = "server_federation_test"
+path = "test/server_federation_test.rs"
+
+[[test]]
 name = "reconnect_test"
 path = "test/reconnect_test.rs"
 

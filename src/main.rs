@@ -199,6 +199,18 @@ struct Cli {
         help_heading = "Server Commands"
     )]
     change_password: Option<Vec<String>>,
+
+    /// Federation: release every nickname and channel a decommissioned
+    /// peer still claims in this server's directory, so those names can be
+    /// registered again. For a server that is genuinely gone for good -
+    /// removing a peer from `server_federation_peer` alone does not do
+    /// this, deliberately: a server can legitimately know about names
+    /// owned by servers it does not itself peer with (learned through a
+    /// server they share), and pruning those would break exactly that.
+    /// Stop this server first. A name the departing peer shared with
+    /// another server is left with that other server's claim intact.
+    #[arg(long, value_name = "PEER_ID", help_heading = "Server Commands")]
+    forget_federation_peer: Option<String>,
 }
 
 /// Not `#[tokio::main]`: on macOS, delivering the global push-to-talk
@@ -221,6 +233,9 @@ fn main() -> Result<(), BoxError> {
     }
     if let Some(args) = &cli.register_user {
         return run_register_user(&args[0], &args[1]);
+    }
+    if let Some(peer_id) = &cli.forget_federation_peer {
+        return run_forget_federation_peer(peer_id);
     }
     if let Some(args) = &cli.change_password {
         return run_change_password(&args[0], &args[1]);
@@ -592,6 +607,74 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
         println!("aloo: registration open");
     }
 
+    if settings.server_federation_enabled {
+        let self_id = settings.server_federation_id.clone().ok_or(
+            "server_federation_enabled is on but server_federation_id is not set - a server \
+             needs its own id to be gossiped about",
+        )?;
+        // Peer ids were validated when `server_federation_peer` was
+        // parsed; this server's own id never was, and it is written into
+        // the persisted nickname directory as an owner.
+        if !server::federation::directory::owner_id_is_storable(&self_id) {
+            return Err(format!(
+                "server_federation_id {self_id:?} cannot be used: it must not be empty or contain \
+                 a tab, newline or comma - those are the separators the federation directory is \
+                 stored with"
+            )
+            .into());
+        }
+        let listen_addr = validation::parse_bind_addr(
+            &settings.server_federation_bind,
+            settings.server_federation_port,
+        )?;
+        let advertise_addr = settings.server_federation_advertise_addr.clone().unwrap_or_else(|| {
+            format!("{}:{}", settings.server_federation_bind, settings.server_federation_port)
+        });
+        let identity_prefix = aloo::platform::expand_tilde(&settings.server_federation_identity);
+        let prefix_str = identity_prefix.to_string_lossy().to_string();
+        let (identity_priv_path, identity_pub_path) = crypto::pq::bundle_paths(&prefix_str);
+        crypto::pq::ensure_bundle_at(&identity_pub_path, &identity_priv_path)
+            .map_err(|e| format!("cannot create federation identity: {e}"))?;
+        let identity = crypto::pq::load_private_bundle(&identity_priv_path).map_err(|e| {
+            format!("cannot read federation identity {}: {e}", identity_priv_path.display())
+        })?;
+        let mut directory = server::federation::directory::FederationDirectory::open_exclusive(
+            server::federation::directory::default_dir(),
+        )?
+        .ok_or_else(server::federation::directory::FederationDirectory::busy_message)?;
+        // Every account this server actually has must be claimed in the
+        // directory, whatever happened last time it ran. `register_account`
+        // writes the account first and records the claim only once the
+        // activation email has gone out (a failed email rolls the account
+        // back, so claiming earlier would leave a claim for an account that
+        // no longer exists) - which leaves a window where a crash in
+        // between produces an account with no claim, and nothing would
+        // ever notice. Reconciling here closes it: the users registry is
+        // the authority on what exists, so anything in it is claimed now.
+        // A name a peer has meanwhile claimed too becomes `Conflicted`,
+        // exactly as it would have at registration time.
+        let local_nicknames = users.nicknames();
+        if !local_nicknames.is_empty() {
+            directory.merge_remote_nicknames(
+                local_nicknames.into_iter().map(|nickname| (nickname, self_id.clone())),
+            )?;
+        }
+        let federation = server::federation::FederationConfig::new(
+            self_id.clone(),
+            listen_addr,
+            advertise_addr,
+            settings.server_federation_client_addr.clone(),
+            identity,
+            settings.server_federation_peers.clone(),
+            directory,
+        )?;
+        println!(
+            "aloo: federation enabled as '{self_id}', listening on {listen_addr} (public key: {})",
+            identity_pub_path.display()
+        );
+        options = options.with_federation(federation);
+    }
+
     let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;
     println!("aloo: server listening on {addr}");
     server::run(addr, options).await?;
@@ -599,8 +682,44 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
 }
 
 /// `--register-user <nickname> <password>`: straight into the registry
-/// the server reads from, active immediately.
+/// the server reads from, active immediately. Runs as its own one-off
+/// process - typically before the server has even started (`docker-server`'s
+/// entrypoint runs every `ALOO_REGISTER_USERS` entry this way ahead of
+/// `aloo --server`) - so there is no live server, and therefore no live
+/// federation link, to check or gossip through the way `register_account`
+/// does for a `Register` over the wire. When federation is on, this
+/// still checks (and records) directly against the on-disk federation
+/// directory: refusing a nickname a peer already owns before ever writing
+/// the account, and recording this server's own claim on success so the
+/// next peer link that comes up picks it up via `DirectorySnapshot`,
+/// exactly as if it had been gossiped live.
 fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
+    let settings = load_settings();
+    let self_id = if settings.server_federation_enabled {
+        Some(settings.server_federation_id.clone().ok_or(
+            "server_federation_enabled is on but server_federation_id is not set - refusing to \
+             register a nickname federation can't attribute to this server",
+        )?)
+    } else {
+        None
+    };
+    // Opened once and held for the whole of this function when federation
+    // is on: the check below and the record at the end are one
+    // read-modify-write, and nothing else - a running server especially -
+    // may write the file in between (see `open_exclusive`).
+    let mut directory = match &self_id {
+        Some(self_id) => {
+            let directory =
+                server::federation::directory::FederationDirectory::open_exclusive(
+                    server::federation::directory::default_dir(),
+                )?
+                .ok_or_else(server::federation::directory::FederationDirectory::busy_message)?;
+            directory.is_registrable_here(nickname, self_id)?;
+            Some(directory)
+        }
+        None => None,
+    };
+
     let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
     // `main`'s default error printer shows a returned error's `Debug`, not
     // its `Display` - for `RegisterError` that would print the bare enum
@@ -610,10 +729,29 @@ fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
     users
         .register_manual(nickname, password)
         .map_err(|e| e.to_string())?;
+
+    if let (Some(self_id), Some(directory)) = (&self_id, &mut directory) {
+        directory.record_local_nickname(nickname.to_string(), self_id)?;
+    }
+
     println!(
         "aloo: registered {nickname} in {} (active, no email)",
         users.dir().display()
     );
+    Ok(())
+}
+
+/// `--forget-federation-peer <peer_id>`: releases every name a
+/// decommissioned peer still claims here. Runs against the directory
+/// directly, so the server must be stopped - see
+/// `FederationDirectory::open_exclusive`.
+fn run_forget_federation_peer(peer_id: &str) -> Result<(), BoxError> {
+    let mut directory = server::federation::directory::FederationDirectory::open_exclusive(
+        server::federation::directory::default_dir(),
+    )?
+    .ok_or_else(server::federation::directory::FederationDirectory::busy_message)?;
+    let freed = directory.forget_owner(peer_id)?;
+    println!("aloo: released {freed} nickname(s) claimed by federated server '{peer_id}'");
     Ok(())
 }
 

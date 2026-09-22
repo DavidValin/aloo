@@ -215,6 +215,19 @@ pub enum AuthCheck {
     /// No such account, or wrong password - deliberately one answer, so a
     /// login attempt cannot be used to find out which names exist.
     Rejected,
+    /// This nickname has no account here, but the federation directory
+    /// (`crate::server::federation`) says a different federated server
+    /// owns it. Never produced by `check_credentials` itself (which knows
+    /// nothing about federation) - `mod.rs`'s auth flow substitutes this
+    /// *before* calling `check_credentials` at all, since no password
+    /// could possibly be right for an account that isn't here.
+    RegisteredElsewhere { server_addr: String },
+    /// This nickname is claimed by more than one federated server (a
+    /// bootstrap collision between two previously-independent servers, or
+    /// an unresolved concurrent registration) - refused for any *new*
+    /// login until an operator resolves it manually. Same non-production
+    /// note as `RegisteredElsewhere`.
+    Conflicted,
 }
 
 /// An account's outstanding activation.

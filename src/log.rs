@@ -1,7 +1,9 @@
 //! Where a diagnostic goes when a terminal UI may be in the way.
 //!
-//! Every warning this crate emits goes through `log_warn!` rather than a
-//! bare `eprintln!`. The reason generalises the one `client::voice`'s
+//! Every warning this crate emits goes through `log_warn!`, and every
+//! routine-but-worth-knowing line (federation activity,
+//! `crate::server::federation`) through `log_info!` - never a bare
+//! `eprintln!`. The reason generalises the one `client::voice`'s
 //! `on_stream_error` callback documents for itself: a background task can
 //! decide it has something to say at *any* moment, including while ratatui
 //! holds the terminal in raw mode on the alternate screen. Bytes written
@@ -90,12 +92,9 @@ pub fn drain() {
     }
 }
 
-/// The one sink every `log_warn!` reaches. Public because the macro
-/// expands to a call to it from other modules, not because anything should
-/// call it directly - use the macro, which keeps the `aloo:` prefix and
-/// the formatting in one place.
-pub fn warn(args: std::fmt::Arguments<'_>) {
-    let line = format!("{PREFIX} {args}");
+/// The line-routing `warn`/`info` share: stderr immediately, unless
+/// something owns the screen, in which case the ring keeps it for later.
+fn emit(line: String) {
     if !is_silenced() {
         eprintln!("{line}");
         return;
@@ -107,6 +106,22 @@ pub fn warn(args: std::fmt::Arguments<'_>) {
     ring.push(line);
 }
 
+/// The one sink every `log_warn!` reaches. Public because the macro
+/// expands to a call to it from other modules, not because anything should
+/// call it directly - use the macro, which keeps the `aloo:` prefix and
+/// the formatting in one place.
+pub fn warn(args: std::fmt::Arguments<'_>) {
+    emit(format!("{PREFIX} {args}"));
+}
+
+/// `warn`'s counterpart for something worth knowing but not wrong - e.g.
+/// federation activity (`crate::server::federation`). Routed through the
+/// exact same sink (so it still queues rather than tearing through a TUI
+/// frame), just without implying a problem.
+pub fn info(args: std::fmt::Arguments<'_>) {
+    emit(format!("{PREFIX} {args}"));
+}
+
 /// One diagnostic line, `aloo:`-prefixed and routed by the current sink.
 /// Takes `format!` arguments, and is deliberately the *only* way this
 /// crate reports something the user may want to know about but cannot act
@@ -116,5 +131,14 @@ pub fn warn(args: std::fmt::Arguments<'_>) {
 macro_rules! log_warn {
     ($($arg:tt)*) => {
         $crate::log::warn(format_args!($($arg)*))
+    };
+}
+
+/// `log_warn!`'s counterpart for routine, not-wrong activity - see
+/// `log::info`.
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        $crate::log::info(format_args!($($arg)*))
     };
 }

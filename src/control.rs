@@ -205,6 +205,14 @@ pub struct ControlReader<R> {
     inner: R,
     key: Option<[u8; 32]>,
     counter: u64,
+    /// The largest frame this reader will *allocate* for, normally
+    /// `proto::MAX_FRAME_LEN`. A reader whose peer has not authenticated
+    /// itself yet lowers this (`set_max_frame_len`): the length prefix is
+    /// believed before a single payload byte arrives, so an unauthenticated
+    /// sender that merely names a large frame and then stalls would
+    /// otherwise hold that much memory per connection for as long as it
+    /// likes.
+    max_frame_len: u32,
 }
 
 impl<R: AsyncRead + Unpin> ControlReader<R> {
@@ -213,7 +221,16 @@ impl<R: AsyncRead + Unpin> ControlReader<R> {
             inner,
             key: None,
             counter: 0,
+            max_frame_len: proto::MAX_FRAME_LEN,
         }
+    }
+
+    /// Caps what one frame may claim, for a connection that has not yet
+    /// earned the full allowance - see `max_frame_len`. Raising it back to
+    /// `proto::MAX_FRAME_LEN` once the peer is authenticated is the
+    /// caller's business (`server::federation::handshake`).
+    pub fn set_max_frame_len(&mut self, max_frame_len: u32) {
+        self.max_frame_len = max_frame_len;
     }
 
     pub fn enable(&mut self, key: [u8; 32]) {
@@ -234,7 +251,7 @@ impl<R: AsyncRead + Unpin> ControlReader<R> {
             return Err(ProtoError::Io(e));
         }
         let len = u32::from_be_bytes(len_buf);
-        if len > proto::MAX_FRAME_LEN {
+        if len > self.max_frame_len {
             return Err(ProtoError::FrameTooLarge(len));
         }
         let mut payload = vec![0u8; len as usize];
