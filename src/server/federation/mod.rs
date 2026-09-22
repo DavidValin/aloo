@@ -129,6 +129,16 @@ pub const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 /// within a few minutes of returning, with no operator action.
 pub const MAX_REDIAL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How many servers a `PeerSignal` may be passed through before it is
+/// dropped. Federation is a small, operator-curated set, so a handful of
+/// hops covers any sane topology; the limit is there to bound the damage
+/// of a strange one, not to express a real ceiling on federation size.
+const PEER_SIGNAL_MAX_HOPS: u8 = 4;
+
+/// How many recently-seen signal ids to remember for loop suppression.
+/// Only has to cover the few seconds a signal is in flight.
+const PEER_SIGNAL_MEMORY: usize = 4096;
+
 /// How often an otherwise-idle link sends a `Ping`, and how long a link
 /// may hear *nothing at all* before it is assumed dead.
 ///
@@ -142,16 +152,6 @@ pub const MAX_REDIAL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 ///
 /// The timeout is comfortably more than twice the interval, so a single
 /// lost ping (or a slow moment) never tears down a healthy link.
-/// How many servers a `PeerSignal` may be passed through before it is
-/// dropped. Federation is a small, operator-curated set, so a handful of
-/// hops covers any sane topology; the limit is there to bound the damage
-/// of a strange one, not to express a real ceiling on federation size.
-const PEER_SIGNAL_MAX_HOPS: u8 = 4;
-
-/// How many recently-seen signal ids to remember for loop suppression.
-/// Only has to cover the few seconds a signal is in flight.
-const PEER_SIGNAL_MEMORY: usize = 4096;
-
 pub const FEDERATION_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const FEDERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
 
@@ -514,6 +514,26 @@ pub async fn broadcast(config: &FederationConfig, msg: FederationMessage, event:
     }
 }
 
+/// `broadcast`, skipping `except_peer_id` - what relaying a peer's own
+/// gossip on to every *other* peer uses (`apply_incoming`), so a message
+/// never bounces straight back to the server that just sent it.
+async fn broadcast_except(
+    config: &FederationConfig,
+    except_peer_id: &str,
+    msg: FederationMessage,
+    event: &'static str,
+) {
+    let senders = config.peer_senders.lock().await;
+    for (peer_id, link) in senders.iter() {
+        if peer_id == except_peer_id {
+            continue;
+        }
+        if link.sender.send(msg.clone()).is_ok() {
+            log_federation_event(peer_id, event);
+        }
+    }
+}
+
 /// Records that channel `name` (owned by this server) was just removed -
 /// `/delete-channel`, a superadmin's removal (single or via account
 /// removal), or the inactivity sweep, all funnel through here - and
@@ -528,12 +548,32 @@ pub async fn announce_channel_removed(config: &FederationConfig, name: &str) {
     .await;
 }
 
+/// Logs a failure to persist the nickname directory, rather than letting
+/// one pass silently - every caller here has already applied the change
+/// to its own in-memory copy (that part cannot fail) by the time it might
+/// learn the disk write didn't stick, so there is nothing left to roll
+/// back; what there is, is an operational fact worth an operator's
+/// attention: this server's own view has already diverged from what's on
+/// disk, and a restart before the next successful save would silently
+/// revert the change - reviving a nickname a superadmin just removed, or
+/// forgetting one that was just registered and letting another server
+/// claim it.
+pub(crate) fn log_directory_save_failure(context: &str, e: std::io::Error) {
+    crate::log_warn!(
+        "federation directory could not be saved to disk ({context}): {e} - this server's own \
+         copy has already changed in memory; a restart before the next successful save would \
+         silently revert it"
+    );
+}
+
 /// Records that nickname `nickname` (registered on this server) was just
 /// removed - a superadmin's `/remove-account` - and gossips it to every
 /// linked peer, so the name stops being permanently blocked for
 /// re-registration federation-wide.
 pub async fn announce_nickname_removed(config: &FederationConfig, nickname: &str) {
-    let _ = config.directory.lock().await.remove_nickname(nickname, &config.self_id);
+    if let Err(e) = config.directory.lock().await.remove_nickname(nickname, &config.self_id) {
+        log_directory_save_failure("removing a nickname", e);
+    }
     broadcast(
         config,
         FederationMessage::NicknameRemoved { nickname: nickname.to_string(), owner: config.self_id.clone() },
@@ -628,20 +668,18 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: FederationContext) ->
 /// configured to dial each other don't spend forever opening a redundant
 /// second connection every tick just to have it rejected.
 ///
-/// Only ever dials when this server's own id sorts *before* `peer.peer_id`
-/// - never the reverse. Two servers each configured to dial the other
-/// would otherwise sometimes both succeed at once (most likely at startup,
-/// when neither has a live link yet to skip the attempt for): each such
-/// connection then wins the `senders`-map race independently on its own
-/// two ends, so it is entirely possible for *both* physical connections to
-/// end up "confirmed" on the end that dialed it while "superseded" on the
-/// end that accepted it - two half-alive links instead of one real one.
-/// Comparing ids the same way the handshake's own transcript does
-/// sidesteps this rather than trying to detect and repair it after the
-/// fact: with only one side ever initiating, at most one connection
-/// between any pair can exist at a time, so the dedup this file already
-/// has only ever has to break a tie against a genuinely stale link (one
-/// whose peer has not yet noticed its socket died), never a fresh race.
+/// Both sides configured to peer with each other do both dial, most
+/// likely at startup when neither has a live link yet to skip the attempt
+/// for - so two physical connections between the same pair can briefly
+/// exist at once, each "confirmed" on the end that dialed it while
+/// "superseded" on the end that accepted it, unless something makes both
+/// ends agree on the same one to keep. That something is
+/// `connection_is_canonical`, applied in `run_peer_link` when a
+/// connection registers itself: a rule computed from `(self_id, peer_id,
+/// who dialed)`, which both ends of a given socket agree on by
+/// construction, so both sides reach the same verdict about the same
+/// connection and only ever displace the redundant one - never the one
+/// that just displaced it.
 async fn dial_peer(ctx: FederationContext, peer: FederationPeerConfig) {
     let mut wait = REDIAL_INTERVAL;
     loop {
@@ -653,7 +691,18 @@ async fn dial_peer(ctx: FederationContext, peer: FederationPeerConfig) {
                 // A link that came up and later ended is not a failure to
                 // reach the peer: start the next attempt at the short
                 // interval rather than wherever the backoff had climbed to.
-                Ok(()) => wait = REDIAL_INTERVAL,
+                Ok(true) => wait = REDIAL_INTERVAL,
+                // The handshake itself refused this connection (unknown
+                // id, bad signature, or the peer just closed on us) -
+                // exactly the kind of failure the backoff exists for, and
+                // indistinguishable to an operator from the peer being
+                // unreachable at all until they check the log: both mean
+                // "this is not going to link up on its own; something
+                // needs fixing." Escalating here, rather than resetting,
+                // is what keeps a persistently misconfigured peer from
+                // being redialed - and logged about - every ten seconds
+                // forever.
+                Ok(false) => wait = next_redial_wait(wait),
                 Err(e) => {
                     // Only the first failure of a run is worth a line. A
                     // peer that is simply down otherwise fills the log with
@@ -696,7 +745,7 @@ pub fn with_jitter(base: Duration) -> Duration {
     base.saturating_sub(Duration::from_millis(span / 2)) + Duration::from_millis(offset)
 }
 
-async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std::io::Result<()> {
+async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std::io::Result<bool> {
     let tcp = TcpStream::connect((peer.host.as_str(), peer.port)).await?;
     run_peer_link(tcp, ctx.clone(), true).await
 }
@@ -707,7 +756,19 @@ async fn dial_once(ctx: &FederationContext, peer: &FederationPeerConfig) -> std:
 /// link to the same peer, exchanges directory snapshots, reconciles any
 /// mail owed to/from that peer, then relays gossip and proxy traffic until
 /// the link drops.
-async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -> std::io::Result<()> {
+///
+/// Returns whether the handshake actually succeeded - not whether the
+/// link then lasted, or lasted long. `dial_peer` uses this, not a bare
+/// `Result<()>`, to decide whether a dial attempt is worth backing off
+/// from: a TCP connection that a peer's own handshake logic *refuses*
+/// (an unknown id, a bad signature, a misconfigured peer that doesn't
+/// list this server back) is exactly the kind of failure the backoff
+/// exists for, and treating it as success - every other branch here
+/// already returned plain `Ok(())` - reset the backoff to
+/// `REDIAL_INTERVAL` on every single tick, so a persistently
+/// misconfigured peer got redialed, and logged about, every ten seconds
+/// forever instead of escalating like any other unreachable peer.
+async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -> std::io::Result<bool> {
     let (rd, wr) = tokio::io::split(tcp);
     let mut rd = ControlReader::new(rd);
     let mut wr = ControlWriter::new(wr);
@@ -743,7 +804,7 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
                 "federation link claims to be this server's own id ('{peer_id}') - refusing; \
                  check server_federation_id and server_federation_peer for a misconfiguration"
             );
-            return Ok(());
+            return Ok(false);
         }
         Err(HandshakeError::Closed) => {
             // The peer hung up mid-handshake. On a connection *we* dialed
@@ -757,11 +818,11 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
                     "federation peer closed the connection during the handshake - check that it                      lists this server in its own server_federation_peer lines, with this                      server's public key"
                 );
             }
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => {
             crate::log_warn!("federation handshake failed: {e}");
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -789,7 +850,7 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
         // - anything else: this connection is the redundant one, so drop it.
         let mut senders = ctx.config.peer_senders.lock().await;
         match senders.get(&peer_id) {
-            Some(existing) if existing.canonical || !canonical => return Ok(()),
+            Some(existing) if existing.canonical || !canonical => return Ok(true),
             Some(existing) => existing.displaced.notify_one(),
             None => {}
         }
@@ -828,26 +889,57 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
         }
     });
 
+    // Reads run on their own task, applying each message the moment it
+    // completes, rather than as a `select!` branch below. `ControlReader::
+    // recv` is built on `read_exact` and is not cancel-safe: a frame it is
+    // midway through reading is simply lost if the future holding it is
+    // dropped. A `select!` branch is exactly that - dropped and recreated
+    // on every iteration where a *different* branch wins, which the ping
+    // tick below does on an otherwise ordinary schedule. Losing the bytes
+    // of a frame that way (most likely a large `MailForward`, or any
+    // frame straddling a tick) desyncs the stream for good: every read
+    // after it fails to decode and the link dies looking like corruption
+    // rather than the timing bug it is. Giving the read loop its own task
+    // means the ping/writer/displaced branches in the `select!` below can
+    // never cancel a `recv()` partway through - only this task's own loop
+    // does, and it always lets one complete before starting the next.
+    let last_heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let reader_last_heard = last_heard.clone();
+    let reader_ctx = ctx.clone();
+    let reader_peer_id = peer_id.clone();
+    let mut reader_task = tokio::spawn(async move {
+        loop {
+            match rd.recv::<FederationMessage>().await {
+                Ok(Some(msg)) => {
+                    *reader_last_heard.lock().expect("last_heard mutex is never poisoned") =
+                        std::time::Instant::now();
+                    apply_incoming(&reader_ctx, &reader_peer_id, msg).await;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    crate::log_warn!("federation link to '{reader_peer_id}' failed: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
     let mut displaced_by_another_link = false;
-    let mut last_heard = std::time::Instant::now();
     let mut ping = tokio::time::interval(ctx.config.ping_interval);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // the first tick is immediate; skip it
     loop {
         tokio::select! {
-            // Any message at all - a `Ping` included - proves the link is
-            // alive, which is what `last_heard` records.
-            incoming = rd.recv::<FederationMessage>() => match incoming {
-                Ok(Some(msg)) => {
-                    last_heard = std::time::Instant::now();
-                    apply_incoming(&ctx, &peer_id, msg).await;
+            // The reader task ended - the peer closed the connection, or a
+            // frame from it failed to decode (both logged, if at all,
+            // inside the task itself; a panic is the only thing left to
+            // report here).
+            result = &mut reader_task => {
+                if let Err(e) = result {
+                    crate::log_warn!("federation link to '{peer_id}' reader task failed: {e}");
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    crate::log_warn!("federation link to '{peer_id}' failed: {e}");
-                    break;
-                }
-            },
+                break;
+            }
             _ = ping.tick() => {
                 // Silence is measured from the last thing *received*, not
                 // from the last time round this loop. Wrapping the read in
@@ -857,7 +949,8 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
                 // interval and it could never elapse - the link would be
                 // declared healthy precisely because *we* were still
                 // talking, which is the one thing that proves nothing.
-                if last_heard.elapsed() > ctx.config.idle_timeout {
+                let elapsed = last_heard.lock().expect("last_heard mutex is never poisoned").elapsed();
+                if elapsed > ctx.config.idle_timeout {
                     crate::log_warn!(
                         "federation link to '{peer_id}' went silent - dropping it so it redials"
                     );
@@ -877,11 +970,6 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
             // keeps telling `dial_peer` not to redial while every message
             // routed through it is silently dropped. No `LINK_DOWN`, no
             // reconnect, no diagnostic, until the process restarts.
-            //
-            // Cancelling the in-flight `rd.recv()` here is safe precisely
-            // because we leave immediately: `ControlReader::recv` is not
-            // cancel-safe (a partially read frame is lost), but nothing
-            // reads this stream again - it is dropped on the way out.
             _ = &mut writer_task => {
                 crate::log_warn!(
                     "federation link to '{peer_id}' could not be written to - dropping it so it redials"
@@ -897,6 +985,13 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
             }
         }
     }
+    // Whichever branch above broke the loop, both tasks are done being
+    // useful: abort them rather than leaving one behind to read (or try
+    // to write) a socket nothing else will ever act on again. Aborting
+    // the reader task is what actually closes `rd`'s half of the socket
+    // now that it, not this function, owns it.
+    reader_task.abort();
+    writer_task.abort();
 
     // Only tear down an entry this task still owns. A displaced link's
     // entry already belongs to the connection that replaced it, and
@@ -913,8 +1008,7 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
         }
     };
     if !still_ours || displaced_by_another_link {
-        writer_task.abort();
-        return Ok(());
+        return Ok(true);
     }
     // Presence learned from this peer dies with the link - see
     // `ChannelsRegistry::forget_members_of_server` for why holding onto it
@@ -922,8 +1016,7 @@ async fn run_peer_link(tcp: TcpStream, ctx: FederationContext, i_dialed: bool) -
     let departed = ctx.registry.lock().await.forget_federated_members_of(&peer_id);
     crate::server::dispatch(&ctx.senders, departed).await;
     log_federation_event(&peer_id, event::LINK_DOWN);
-    writer_task.abort();
-    Ok(())
+    Ok(true)
 }
 
 /// Sweeps this server's own mail store for anything owed to or from
@@ -1046,13 +1139,53 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             }
         }
         FederationMessage::NicknameRegistered { nickname, owner } => {
-            let _ = ctx.config.directory.lock().await.merge_remote_nickname(nickname, owner);
+            // Relayed on to every *other* linked peer, gated on this
+            // claim actually being new to this server - what closes the
+            // hub-topology gap `DirectorySnapshot` alone leaves: a server
+            // linked to both ends of a pair with no direct link between
+            // them otherwise never passes ongoing gossip through, only
+            // whatever each snapshot already held at link-up. Gating on
+            // "actually changed" (rather than relaying unconditionally)
+            // is what stops that same relay from bouncing forever between
+            // two servers that both already know it.
+            // `Err` here only ever means the *save* failed - the in-memory
+            // entry was already merged before that was attempted (see
+            // `merge_remote_nicknames`), so it is still worth relaying on;
+            // only the disk copy, not this server's own live answers to
+            // its clients, is what didn't stick.
+            let changed = match ctx.config.directory.lock().await.merge_remote_nickname(nickname.clone(), owner.clone()) {
+                Ok(changed) => changed,
+                Err(e) => {
+                    log_directory_save_failure("recording a peer's nickname gossip", e);
+                    true
+                }
+            };
             log_federation_event(peer_id, event::NICKS_GOSSIP);
+            if changed {
+                broadcast_except(
+                    &ctx.config,
+                    peer_id,
+                    FederationMessage::NicknameRegistered { nickname, owner },
+                    event::NICKS_GOSSIP,
+                )
+                .await;
+            }
         }
         FederationMessage::ChannelRegistered { channel } => {
-            ctx.config.directory.lock().await.merge_remote_channel(channel.clone());
+            let changed = ctx.config.directory.lock().await.merge_remote_channel(channel.clone());
             log_federation_event(peer_id, event::CHANNEL_GOSSIP);
             ensure_public_channel_and_announce(ctx, &channel).await;
+            // See `NicknameRegistered` above for why this relays on, and
+            // only on genuine change.
+            if changed {
+                broadcast_except(
+                    &ctx.config,
+                    peer_id,
+                    FederationMessage::ChannelRegistered { channel },
+                    event::CHANNEL_GOSSIP,
+                )
+                .await;
+            }
         }
         FederationMessage::ChannelRemoved { name, owner } => {
             // If this server mirrors *that exact* channel (its directory
@@ -1068,7 +1201,7 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
                 let dir = ctx.config.directory.lock().await;
                 dir.owner_of_channel(&name).is_some_and(|info| info.owner == owner)
             };
-            ctx.config.directory.lock().await.remove_channel(&name, &owner);
+            let changed = ctx.config.directory.lock().await.remove_channel(&name, &owner);
             log_federation_event(peer_id, event::CHANNEL_DELETED);
             if was_mirroring {
                 let outgoing = ctx
@@ -1078,10 +1211,41 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
                     .remove_channel(&name, "the federated server that owns it removed it");
                 crate::server::dispatch(&ctx.senders, outgoing).await;
             }
+            // See `NicknameRegistered` above for why this relays on, and
+            // only on genuine change.
+            if changed {
+                broadcast_except(
+                    &ctx.config,
+                    peer_id,
+                    FederationMessage::ChannelRemoved { name, owner },
+                    event::CHANNEL_DELETED,
+                )
+                .await;
+            }
         }
         FederationMessage::NicknameRemoved { nickname, owner } => {
-            let _ = ctx.config.directory.lock().await.remove_nickname(&nickname, &owner);
+            // Same reasoning as `NicknameRegistered` above: `Err` here
+            // means the save failed after the in-memory removal already
+            // happened, so it is still worth relaying on.
+            let changed = match ctx.config.directory.lock().await.remove_nickname(&nickname, &owner) {
+                Ok(changed) => changed,
+                Err(e) => {
+                    log_directory_save_failure("removing a peer's nickname gossip", e);
+                    true
+                }
+            };
             log_federation_event(peer_id, event::NICK_DELETED);
+            // See `NicknameRegistered` above for why this relays on, and
+            // only on genuine change.
+            if changed {
+                broadcast_except(
+                    &ctx.config,
+                    peer_id,
+                    FederationMessage::NicknameRemoved { nickname, owner },
+                    event::NICK_DELETED,
+                )
+                .await;
+            }
         }
         FederationMessage::JoinProxyRequest {
             request_id,
@@ -1151,6 +1315,27 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             .await;
         }
         FederationMessage::ChannelMemberJoined { channel, member } => {
+            // Only the channel's real home server ever sends this - it is
+            // never relayed on by a receiving peer (unlike the directory
+            // gossip above), so unlike that gossip, believing it is safe
+            // to condition on the sender actually being who this
+            // server's own directory says owns `channel` - the same
+            // check `ChannelMembership` below already applies. Without
+            // it, any linked peer could invent a member of a channel it
+            // has nothing to do with, including one it does not even
+            // mirror, and have this server show that fabrication to its
+            // own local members.
+            let owned_by_sender = matches!(
+                ctx.config.directory.lock().await.owner_of_channel(&channel),
+                Some(info) if info.owner == peer_id
+            );
+            if !owned_by_sender {
+                crate::log_warn!(
+                    "federation peer '{peer_id}' claimed a member joined '{channel}', which its \
+                     own directory does not say it owns - ignoring"
+                );
+                return;
+            }
             // The home server broadcasts this to every linked peer,
             // including whichever one the member actually connects
             // through - naming *this* server. That case is not a remote
@@ -1189,6 +1374,21 @@ async fn apply_incoming(ctx: &FederationContext, peer_id: &str, msg: FederationM
             }
         }
         FederationMessage::ChannelMemberLeft { channel, server, nickname } => {
+            // Same authenticity check as `ChannelMemberJoined` above, and
+            // for the same reason - this is never relayed on either, so
+            // only the channel's real home server should ever be believed
+            // to report a departure from it.
+            let owned_by_sender = matches!(
+                ctx.config.directory.lock().await.owner_of_channel(&channel),
+                Some(info) if info.owner == peer_id
+            );
+            if !owned_by_sender {
+                crate::log_warn!(
+                    "federation peer '{peer_id}' claimed a member left '{channel}', which its \
+                     own directory does not say it owns - ignoring"
+                );
+                return;
+            }
             // Mirror of the guard above: a departure naming *this* server
             // is this server's own local client leaving, already handled
             // by the ordinary local `leave`/disconnect path.

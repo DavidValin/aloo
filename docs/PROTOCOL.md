@@ -6301,7 +6301,16 @@ it. Right after `Hello`, whichever side just connected sends a
 own and learned-from-others alike - so a newly linked peer's directory
 starts complete rather than growing one message at a time. After that,
 each new local registration or channel creation is gossiped immediately
-(`NicknameRegistered`/`ChannelRegistered`) to every currently-linked peer.
+(`NicknameRegistered`/`ChannelRegistered`) to every currently-linked peer,
+and removal (`NicknameRemoved`/`ChannelRemoved`) the same way. A server
+receiving one of these relays it on to every *other* peer it is linked to
+(never back to whoever it just arrived from), so a hub with no direct
+link between two of its own peers still passes ongoing directory changes
+between them - the same reason a hub behaves like a full mesh for
+`PeerSignal` (§18.5) applies here too, just for the directory instead of
+an introduction. Relaying stops the moment a server learns nothing new
+from a given message (its own merge is a no-op), which is what keeps
+that from being an infinite bounce between two peers who already agree.
 
 A channel's federation-visible metadata (`FederatedChannelInfo`) is only
 its name, kind, and owning server - never its members, password, admin,

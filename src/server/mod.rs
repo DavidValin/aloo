@@ -2079,11 +2079,14 @@ async fn register_account(
     // `federation_announce_nickname_removed`, so a removed nickname does
     // not stay permanently blocked federation-wide.
     if let Some(federation) = &options.federation {
-        let _ = federation
+        if let Err(e) = federation
             .directory
             .lock()
             .await
-            .record_local_nickname(nickname.to_string(), &federation.self_id);
+            .record_local_nickname(nickname.to_string(), &federation.self_id)
+        {
+            federation::log_directory_save_failure("recording a local registration", e);
+        }
         federation::broadcast(
             federation,
             federation::proto::FederationMessage::NicknameRegistered {

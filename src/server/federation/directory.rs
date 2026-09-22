@@ -46,16 +46,25 @@ impl Ownership {
     /// Merges in a claim that `owner` also owns this name - `self`
     /// unchanged (already `Owned(owner)`), upgraded to `Conflicted` (a
     /// different single owner, or a new claimant added to an existing
-    /// conflict).
-    fn merge(&mut self, owner: &str) {
+    /// conflict). Returns whether anything actually changed: a duplicate
+    /// claim for an owner already recorded here is `false`, which is what
+    /// lets gossip relaying (`server::federation::apply_incoming`) stop
+    /// forwarding a message once every server that would learn something
+    /// new from it already has - without that, two servers gossiping the
+    /// same already-known claim back and forth would never stop.
+    fn merge(&mut self, owner: &str) -> bool {
         match self {
-            Ownership::Owned(existing) if existing == owner => {}
+            Ownership::Owned(existing) if existing == owner => false,
             Ownership::Owned(existing) => {
                 *self = Ownership::Conflicted(vec![existing.clone(), owner.to_string()]);
+                true
             }
             Ownership::Conflicted(owners) => {
-                if !owners.iter().any(|o| o == owner) {
+                if owners.iter().any(|o| o == owner) {
+                    false
+                } else {
                     owners.push(owner.to_string());
+                    true
                 }
             }
         }
@@ -77,10 +86,15 @@ pub enum ChannelOwnership {
     Conflicted(Vec<FederatedChannelInfo>),
 }
 
-fn merge_channel_entry(existing: &mut ChannelOwnership, info: FederatedChannelInfo) {
+/// `Ownership::merge`'s channel-side analogue, including its "did this
+/// actually change anything" return - see there for why gossip relaying
+/// needs it.
+fn merge_channel_entry(existing: &mut ChannelOwnership, info: FederatedChannelInfo) -> bool {
     match existing {
         ChannelOwnership::Owned(current) if current.owner == info.owner => {
+            let changed = *current != info;
             *current = info;
+            changed
         }
         ChannelOwnership::Owned(current) => {
             crate::log_warn!(
@@ -91,10 +105,14 @@ fn merge_channel_entry(existing: &mut ChannelOwnership, info: FederatedChannelIn
                 info.owner
             );
             *existing = ChannelOwnership::Conflicted(vec![current.clone(), info]);
+            true
         }
         ChannelOwnership::Conflicted(owners) => {
-            if !owners.iter().any(|o| o.owner == info.owner) {
+            if owners.iter().any(|o| o.owner == info.owner) {
+                false
+            } else {
                 owners.push(info);
+                true
             }
         }
     }
@@ -316,7 +334,7 @@ impl FederationDirectory {
     /// becomes `Conflicted`, the same as if the order of arrival had been
     /// reversed.
     pub fn record_local_nickname(&mut self, nickname: String, self_id: &str) -> io::Result<()> {
-        self.merge_remote_nickname(nickname, self_id.to_string())
+        self.merge_remote_nickname(nickname, self_id.to_string()).map(|_changed| ())
     }
 
     /// Whether `nickname` may be freshly registered on `self_id` right
@@ -357,37 +375,55 @@ impl FederationDirectory {
     /// comma could forge the owner field. A peer is trusted to say who
     /// owns what; it is not trusted to write arbitrary bytes into a file
     /// this server parses on every start.
-    pub fn merge_remote_nickname(&mut self, nickname: String, owner: String) -> io::Result<()> {
+    ///
+    /// Returns whether this specific claim actually changed anything -
+    /// `false` for a duplicate of a claim already recorded, or for one
+    /// this server refused to store at all. `apply_incoming` uses this to
+    /// decide whether to relay the gossip message that carried it on to
+    /// every *other* linked peer: a hub topology (this server linked to
+    /// both ends of a pair with no direct link between them) otherwise
+    /// never passes ongoing gossip on, only whatever a `DirectorySnapshot`
+    /// happened to already contain at the moment each link came up. Only
+    /// relaying on genuine change is what keeps that from also being an
+    /// infinite bounce between two servers that both already know it.
+    pub fn merge_remote_nickname(&mut self, nickname: String, owner: String) -> io::Result<bool> {
         self.merge_remote_nicknames(std::iter::once((nickname, owner)))
     }
 
     /// `merge_remote_nickname` for many at once, saving **once** at the
     /// end rather than per entry - what a `DirectorySnapshot` applies.
+    /// Returns whether *any* entry actually changed something (and so
+    /// whether anything was worth saving) - always `false` for a snapshot
+    /// that told this server nothing it didn't already know.
     ///
-    /// The difference is not a micro-optimisation: each save rewrites the
-    /// whole file, and the snapshot arm holds the directory lock across
-    /// the loop, so per-entry saving made one link-up cost N full-file
-    /// writes serialised against every login check and registration on
-    /// this server. At a few hundred nicknames that is a visible stall; at
-    /// tens of thousands it is minutes of disk and a locked-out server,
-    /// reachable by an honest large federation and trivially forced by a
-    /// peer sending a large snapshot.
+    /// The single-save difference is not a micro-optimisation: each save
+    /// rewrites the whole file, and the snapshot arm holds the directory
+    /// lock across the loop, so per-entry saving made one link-up cost N
+    /// full-file writes serialised against every login check and
+    /// registration on this server. At a few hundred nicknames that is a
+    /// visible stall; at tens of thousands it is minutes of disk and a
+    /// locked-out server, reachable by an honest large federation and
+    /// trivially forced by a peer sending a large snapshot.
     pub fn merge_remote_nicknames(
         &mut self,
         entries: impl IntoIterator<Item = (String, String)>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let mut changed = false;
         for (nickname, owner) in entries {
             if !crate::validation::nickname_is_registrable(&nickname) || !owner_id_is_storable(&owner) {
                 continue;
             }
-            self.nicknames
-                .entry(nickname)
-                .and_modify(|o| o.merge(&owner))
-                .or_insert_with(|| Ownership::Owned(owner));
-            changed = true;
+            let entry_changed = match self.nicknames.entry(nickname) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().merge(&owner),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Ownership::Owned(owner));
+                    true
+                }
+            };
+            changed |= entry_changed;
         }
-        if changed { self.save_nicknames() } else { Ok(()) }
+        if changed { self.save_nicknames()?; }
+        Ok(changed)
     }
 
     /// Removes `owner`'s claim on `nickname` - the mirror of
@@ -398,18 +434,23 @@ impl FederationDirectory {
     /// with the smaller list - so resolving a collision by removing one
     /// side doesn't require anything from the other side too. A message
     /// naming an owner that isn't actually a current claimant (a stale or
-    /// malformed one) is a no-op.
-    pub fn remove_nickname(&mut self, nickname: &str, owner: &str) -> io::Result<()> {
+    /// malformed one) is a no-op, and - like `merge_remote_nickname` -
+    /// returns `false` for one, both to skip a needless save and so
+    /// `apply_incoming` knows not to relay it any further.
+    pub fn remove_nickname(&mut self, nickname: &str, owner: &str) -> io::Result<bool> {
         let Some(existing) = self.nicknames.get_mut(nickname) else {
-            return Ok(());
+            return Ok(false);
         };
-        match existing {
+        let changed = match existing {
             Ownership::Owned(o) if o == owner => {
                 self.nicknames.remove(nickname);
+                true
             }
-            Ownership::Owned(_) => {}
+            Ownership::Owned(_) => false,
             Ownership::Conflicted(owners) => {
+                let before = owners.len();
                 owners.retain(|o| o != owner);
+                let removed = owners.len() != before;
                 match owners.len() {
                     0 => {
                         self.nicknames.remove(nickname);
@@ -420,9 +461,13 @@ impl FederationDirectory {
                     }
                     _ => {}
                 }
+                removed
             }
+        };
+        if changed {
+            self.save_nicknames()?;
         }
-        self.save_nicknames()
+        Ok(changed)
     }
 
     /// Records that `info.name` was just created locally (`info.owner` is
@@ -448,14 +493,21 @@ impl FederationDirectory {
     /// there is no file to corrupt here - but a name no local client could
     /// ever type would be permanently unroutable and permanently listed,
     /// which is its own small denial of service.)
-    pub fn merge_remote_channel(&mut self, info: FederatedChannelInfo) {
+    ///
+    /// Returns whether this claim actually changed anything - see
+    /// `merge_remote_nickname` for why `apply_incoming` needs that to
+    /// decide whether to relay the gossip message on to other peers.
+    pub fn merge_remote_channel(&mut self, info: FederatedChannelInfo) -> bool {
         if !crate::validation::channel_name_is_valid(&info.name) || !owner_id_is_storable(&info.owner) {
-            return;
+            return false;
         }
-        self.channels
-            .entry(info.name.clone())
-            .and_modify(|existing| merge_channel_entry(existing, info.clone()))
-            .or_insert_with(|| ChannelOwnership::Owned(info));
+        match self.channels.entry(info.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => merge_channel_entry(e.get_mut(), info),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(ChannelOwnership::Owned(info));
+                true
+            }
+        }
     }
 
     /// Removes `owner`'s claim on channel `name` - the mirror of
@@ -463,18 +515,23 @@ impl FederationDirectory {
     /// server's own `/delete-channel`, a superadmin's removal, or the
     /// inactivity sweep, relayed the same way regardless of which). Same
     /// partial-removal behaviour `remove_nickname` gives a `Conflicted`
-    /// entry: only `owner`'s claim is dropped, not the whole entry.
-    pub fn remove_channel(&mut self, name: &str, owner: &str) {
+    /// entry: only `owner`'s claim is dropped, not the whole entry. Same
+    /// "did this actually change anything" return as `remove_nickname`,
+    /// for the same gossip-relaying reason.
+    pub fn remove_channel(&mut self, name: &str, owner: &str) -> bool {
         let Some(existing) = self.channels.get_mut(name) else {
-            return;
+            return false;
         };
         match existing {
             ChannelOwnership::Owned(info) if info.owner == owner => {
                 self.channels.remove(name);
+                true
             }
-            ChannelOwnership::Owned(_) => {}
+            ChannelOwnership::Owned(_) => false,
             ChannelOwnership::Conflicted(owners) => {
+                let before = owners.len();
                 owners.retain(|o| o.owner != owner);
+                let removed = owners.len() != before;
                 match owners.len() {
                     0 => {
                         self.channels.remove(name);
@@ -485,6 +542,7 @@ impl FederationDirectory {
                     }
                     _ => {}
                 }
+                removed
             }
         }
     }

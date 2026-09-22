@@ -657,7 +657,7 @@ server_federation_peer=serverB,serverb.example.com,7880,~/.aloo/federation/serve
 
 A server will refuse to start if federation is on and `server_federation_id` is empty or contains a tab, newline or comma — those are the separators its directory file is stored with.
 
-You can join a channel that lives on a different federated server by name, and send OTP mail to someone registered on one — both are proxied/relayed to the right server automatically. What doesn't work yet is a live chat between two people connected to *different* federated servers, even in a channel they're both members of — direct peer-to-peer links are still only set up between people sharing one server; see `docs/PROTOCOL.md` §18.5.
+You can join a channel that lives on a different federated server by name, and send OTP mail to someone registered on one — both are proxied/relayed to the right server automatically. Two people connected to *different* federated servers, even in a channel they're both members of, can also open a live direct peer-to-peer link with each other — their servers introduce them (relaying through one they share, if there's no direct link between those two servers), and once it's up nothing about the conversation touches a server again, same as any other direct link; see `docs/PROTOCOL.md` §18.5.
 
 ## One Time Pad mail
 

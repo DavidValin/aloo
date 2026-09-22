@@ -39,11 +39,10 @@ pub struct FederatedChannelInfo {
 /// Enough of a federated member's identity to show them in a channel's
 /// member list on a server they have no live connection to: which server
 /// they actually are connected to, their nickname there, and the public
-/// bundle peers would seal to if federated peer-to-peer linking existed
-/// (it does not yet - see docs/PROTOCOL.md §18.5 - so this is carried
-/// forward for when it does, and meanwhile just lets a receiving server
-/// build a `UserInfo` good enough to display). Never carries a password
-/// or anything membership-unrelated.
+/// bundle peers seal to when setting up a federated peer-to-peer link
+/// (`FederationMessage::PeerSignal`, docs/PROTOCOL.md §18.5) - and,
+/// meanwhile, just lets a receiving server build a `UserInfo` good enough
+/// to display. Never carries a password or anything membership-unrelated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteIdentity {
     pub server: String,
@@ -112,7 +111,12 @@ pub enum FederationMessage {
     /// Gossip: `nickname` was just registered on `owner`. Sent to every
     /// linked peer the moment a local registration succeeds, so the rest
     /// of the federation's directories stay current without waiting for
-    /// the next full snapshot.
+    /// the next full snapshot. A server receiving this from a peer relays
+    /// it on to every *other* peer it is linked to as well (never back to
+    /// where it came from), gated on the claim actually being new to it -
+    /// what lets a hub with no direct link between two of its own peers
+    /// still pass this on between them, the same as `PeerSignal` does for
+    /// an introduction (§18.5's doctrine, applied to the directory).
     NicknameRegistered { nickname: String, owner: String },
     /// Gossip: `channel` was just created on its `owner`. For a *public*
     /// channel, every receiving server also mirrors it into its own local
@@ -122,17 +126,19 @@ pub enum FederationMessage {
     /// not just whichever servers a client happens to have joined
     /// something on already. A private channel is never mirrored this
     /// way; it stays reachable only by knowing its name, exactly like a
-    /// local one.
+    /// local one. Relayed hub-wise exactly as `NicknameRegistered` is.
     ChannelRegistered { channel: FederatedChannelInfo },
     /// Gossip: a channel owned by `owner` was removed (`/delete-channel`,
     /// a superadmin's removal, or the inactivity sweep) - clears `owner`'s
     /// claim on `name` from every peer's directory (see
     /// `directory::FederationDirectory::remove_channel` for what that
-    /// means when the name was `Conflicted`).
+    /// means when the name was `Conflicted`). Relayed hub-wise exactly as
+    /// `NicknameRegistered` is.
     ChannelRemoved { name: String, owner: String },
     /// Gossip: `nickname`, registered on `owner`, was removed (a
     /// superadmin's `/remove-account`) - clears `owner`'s claim on it the
-    /// same way `ChannelRemoved` does for a channel.
+    /// same way `ChannelRemoved` does for a channel. Relayed hub-wise
+    /// exactly as `NicknameRegistered` is.
     NicknameRemoved { nickname: String, owner: String },
 
     /// Sent by a server whose local client wants to join `channel`, to
